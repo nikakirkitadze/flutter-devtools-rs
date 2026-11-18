@@ -37,6 +37,9 @@ pub fn main_window_options(cx: &App) -> WindowOptions {
         ))),
         window_min_size: Some(layout::WINDOW_MIN),
         app_id: Some("dev.fdt.fdt".into()),
+        // Linux has no server-side frame here: draw it on the client (unverified, built on macOS).
+        #[cfg(target_os = "linux")]
+        window_decorations: Some(gpui_kit::WindowDecorations::Client),
         ..TitleBar::window_options()
     }
 }
@@ -63,6 +66,7 @@ pub fn run() {
             if let Err(err) = fdt_ui::fonts::load(cx) {
                 log::warn!("loading bundled fonts failed, using system fonts: {err:#}");
             }
+            cx.set_menus(crate::menus::app_menus());
             init_settings(cx, store);
             let pref = settings(cx).theme;
             theme::apply(pref, None, cx);
@@ -80,4 +84,22 @@ pub fn run() {
             .detach();
             cx.activate(true);
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::TestAppContext;
+
+    #[gpui_kit::test]
+    fn window_options_use_layout_tokens(cx: &mut TestAppContext) {
+        let opts = cx.update(|cx| main_window_options(cx));
+        assert_eq!(opts.window_min_size, Some(layout::WINDOW_MIN));
+        assert_eq!(opts.app_id.as_deref(), Some("dev.fdt.fdt"));
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            opts.window_decorations,
+            Some(gpui_kit::WindowDecorations::Client)
+        );
+    }
 }

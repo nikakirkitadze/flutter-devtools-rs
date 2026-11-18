@@ -2,12 +2,13 @@
 
 mod settings_page;
 mod sidebar;
+mod title_bar;
 mod tool_page;
 
 use crate::actions::{
-    ClearSelection, GoBack, GoForward, OpenPalette, OpenSettings, ShowLogs, ShowMemory,
+    ClearSelection, GoBack, GoForward, Minimize, OpenPalette, OpenSettings, ShowLogs, ShowMemory,
     ShowNetwork, ShowPerformance, ShowState, ShowTimeline, ShowWidgets, ToggleFrameHud,
-    UseDarkTheme, UseLightTheme, UseSystemTheme,
+    ToggleFullScreen, UseDarkTheme, UseLightTheme, UseSystemTheme, Zoom,
 };
 use crate::keymap::SHELL_CONTEXT;
 use crate::nav::{Location, NavHistory, Page, Tool};
@@ -164,20 +165,21 @@ pub fn format_count(n: u64) -> String {
 }
 
 impl Render for MainWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.tokens();
         let page: gpui_kit::AnyElement = match self.current().page {
             Page::Tool(tool) => tool_page::render(tool, cx).into_any_element(),
             Page::Settings => settings_page::render(settings(cx).theme, cx).into_any_element(),
         };
         let nav = |dir| MouseButton::Navigate(dir);
-        div()
+        let root = div()
             .id("shell")
             .test_support()
             .key_context(SHELL_CONTEXT)
             .track_focus(&self.focus)
             .size_full()
             .flex()
+            .flex_col()
             .font_family(fdt_ui::tokens::font::UI)
             .text_color(Hsla::from(t.text))
             .on_action(
@@ -212,6 +214,9 @@ impl Render for MainWindow {
             .on_action(cx.listener(|this, _: &ToggleFrameHud, w, cx| {
                 this.hud.update(cx, |hud, cx| hud.toggle(w, cx));
             }))
+            .on_action(cx.listener(|_, _: &Minimize, w, _| w.minimize_window()))
+            .on_action(cx.listener(|_, _: &Zoom, w, _| w.zoom_window()))
+            .on_action(cx.listener(|_, _: &ToggleFullScreen, w, _| w.toggle_fullscreen()))
             .on_mouse_down(
                 nav(NavigationDirection::Back),
                 cx.listener(|this, _, _, cx| this.go_back(cx)),
@@ -220,17 +225,29 @@ impl Render for MainWindow {
                 nav(NavigationDirection::Forward),
                 cx.listener(|this, _, _, cx| this.go_forward(cx)),
             )
-            .child(self.render_sidebar(cx))
+            .child(self.render_title_bar(window, cx))
             .child(
                 div()
-                    .id("page-area")
-                    .relative()
+                    .flex()
                     .flex_1()
-                    .h_full()
-                    .bg(Hsla::from(t.bg))
-                    .child(page)
-                    .child(self.hud.clone()),
-            )
+                    .overflow_hidden()
+                    .w_full()
+                    .child(self.render_sidebar(cx))
+                    .child(
+                        div()
+                            .id("page-area")
+                            .relative()
+                            .flex_1()
+                            .h_full()
+                            .bg(Hsla::from(t.bg))
+                            .child(page)
+                            .child(self.hud.clone()),
+                    ),
+            );
+        // Linux draws its own frame and resize edges.
+        #[cfg(target_os = "linux")]
+        let root = gpui_kit::component::window_border().child(root);
+        root
     }
 }
 
