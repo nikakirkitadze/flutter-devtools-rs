@@ -12,8 +12,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if args.len() == 1 && args[0] == "--startup-trace" {
-        fdt_app::app::run_with_startup_trace(t0);
-        return ExitCode::SUCCESS;
+        return fdt_app::app::run_with_startup_trace(t0);
     }
     eprintln!("usage: fdt [--version] [--startup-trace]");
     ExitCode::from(2)

@@ -214,6 +214,20 @@ fn apply_motion(theme: &mut Theme) {
     theme.focus_ring = true;
 }
 
+/// Creates the component theme global with our font families already named, so that
+/// `gpui_kit::init` skips its installed-font probe.
+///
+/// Call once, before `gpui_kit::init`. `Theme::change` (run by the init) otherwise sees the
+/// platform default families and asks the OS for every installed font, which costs about 50 ms
+/// on macOS at startup. We never use those fonts: the bundled Inter and JetBrains Mono are named
+/// on the theme here and again by [`install`]. Colours are replaced by [`install`] and [`apply`].
+pub fn seed_fonts(cx: &mut App) {
+    let mut theme = Theme::default();
+    theme.font_family = font::UI.into();
+    theme.mono_font_family = font::MONO.into();
+    cx.set_global(theme);
+}
+
 /// Installs the fdt themes into the component theme. Call once, after `gpui_kit::init`.
 pub fn install(cx: &mut App) {
     let theme = Theme::global_mut(cx);
@@ -358,5 +372,36 @@ mod tests {
             assert_eq!(Theme::global(cx).colors.background, LIGHT.bg.hsla());
             assert_eq!(cx.appearance(), Appearance::Light);
         });
+    }
+
+    #[gpui_kit::test]
+    fn seeded_init_ends_in_the_same_theme_as_plain_init(cx: &mut TestAppContext) {
+        let snapshot = |cx: &mut gpui_kit::App| {
+            let t = Theme::global(cx);
+            (
+                t.colors,
+                t.font_family.clone(),
+                t.mono_font_family.clone(),
+                t.font_size,
+                t.radius,
+                t.radius_lg,
+                t.motion.duration_fast,
+                t.is_dark(),
+            )
+        };
+        let plain = cx.update(|cx| {
+            gpui_kit::init(cx);
+            install(cx);
+            apply(ThemePreference::Dark, None, cx);
+            snapshot(cx)
+        });
+        let seeded = cx.update(|cx| {
+            seed_fonts(cx);
+            gpui_kit::init(cx);
+            install(cx);
+            apply(ThemePreference::Dark, None, cx);
+            snapshot(cx)
+        });
+        assert_eq!(plain, seeded);
     }
 }

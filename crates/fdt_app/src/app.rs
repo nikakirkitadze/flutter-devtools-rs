@@ -4,18 +4,28 @@ use crate::actions::{Hide, HideOthers, OpenPalette, Quit, ShowAll};
 use crate::keymap;
 use crate::settings::{SettingsStore, init_settings, settings};
 use crate::shell::MainWindow;
-use crate::startup::StartupReport;
+use crate::startup::{StartupPhases, StartupReport, WATCHDOG, emit, mark};
 use fdt_ui::assets::FdtAssets;
 use fdt_ui::theme;
 use fdt_ui::tokens::layout;
-use gpui_kit::component::TitleBar;
+use gpui_kit::component::{TitleBar, WindowExt as _};
 use gpui_kit::{App, AppContext as _, Bounds, Entity, Window, WindowBounds, WindowOptions};
+use std::cell::Cell;
+use std::process::ExitCode;
+use std::rc::Rc;
 use std::time::Instant;
 
 /// Setup shared by the real app and the tests.
 pub fn init(cx: &mut App) {
+    init_with(cx, &mut None);
+}
+
+fn init_with(cx: &mut App, phases: &mut Option<&mut StartupPhases>) {
+    theme::seed_fonts(cx);
     gpui_kit::init(cx);
+    mark(phases, "gpui_kit_init");
     theme::install(cx);
+    mark(phases, "theme_installed");
     cx.bind_keys(keymap::bindings());
     cx.on_action(|_: &Quit, cx| cx.quit());
     #[cfg(target_os = "macos")]
@@ -55,17 +65,26 @@ pub fn open_main_window(cx: &mut App) -> anyhow::Result<Entity<MainWindow>> {
 }
 
 /// Common startup: global setup, settings, theme, fonts, menus and the main window.
-fn start(cx: &mut App, store: SettingsStore) -> anyhow::Result<Entity<MainWindow>> {
-    init(cx);
+fn start(
+    cx: &mut App,
+    store: SettingsStore,
+    mut phases: Option<&mut StartupPhases>,
+) -> anyhow::Result<Entity<MainWindow>> {
+    let phases = &mut phases;
+    init_with(cx, phases);
     if let Err(err) = fdt_ui::fonts::load(cx) {
         log::warn!("loading bundled fonts failed, using system fonts: {err:#}");
     }
-    cx.set_menus(crate::menus::app_menus());
+    mark(phases, "fonts_loaded");
     init_settings(cx, store);
     let pref = settings(cx).theme;
     theme::apply(pref, None, cx);
+    mark(phases, "theme_applied");
     fdt_ui::os::sync_reduced_motion(cx);
+    mark(phases, "motion_synced");
     let shell = open_main_window(cx)?;
+    mark(phases, "window_opened");
+    defer_menus(cx);
     cx.on_window_closed(|cx, _| {
         if cx.windows().is_empty() {
             cx.quit();
@@ -74,6 +93,28 @@ fn start(cx: &mut App, store: SettingsStore) -> anyhow::Result<Entity<MainWindow
     .detach();
     cx.activate(true);
     Ok(shell)
+}
+
+/// Installs the app menus a few frames after the window opens instead of before it.
+///
+/// Building the native menu bar costs about 12 ms on macOS and the first frame does not need it.
+/// The shortcuts are key bindings, so they work in the meantime. The extra frame keeps this after
+/// the callback that `run_with_startup_trace` uses to time first paint.
+fn defer_menus(cx: &mut App) {
+    let Some(handle) = cx.windows().first().copied() else {
+        cx.set_menus(crate::menus::app_menus());
+        return;
+    };
+    let result = handle.update(cx, |_, window, _| {
+        window.on_next_frame(|window, _| {
+            window.on_next_frame(|window, _| {
+                window.on_next_frame(|_, cx| cx.set_menus(crate::menus::app_menus()));
+            });
+        });
+    });
+    if result.is_err() {
+        cx.set_menus(crate::menus::app_menus());
+    }
 }
 
 fn load_store() -> SettingsStore {
@@ -90,7 +131,7 @@ pub fn run() {
     gpui_kit::application()
         .with_assets(FdtAssets)
         .run(|cx: &mut App| {
-            if let Err(err) = start(cx, store) {
+            if let Err(err) = start(cx, store, None) {
                 log::error!("opening the main window failed: {err:#}");
                 cx.quit();
             }
@@ -102,12 +143,26 @@ pub fn run() {
 /// Times are measured from `t0` (the first statement of `main()`), not from process exec, and
 /// presentation is approximated by the next-frame callback: a nested `on_next_frame` runs after
 /// the first frame was drawn. "Interactive" is when the command palette has been opened and drawn.
-pub fn run_with_startup_trace(t0: Instant) {
+///
+/// Returns a failure exit code when the palette did not open; a watchdog ends the process with
+/// exit code 1 if no report was printed within [`WATCHDOG`].
+pub fn run_with_startup_trace(t0: Instant) -> ExitCode {
+    std::thread::spawn(|| {
+        std::thread::sleep(WATCHDOG);
+        eprintln!("startup-trace: timed out");
+        std::process::exit(1);
+    });
+    let ok = Rc::new(Cell::new(false));
+    let ok_in_run = ok.clone();
     let store = load_store();
+    let mut phases = StartupPhases::new(t0);
+    phases.mark("settings_loaded");
     gpui_kit::application()
         .with_assets(FdtAssets)
         .run(move |cx: &mut App| {
-            let shell = match start(cx, store) {
+            let ok = ok_in_run;
+            phases.mark("app_started");
+            let shell = match start(cx, store, Some(&mut phases)) {
                 Ok(shell) => shell,
                 Err(err) => {
                     log::error!("opening the main window failed: {err:#}");
@@ -122,14 +177,23 @@ pub fn run_with_startup_trace(t0: Instant) {
             let result = handle.update(cx, move |_, window, cx| {
                 after_next_paint(window, cx, move |window, cx| {
                     let first_paint = t0.elapsed();
+                    phases.mark("first_paint");
                     window.focus(&shell.read(cx).focus_handle(), cx);
                     window.dispatch_action(Box::new(OpenPalette), cx);
-                    after_next_paint(window, cx, move |_, cx| {
+                    after_next_paint(window, cx, move |window, cx| {
                         let report = StartupReport {
                             first_paint,
                             interactive: t0.elapsed(),
+                            phases: phases.into_marks(),
                         };
-                        println!("{}", report.to_json());
+                        let palette_open = window.has_active_dialog(cx);
+                        let printed = emit(
+                            &report,
+                            palette_open,
+                            &mut std::io::stdout(),
+                            &mut std::io::stderr(),
+                        );
+                        ok.set(printed);
                         cx.quit();
                     });
                 });
@@ -139,6 +203,11 @@ pub fn run_with_startup_trace(t0: Instant) {
                 cx.quit();
             }
         });
+    if ok.get() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 /// Runs `callback` after the next frame has been drawn (a nested `on_next_frame`).
