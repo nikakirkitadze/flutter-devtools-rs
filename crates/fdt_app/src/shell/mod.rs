@@ -1,14 +1,16 @@
 //! The main window: sidebar, current tool page and overlays.
 
+mod about;
 mod settings_page;
+mod shortcuts;
 mod sidebar;
 mod title_bar;
 mod tool_page;
 
 use crate::actions::{
-    ClearSelection, GoBack, GoForward, Minimize, OpenPalette, OpenSettings, ShowLogs, ShowMemory,
-    ShowNetwork, ShowPerformance, ShowState, ShowTimeline, ShowWidgets, ToggleFrameHud,
-    ToggleFullScreen, UseDarkTheme, UseLightTheme, UseSystemTheme, Zoom,
+    About, ClearSelection, GoBack, GoForward, Minimize, OpenPalette, OpenSettings, ShowLogs,
+    ShowMemory, ShowNetwork, ShowPerformance, ShowShortcuts, ShowState, ShowTimeline, ShowWidgets,
+    ToggleFrameHud, ToggleFullScreen, UseDarkTheme, UseLightTheme, UseSystemTheme, Zoom,
 };
 use crate::keymap::SHELL_CONTEXT;
 use crate::nav::{Location, NavHistory, Page, Tool};
@@ -91,6 +93,13 @@ impl MainWindow {
     /// The most recently opened palette's model.
     pub fn palette(&self) -> Option<&Entity<PaletteModel>> {
         self.palette.as_ref()
+    }
+
+    fn show_shortcuts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            window.close_dialog(cx);
+        }
+        shortcuts::open_shortcuts(self.focus_handle(), window, cx);
     }
 
     fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -194,6 +203,13 @@ impl Render for MainWindow {
             .on_action(cx.listener(|this, _: &ShowWidgets, w, cx| this.show(Tool::Widgets, w, cx)))
             .on_action(cx.listener(|this, _: &ShowState, w, cx| this.show(Tool::State, w, cx)))
             .on_action(cx.listener(|this, _: &OpenPalette, w, cx| this.toggle_palette(w, cx)))
+            .on_action(cx.listener(|this, _: &ShowShortcuts, w, cx| this.show_shortcuts(w, cx)))
+            .on_action(cx.listener(|_, _: &About, w, cx| {
+                if w.has_active_dialog(cx) {
+                    w.close_dialog(cx);
+                }
+                about::open_about(w, cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenSettings, w, cx| this.open_settings(w, cx)))
             .on_action(cx.listener(|this, _: &UseSystemTheme, w, cx| {
                 this.set_theme(ThemePreference::System, w, cx)
