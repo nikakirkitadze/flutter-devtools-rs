@@ -71,6 +71,17 @@ fn tool_binding(keys: &'static str, tool: Tool, ctx: Option<&str>) -> KeyBinding
     }
 }
 
+/// The shortcut hint for `action`: its binding in the shell context, else any global binding.
+pub fn shortcut_hint(
+    action: &dyn gpui_kit::Action,
+    shell_focus: &gpui_kit::FocusHandle,
+    window: &gpui_kit::Window,
+) -> Option<gpui_kit::component::kbd::Kbd> {
+    use gpui_kit::component::kbd::Kbd;
+    Kbd::binding_for_action_in(action, shell_focus, window)
+        .or_else(|| Kbd::binding_for_action(action, None, window))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

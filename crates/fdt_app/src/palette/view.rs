@@ -4,11 +4,11 @@ use super::rank::rank;
 use super::recent::record_recent;
 use super::registry::{CommandSpec, haystack};
 use crate::actions::OpenPalette;
+use crate::keymap::shortcut_hint;
 use crate::settings::{settings, update_settings};
 use fdt_ui::theme::TokensExt as _;
 use fdt_ui::tokens::{font, layout, space};
 use gpui_kit::component::command::{Command, CommandItem, CommandState};
-use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::{IndexPath, WindowExt as _};
 use gpui_kit::{
     App, AppContext as _, Entity, FocusHandle, Hsla, InteractiveElement as _, ParentElement as _,
@@ -89,8 +89,7 @@ pub fn open_palette(
                     let focus = focus_for_rows.clone();
                     CommandItem::new().label(label).child(move |window, _cx| {
                         let action = make();
-                        let hint = Kbd::binding_for_action_in(action.as_ref(), &focus, window)
-                            .or_else(|| Kbd::binding_for_action(action.as_ref(), None, window));
+                        let hint = shortcut_hint(action.as_ref(), &focus, window);
                         div()
                             .flex()
                             .items_center()

@@ -1,5 +1,6 @@
 //! The keyboard shortcut cheat sheet, built from the registry and the live keymap.
 
+use crate::keymap::shortcut_hint;
 use crate::palette::registry::{CommandSpec, Group, commands};
 use fdt_ui::theme::TokensExt as _;
 use fdt_ui::tokens::{font, space};
@@ -22,9 +23,7 @@ fn group_name(group: Group) -> &'static str {
 }
 
 fn hint(spec: &CommandSpec, shell_focus: &FocusHandle, window: &Window) -> Option<Kbd> {
-    let action = (spec.action)();
-    Kbd::binding_for_action_in(action.as_ref(), shell_focus, window)
-        .or_else(|| Kbd::binding_for_action(action.as_ref(), None, window))
+    shortcut_hint((spec.action)().as_ref(), shell_focus, window)
 }
 
 /// Commands that have a binding, grouped in `Group` order; empty groups are dropped.
