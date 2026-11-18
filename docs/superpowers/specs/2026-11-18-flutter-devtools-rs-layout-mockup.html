@@ -1,0 +1,123 @@
+<style>
+.w{--bg:#0d0e11;--panel:#131519;--panel2:#1a1c22;--line:#23262d;--tx:#e7e8eb;--mu:#8a8f99;--dim:#5b606a;--ac:#7b8cff;--ok:#3fb27f;--warn:#e2a336;--bad:#e5534b;--net:#4ea1ff;--st:#b07cff;
+  background:var(--bg);color:var(--tx);border-radius:10px;overflow:hidden;font:12px/1.4 -apple-system,BlinkMacSystemFont,"Inter",system-ui,sans-serif;height:470px;display:flex;flex-direction:column;border:1px solid #2a2d34;text-align:left;width:100%}
+.w *{box-sizing:border-box}
+.w-title{height:36px;flex-shrink:0;display:flex;align-items:center;gap:12px;padding:0 12px;border-bottom:1px solid var(--line);background:var(--panel)}
+.w-dots{display:flex;gap:6px}.w-dots i{width:10px;height:10px;border-radius:50%;background:#3a3d44;display:block}
+.w-app{color:var(--mu);font-size:11.5px}.w-app b{color:var(--tx);font-weight:500}
+.w-live{display:flex;align-items:center;gap:5px;color:var(--ok);font-size:11px}.w-live:before{content:"";width:6px;height:6px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px rgba(63,178,127,.18)}
+.w-pill{margin-left:auto;display:flex;align-items:center;gap:6px;background:var(--panel2);border:1px solid var(--line);color:var(--dim);padding:3px 8px;border-radius:6px;font-size:11px;width:220px}
+.w-kbd{margin-left:auto;font-size:10px;color:var(--dim);border:1px solid var(--line);padding:0 4px;border-radius:3px}
+.w-nav{display:flex;gap:2px}.w-nav span{width:22px;height:22px;border-radius:5px;display:flex;align-items:center;justify-content:center;color:var(--dim);font-size:13px}
+.w-nav span.on{color:var(--tx);background:var(--panel2)}
+.w-scope{display:flex;align-items:center;gap:6px;background:rgba(123,140,255,.12);border:1px solid rgba(123,140,255,.45);color:#c9cfff;padding:2px 8px;border-radius:6px;font-size:11px}
+.w-scope .x{color:var(--dim);margin-left:2px}
+.w-body{flex:1;display:flex;min-height:0}
+.w-col{flex:1;display:flex;flex-direction:column;min-width:0}
+.w-lbl{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);font-weight:600}
+.w-chart{position:relative;height:30px}
+.w-frames{display:flex;align-items:flex-end;gap:1.5px;height:100%}
+.w-frames i{flex:1;display:block;border-radius:1px 1px 0 0;background:var(--ok);opacity:.45}
+.w-frames i.s{background:var(--warn);opacity:.9}.w-frames i.j{background:var(--bad);opacity:1}
+.w-selbox{position:absolute;top:-3px;bottom:-3px;border:1px solid rgba(123,140,255,.75);background:rgba(123,140,255,.10);border-radius:3px}
+.w-row{display:flex;gap:8px;padding:6px 14px;border-bottom:1px solid var(--line);align-items:center;white-space:nowrap}
+.w-row.sel{background:rgba(123,140,255,.10);box-shadow:inset 2px 0 0 var(--ac)}
+.w-mono{font-family:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}
+.w-mu{color:var(--mu)}.w-dim{color:var(--dim)}
+.w-bad{color:var(--bad)}.w-warn{color:var(--warn)}.w-ok{color:var(--ok)}
+.w-h{font-size:13.5px;font-weight:600;letter-spacing:-.01em}
+.w-side{width:184px;flex-shrink:0;border-right:1px solid var(--line);background:var(--panel);padding:10px 8px;display:flex;flex-direction:column;gap:2px}
+.w-side .it{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:6px;color:var(--mu)}
+.w-side .it.on{background:var(--panel2);color:var(--tx)}
+.w-side .ct{margin-left:auto;font-size:10px;color:var(--dim)}
+.w-side .sep{height:1px;background:var(--line);margin:6px 4px}
+.w-tabs{display:flex;gap:16px;padding:0 14px;border-bottom:1px solid var(--line);height:34px;align-items:flex-end}
+.w-tabs span{padding-bottom:8px;color:var(--mu)}.w-tabs span.on{color:var(--tx);box-shadow:inset 0 -2px 0 var(--ac)}
+.w-m{font-size:10px;font-weight:600;padding:1px 5px;border-radius:3px;background:var(--panel2);color:var(--mu)}
+.w-wf{position:relative;height:8px;flex:1}
+.w-wf b{position:absolute;top:1px;height:6px;border-radius:2px;display:block;background:var(--net);opacity:.7}
+.w-link{color:#aab4ff}
+.w-badge{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;background:var(--ac);color:#fff;font-size:10px;font-weight:700;margin-right:4px;flex-shrink:0}
+.notes{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:.75rem;margin-top:1rem}
+.notes div{background:var(--bg-secondary);border:1px solid var(--border);border-radius:10px;padding:.75rem .9rem;font-size:.88rem}
+.notes b{display:block;margin-bottom:.2rem}
+.num{display:inline-flex;align-items:center;justify-content:center;width:1.2rem;height:1.2rem;border-radius:50%;background:#7b8cff;color:#fff;font-size:.72rem;font-weight:700;margin-right:.35rem}
+</style>
+
+<h2>B, keeping the shared timeline</h2>
+<p class="subtitle">This is your pick, with four changes so you keep your place when you switch tools. Here you've selected a janky stretch in Performance, then jumped to Network.</p>
+
+<div class="mockup">
+<div class="mockup-header">Network page, scoped to the time you selected in Performance</div>
+<div class="mockup-body" style="padding:14px;background:var(--bg-tertiary)">
+<div class="w">
+  <div class="w-title"><div class="w-dots"><i></i><i></i><i></i></div>
+    <div class="w-nav"><span class="on"><span class="w-badge">1</span></span><span class="on">‹</span><span>›</span></div>
+    <span class="w-app"><b>shop_app</b> · iPhone 16 Pro · profile</span><span class="w-live">Recording 2:14</span>
+    <span class="w-badge">2</span><div class="w-scope">◷ 0:51 – 1:07 · 16 s<span class="x">✕</span></div>
+    <div class="w-pill">⌕ Search or run a command<span class="w-kbd">⌘K</span></div></div>
+  <div class="w-body">
+    <div class="w-side">
+      <div class="it"><span class="w-badge">3</span>⧉ Timeline<span class="ct">all</span></div>
+      <div class="sep"></div>
+      <div class="w-lbl" style="padding:2px 8px 4px">Tools</div>
+      <div class="it">▤ Performance<span class="ct w-bad">6</span></div>
+      <div class="it">◎ Memory<span class="ct">2</span></div>
+      <div class="it on">⇅ Network<span class="ct">9</span></div>
+      <div class="it">≡ Logs<span class="ct">214</span></div>
+      <div class="it">⌗ Widget tree</div>
+      <div class="it">◇ State<span class="ct">31</span></div>
+      <div style="margin-top:auto" class="it">⇪ Export session…</div>
+      <div class="it">⚙ Settings</div>
+    </div>
+    <div class="w-col">
+      <div style="padding:8px 14px 8px;border-bottom:1px solid var(--line);background:var(--panel)">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:5px"><span class="w-lbl">Session</span><span class="w-dim" style="font-size:10.5px">Same strip on every tool · drag to change the time range</span></div>
+        <div style="position:relative"><div class="w-chart"><div class="w-frames" data-n="160" data-seed="11"></div></div><div class="w-selbox" style="left:54%;width:13%"></div></div>
+      </div>
+      <div class="w-tabs"><span class="on">Requests</span><span>WebSockets</span><span>Errors <span class="w-bad">1</span></span></div>
+      <div style="flex:1;display:flex;min-height:0">
+        <div style="flex:1;overflow:hidden;border-right:1px solid var(--line)">
+          <div class="w-row w-lbl"><span style="width:44px">Method</span><span style="width:150px">Path</span><span style="width:44px">Status</span><span style="width:54px">Time</span><span style="flex:1">Waterfall</span></div>
+          <div class="w-row"><span style="width:44px"><span class="w-m">GET</span></span><span class="w-mono" style="width:150px">/v2/products?page=3</span><span class="w-mono w-ok" style="width:44px">200</span><span class="w-mono w-mu" style="width:54px">182 ms</span><div class="w-wf"><b style="left:2%;width:22%"></b></div></div>
+          <div class="w-row sel"><span style="width:44px"><span class="w-m">GET</span></span><span class="w-mono" style="width:150px">/img/hero_banner.jpg</span><span class="w-mono w-ok" style="width:44px">200</span><span class="w-mono w-warn" style="width:54px">1.4 s</span><div class="w-wf"><b style="left:10%;width:70%;background:var(--warn)"></b></div></div>
+          <div class="w-row"><span style="width:44px"><span class="w-m">GET</span></span><span class="w-mono" style="width:150px">/v2/cart</span><span class="w-mono w-ok" style="width:44px">200</span><span class="w-mono w-mu" style="width:54px">64 ms</span><div class="w-wf"><b style="left:30%;width:8%"></b></div></div>
+          <div class="w-row"><span style="width:44px"><span class="w-m">POST</span></span><span class="w-mono" style="width:150px">/v2/analytics/batch</span><span class="w-mono w-ok" style="width:44px">204</span><span class="w-mono w-mu" style="width:54px">91 ms</span><div class="w-wf"><b style="left:44%;width:11%"></b></div></div>
+          <div class="w-row"><span style="width:44px"><span class="w-m">POST</span></span><span class="w-mono" style="width:150px">/v2/orders</span><span class="w-mono w-bad" style="width:44px">500</span><span class="w-mono w-mu" style="width:54px">310 ms</span><div class="w-wf"><b style="left:60%;width:30%;background:var(--bad)"></b></div></div>
+          <div class="w-row"><span style="width:44px"><span class="w-m">GET</span></span><span class="w-mono" style="width:150px">/v2/products?page=4</span><span class="w-mono w-ok" style="width:44px">200</span><span class="w-mono w-mu" style="width:54px">170 ms</span><div class="w-wf"><b style="left:72%;width:20%"></b></div></div>
+        </div>
+        <div style="width:250px;flex-shrink:0;padding:12px 14px;overflow:hidden">
+          <div class="w-h w-mono" style="font-size:12.5px">GET /img/hero_banner.jpg</div>
+          <div class="w-mu" style="margin:4px 0 10px">200 · 14.2 MB · 1.4 s · via dart:io</div>
+          <div class="w-lbl" style="margin-bottom:4px">Related</div>
+          <div style="display:flex;align-items:flex-start;gap:4px;margin-bottom:5px"><span class="w-badge">4</span><span class="w-link">Frame #4,820 · 12.4 ms raster: decoding this image →</span></div>
+          <div class="w-link" style="margin:0 0 5px 20px">CachedImage in ProductCard →</div>
+          <div class="w-link" style="margin-left:20px">3 log lines at this time →</div>
+          <div class="w-lbl" style="margin:12px 0 4px">Headers</div>
+          <div class="w-mono w-mu" style="font-size:10.5px;line-height:1.6">content-type: image/jpeg<br>content-length: 14 893 120<br>cache-control: max-age=3600</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+</div>
+
+<div class="notes">
+  <div><b><span class="num">1</span>Back and forward</b>⌘[ and ⌘] move through where you've been, like a browser, across tools and selections.</div>
+  <div><b><span class="num">2</span>Time range follows you</b>Select a stretch in any tool and every other tool narrows to it until you clear it. The session strip at the top of each page shows it.</div>
+  <div><b><span class="num">3</span>Timeline page</b>The all-lanes view (frames, network, logs, state, GC) is one page in the sidebar. It's also where session export starts.</div>
+  <div><b><span class="num">4</span>Cross-links</b>Anything related at the same moment is one click away: a request's frame, a frame's rebuilt widgets, a leak's screen.</div>
+</div>
+
+<script>
+(function(){
+  function rng(s){return function(){s=(s*9301+49297)%233280;return s/233280;}}
+  document.querySelectorAll('.w-frames').forEach(function(el){
+    var n=+el.dataset.n||90,r=rng(+el.dataset.seed||7),h='';
+    for(var i=0;i<n;i++){var v=r(),x,c='';var b=(i/n>0.55&&i/n<0.66);
+      if(v>0.95||(b&&v>0.55)){x=72+r()*28;c='j'}else if(v>0.87||(b&&v>0.3)){x=46+r()*18;c='s'}else{x=14+r()*24}
+      h+='<i class="'+c+'" style="height:'+x.toFixed(0)+'%"></i>';}
+    el.innerHTML=h;});
+})();
+</script>
