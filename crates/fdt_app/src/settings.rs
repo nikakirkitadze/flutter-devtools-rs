@@ -78,6 +78,8 @@ struct AppSettings {
     store: SettingsStore,
     /// Bumped on every update; a save only writes while it is still the latest.
     generation: Arc<AtomicU64>,
+    /// The generation last written to disk; equal to `generation` when nothing is pending.
+    saved: Arc<AtomicU64>,
     /// Serialises writes so they never share the temporary file.
     write_lock: Arc<Mutex<()>>,
 }
@@ -88,6 +90,7 @@ pub fn init_settings(cx: &mut App, store: SettingsStore) {
     cx.set_global(AppSettings {
         store,
         generation: Arc::new(AtomicU64::new(0)),
+        saved: Arc::new(AtomicU64::new(0)),
         write_lock: Arc::new(Mutex::new(())),
     });
 }
@@ -106,6 +109,7 @@ pub fn update_settings(cx: &mut App, f: impl FnOnce(&mut Settings)) {
     };
     let snapshot = app.store.current.clone();
     let latest = app.generation.clone();
+    let saved = app.saved.clone();
     let lock = app.write_lock.clone();
     cx.background_executor()
         .spawn(async move {
@@ -114,25 +118,33 @@ pub fn update_settings(cx: &mut App, f: impl FnOnce(&mut Settings)) {
             if latest.load(Ordering::SeqCst) != generation {
                 return;
             }
-            if let Err(err) = SettingsStore::write(&path, &snapshot) {
-                log::warn!("saving settings to {} failed: {err}", path.display());
+            match SettingsStore::write(&path, &snapshot) {
+                Ok(()) => saved.store(generation, Ordering::SeqCst),
+                Err(err) => log::warn!("saving settings to {} failed: {err}", path.display()),
             }
         })
         .detach();
 }
 
-/// Writes the current settings to disk now, on the calling thread.
+/// Writes the current settings to disk now, on the calling thread, if they have changed since
+/// the last save.
 ///
 /// Used when the app quits: macOS then calls `exit(0)`, which can kill a background save that
-/// is still pending. Waits for any in-flight write through the same lock.
+/// is still pending. Waits for any in-flight write through the same lock. Skipping unchanged
+/// settings keeps a hand-edited file that failed to load from being overwritten with defaults.
 pub fn flush_settings(cx: &App) {
     let app = cx.global::<AppSettings>();
     let Some(path) = app.store.path.as_ref() else {
         return;
     };
     let _guard = app.write_lock.lock().unwrap_or_else(|e| e.into_inner());
-    if let Err(err) = SettingsStore::write(path, app.store.get()) {
-        log::warn!("saving settings to {} failed: {err}", path.display());
+    let current = app.generation.load(Ordering::SeqCst);
+    if app.saved.load(Ordering::SeqCst) == current {
+        return;
+    }
+    match SettingsStore::write(path, app.store.get()) {
+        Ok(()) => app.saved.store(current, Ordering::SeqCst),
+        Err(err) => log::warn!("saving settings to {} failed: {err}", path.display()),
     }
 }
 
@@ -238,6 +250,33 @@ mod tests {
             SettingsStore::load(path).get().theme,
             ThemePreference::Light
         );
+    }
+
+    #[gpui_kit::test]
+    fn flush_leaves_the_file_alone_when_nothing_changed(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_in(dir.path());
+        // A hand-edited file with a mistake: load falls back to defaults.
+        std::fs::write(&path, "{not json").unwrap();
+        cx.update(|cx| {
+            init_settings(cx, SettingsStore::load(path.clone()));
+            flush_settings(cx);
+        });
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not json");
+    }
+
+    #[gpui_kit::test]
+    fn flush_skips_settings_the_background_save_already_wrote(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_in(dir.path());
+        cx.update(|cx| {
+            init_settings(cx, SettingsStore::load(path.clone()));
+            update_settings(cx, |s| s.theme = ThemePreference::Dark);
+        });
+        cx.run_until_parked();
+        std::fs::write(&path, "edited by hand").unwrap();
+        cx.update(|cx| flush_settings(cx));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited by hand");
     }
 
     #[gpui_kit::test]

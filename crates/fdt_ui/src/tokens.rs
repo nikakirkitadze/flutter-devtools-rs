@@ -225,7 +225,7 @@ pub mod layout {
     pub const PALETTE_WIDTH: Pixels = px(640.);
     pub const PALETTE_TOP_OFFSET: Pixels = px(96.);
     pub const PALETTE_MAX_HEIGHT: Pixels = px(420.);
-    pub const HUD_WIDTH: Pixels = px(232.);
+    pub const HUD_WIDTH: Pixels = px(320.);
     pub const HUD_GRAPH_HEIGHT: Pixels = px(40.);
     pub const FOCUS_RING: Pixels = px(2.);
     pub const BORDER: Pixels = px(1.);

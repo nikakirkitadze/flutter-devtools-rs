@@ -327,6 +327,22 @@ mod tests {
         assert_eq!(refresh, Duration::from_secs_f64(0.008333));
     }
 
+    #[test]
+    fn hud_width_fits_the_widest_row() {
+        // JetBrains Mono advances 600/1000 em per glyph (checked in the bundled TTF).
+        let glyph = font::LABEL * 0.6;
+        // Widest row: a 12-glyph label, three "p50 999.9" cells and "ms".
+        let text = glyph * (12 + 3 * (3 + 5) + 2) as f32;
+        let gaps = space::S6 * 4.0 + space::S4 * 3.0;
+        let chrome = space::S12 * 2.0 + layout::BORDER * 2.0;
+        let needed = text + gaps + chrome;
+        assert!(
+            needed <= layout::HUD_WIDTH,
+            "HUD rows need {needed:?}, panel is {:?}",
+            layout::HUD_WIDTH
+        );
+    }
+
     fn exists(cx: &mut gpui_kit::VisualTestContext, id: &'static str) -> bool {
         cx.update(|window, cx| {
             window.render_frame(cx);

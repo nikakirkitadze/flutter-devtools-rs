@@ -4,8 +4,8 @@ These are review findings that were deliberately not fixed in M1. They were tria
 
 ## Parked after the final fix round
 
-- HUD rows overflow the 232 px panel after relabelling ("Frame (anim)") — Ruling: real and user-visible; deferred because T16 is measuring on this exact code and there is no second wave; fix = HUD_WIDTH ≈ 280 or shorter labels; surface to user as recommended pre-merge one-liner.
-- flush_settings writes on every quit (overwrites a hand-edited invalid settings.json with defaults; startup-trace runs rewrite the file; main-thread write at quit) — Ruling: real, regression from M3; fix = skip when generation unchanged since last write; surface to user as recommended pre-merge one-liner.
+- ~~HUD rows overflow the 232 px panel after relabelling ("Frame (anim)")~~ — **Fixed before merge:** HUD_WIDTH is 320 px (the widest row needs ~313 px at JetBrains Mono's 0.6 em advance); `hud_width_fits_the_widest_row` pins it.
+- ~~flush_settings writes on every quit~~ — **Fixed before merge:** settings track the last saved generation and the quit flush skips when nothing is pending; tests `flush_leaves_the_file_alone_when_nothing_changed` and `flush_skips_settings_the_background_save_already_wrote`.
 - logger uses eprintln! (panics on broken stderr pipe) — Ruling: real, trivial (`let _ = writeln!(stderr)`); deferred.
 - I6 jank test doesn't exercise the no-toggle dispose path, so it can't go RED on 3.41.9 against the old code — Ruling: real; fix is controller-eager already, test gap only; deferred.
 - I5 has no test though bounds-based line-height test is possible — Ruling: deferred, visual review covers it.
