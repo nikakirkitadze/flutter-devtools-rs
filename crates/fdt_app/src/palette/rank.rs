@@ -1,10 +1,37 @@
 //! Fuzzy scoring and ordering for the command palette.
 
+/// Most terms a query may have; beyond this nothing matches.
+const MAX_TERMS: usize = 32;
+
+/// A query split into lower-cased terms, built once per keystroke.
+struct PreparedQuery {
+    terms: Vec<Vec<char>>,
+    longest: usize,
+}
+
+impl PreparedQuery {
+    fn new(query: &str) -> Self {
+        let terms: Vec<Vec<char>> = query
+            .split_whitespace()
+            .map(|t| t.chars().map(lower).collect())
+            .collect();
+        let longest = terms.iter().map(Vec::len).max().unwrap_or(0);
+        Self { terms, longest }
+    }
+}
+
 /// Scores `query` against `haystack`; `None` when any term does not match.
 pub fn fuzzy_score(query: &str, haystack: &str) -> Option<i32> {
-    let terms: Vec<&str> = query.split_whitespace().collect();
-    if terms.is_empty() {
+    score_prepared(&PreparedQuery::new(query), haystack)
+}
+
+fn score_prepared(q: &PreparedQuery, haystack: &str) -> Option<i32> {
+    if q.terms.is_empty() {
         return Some(0);
+    }
+    // A term cannot be longer than the haystack (byte length >= char count).
+    if q.longest > haystack.len() {
+        return None;
     }
     let orig: Vec<char> = haystack.chars().collect();
     let h: Vec<char> = orig.iter().map(|c| lower(*c)).collect();
@@ -18,9 +45,8 @@ pub fn fuzzy_score(query: &str, haystack: &str) -> Option<i32> {
     let mut prev = vec![NEG; h.len()];
     let mut cur = vec![NEG; h.len()];
     let mut total = 0i32;
-    for term in terms {
-        let t: Vec<char> = term.chars().map(lower).collect();
-        total += term_score(&t, &h, &boundary, &mut prev, &mut cur)?;
+    for t in &q.terms {
+        total += term_score(t, &h, &boundary, &mut prev, &mut cur)?;
     }
     Some(total)
 }
@@ -102,10 +128,19 @@ pub fn rank(query: &str, haystacks: &[String], recent: &[usize]) -> Vec<usize> {
         let rest = (0..haystacks.len()).filter(|&i| !seen[i]);
         return recents.into_iter().chain(rest).collect();
     }
+    let q = PreparedQuery::new(query);
+    let longest = haystacks
+        .iter()
+        .map(|h| h.chars().count())
+        .max()
+        .unwrap_or(0);
+    if q.terms.len() > MAX_TERMS || q.longest > longest {
+        return Vec::new();
+    }
     let mut scored: Vec<(i32, usize)> = haystacks
         .iter()
         .enumerate()
-        .filter_map(|(i, h)| fuzzy_score(query, h).map(|s| (s + bonus[i], i)))
+        .filter_map(|(i, h)| score_prepared(&q, h).map(|s| (s + bonus[i], i)))
         .collect();
     scored.sort_by(|a, b| {
         b.0.cmp(&a.0)
@@ -200,12 +235,29 @@ mod tests {
     }
 
     #[test]
+    fn long_paste_returns_no_matches_quickly() {
+        let start = std::time::Instant::now();
+        assert!(rank(&"x".repeat(100_000), &synthetic_labels(5000), &[]).is_empty());
+        assert!(start.elapsed() < std::time::Duration::from_millis(500));
+    }
+
+    #[test]
+    fn many_short_terms_are_capped() {
+        let q = vec!["a"; 40].join(" ");
+        assert!(rank(&q, &synthetic_labels(5000), &[]).is_empty());
+    }
+
+    #[test]
     #[cfg_attr(debug_assertions, ignore = "budget: run with --release")]
     fn budget_rank_5000_items_per_keystroke() {
         let items = synthetic_labels(5000);
-        for q in [
-            "s", "sh", "sho", "show", "show m", "show me", "net req", "frame 48", "zzz",
-        ] {
+        let long = "x".repeat(100_000);
+        let many = vec!["a"; 40].join(" ");
+        let queries: [&str; 11] = [
+            "s", "sh", "sho", "show", "show m", "show me", "net req", "frame 48", "zzz", &long,
+            &many,
+        ];
+        for q in queries {
             std::hint::black_box(rank(q, &items, &[]));
             let mut worst = std::time::Duration::ZERO;
             for _ in 0..20 {
@@ -213,10 +265,11 @@ mod tests {
                 std::hint::black_box(rank(q, &items, &[1, 2, 3]));
                 worst = worst.max(t.elapsed());
             }
-            eprintln!("budget query {q:?} worst {worst:?}");
+            eprintln!("budget query len {} worst {worst:?}", q.len());
             assert!(
                 worst <= std::time::Duration::from_millis(8),
-                "query {q:?} took {worst:?}"
+                "query of {} bytes took {worst:?}",
+                q.len()
             );
         }
     }
