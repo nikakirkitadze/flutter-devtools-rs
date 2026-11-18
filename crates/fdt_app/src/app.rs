@@ -2,14 +2,16 @@
 
 use crate::actions::{Hide, HideOthers, OpenPalette, Quit, ShowAll};
 use crate::keymap;
-use crate::settings::{SettingsStore, init_settings, settings};
+use crate::settings::{SettingsStore, flush_settings, init_settings, settings};
 use crate::shell::MainWindow;
 use crate::startup::{StartupPhases, StartupReport, WATCHDOG, emit, mark};
 use fdt_ui::assets::FdtAssets;
 use fdt_ui::theme;
 use fdt_ui::tokens::layout;
 use gpui_kit::component::{TitleBar, WindowExt as _};
-use gpui_kit::{App, AppContext as _, Bounds, Entity, Window, WindowBounds, WindowOptions};
+use gpui_kit::{
+    App, AppContext as _, Bounds, Entity, TitlebarOptions, Window, WindowBounds, WindowOptions,
+};
 use std::cell::Cell;
 use std::process::ExitCode;
 use std::rc::Rc;
@@ -49,6 +51,11 @@ pub fn main_window_options(cx: &App) -> WindowOptions {
         ))),
         window_min_size: Some(layout::WINDOW_MIN),
         app_id: Some("dev.fdt.fdt".into()),
+        // The title bar is custom drawn, but Alt-Tab, taskbars and screen readers read this.
+        titlebar: Some(TitlebarOptions {
+            title: Some("fdt".into()),
+            ..TitleBar::title_bar_options()
+        }),
         // Linux has no server-side frame here: draw it on the client (unverified, built on macOS).
         #[cfg(target_os = "linux")]
         window_decorations: Some(gpui_kit::WindowDecorations::Client),
@@ -77,6 +84,11 @@ fn start(
     }
     mark(phases, "fonts_loaded");
     init_settings(cx, store);
+    cx.on_app_quit(|cx| {
+        flush_settings(cx);
+        std::future::ready(())
+    })
+    .detach();
     let pref = settings(cx).theme;
     theme::apply(pref, None, cx);
     mark(phases, "theme_applied");
@@ -240,6 +252,8 @@ mod tests {
         let opts = cx.update(|cx| main_window_options(cx));
         assert_eq!(opts.window_min_size, Some(layout::WINDOW_MIN));
         assert_eq!(opts.app_id.as_deref(), Some("dev.fdt.fdt"));
+        let title = opts.titlebar.and_then(|t| t.title);
+        assert_eq!(title.as_deref(), Some("fdt"));
         #[cfg(target_os = "linux")]
         assert_eq!(
             opts.window_decorations,

@@ -121,6 +121,21 @@ pub fn update_settings(cx: &mut App, f: impl FnOnce(&mut Settings)) {
         .detach();
 }
 
+/// Writes the current settings to disk now, on the calling thread.
+///
+/// Used when the app quits: macOS then calls `exit(0)`, which can kill a background save that
+/// is still pending. Waits for any in-flight write through the same lock.
+pub fn flush_settings(cx: &App) {
+    let app = cx.global::<AppSettings>();
+    let Some(path) = app.store.path.as_ref() else {
+        return;
+    };
+    let _guard = app.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+    if let Err(err) = SettingsStore::write(path, app.store.get()) {
+        log::warn!("saving settings to {} failed: {err}", path.display());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +222,30 @@ mod tests {
         });
         cx.run_until_parked();
         cx.update(|cx| assert_eq!(settings(cx).theme, ThemePreference::Dark));
+    }
+
+    #[gpui_kit::test]
+    fn flush_writes_the_latest_settings_before_the_background_save_runs(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_in(dir.path());
+        cx.update(|cx| {
+            init_settings(cx, SettingsStore::load(path.clone()));
+            update_settings(cx, |s| s.theme = ThemePreference::Light);
+            // No `run_until_parked`: the background save has not run yet.
+            flush_settings(cx);
+        });
+        assert_eq!(
+            SettingsStore::load(path).get().theme,
+            ThemePreference::Light
+        );
+    }
+
+    #[gpui_kit::test]
+    fn flush_without_a_file_is_a_no_op(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            init_settings(cx, SettingsStore::in_memory());
+            flush_settings(cx);
+        });
     }
 
     #[gpui_kit::test]
