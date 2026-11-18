@@ -15,6 +15,12 @@ pub enum Appearance {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Color(pub u32);
 
+impl From<Color> for Hsla {
+    fn from(c: Color) -> Self {
+        c.hsla()
+    }
+}
+
 impl Color {
     pub fn hsla(self) -> Hsla {
         rgb(self.0).into()
