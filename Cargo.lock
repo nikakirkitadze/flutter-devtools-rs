@@ -1728,6 +1728,7 @@ name = "fdt_app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "criterion",
  "dirs 6.0.0",
  "fdt_ui",
  "gpui-kit",

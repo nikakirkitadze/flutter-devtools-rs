@@ -22,3 +22,8 @@ dirs.workspace = true
 [dev-dependencies]
 gpui_kit = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "palette_rank"
+harness = false
