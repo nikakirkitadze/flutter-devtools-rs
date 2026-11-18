@@ -1,0 +1,28 @@
+[graph]
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+  "x86_64-unknown-linux-gnu",
+]
+
+[licenses]
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "0BSD",
+  "CC0-1.0",
+]
+confidence-threshold = 0.93
+# MPL-2.0 only for these crates, used unmodified (spec §12.1). Adding one needs a decision, not an edit.
+exceptions = [
+  { allow = ["MPL-2.0"], crate = "dwrote" },
+  { allow = ["MPL-2.0"], crate = "option-ext" },
+  { allow = ["MPL-2.0"], crate = "cbindgen" },
+]
