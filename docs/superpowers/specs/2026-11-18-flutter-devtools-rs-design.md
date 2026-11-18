@@ -1,7 +1,7 @@
 # Flutter DevTools replacement in Rust: design
 
 - **Date:** 2026-11-18
-- **Status:** Draft, awaiting approval
+- **Status:** Approved 2026-11-18. Implementation plans live in `docs/superpowers/plans/`.
 - **Working name:** `fdt` (a placeholder for crates, the binary and the file extension; the product name is still open)
 
 ---
@@ -109,6 +109,7 @@ The Dart VM service is JSON-RPC over WebSocket, exposed by debug and profile bui
 - **Flutter.** The current stable release plus the three before it, roughly a year of releases. Recorded VM service fixtures and the CI `jank_lab` matrix cover the oldest and newest of that range.
 - **Fallback code paths.** Paths such as the JSON timeline and `getCpuSamples` exist only if a supported release needs them. The builder checks this against the range.
 - **Probe package.** Its minimum SDK matches the oldest supported Flutter. It targets current majors: `bloc` 9+ and `flutter_riverpod` 3+. Riverpod 3 changed `ProviderObserver`, and Riverpod 2 is not supported.
+- **The range at M1 planning (2026-11-18)** is Flutter 3.41 to 3.50 (Dart 3.11 to 3.14). Flutter 3.50.0 shipped on 2026-11-11.
 - **SDK-internal fields.** The versioned table of fields used for leak detection (§8.3 Memory) has one entry per supported release where the fields differ.
 
 ## 6. Approaches considered
@@ -388,7 +389,7 @@ VM service / DTD ──WebSocket──► fdt_vm (async runtime, own threads)
 
 | Purpose | Crates |
 |---------|--------|
-| UI | `gpui` (pinned git revision), `gpui-component` |
+| UI | `gpui-kit` 0.10.0, pinned with `=`. It bundles `gpui-pre` 0.3.12 (a crates.io snapshot of Zed's `gpui`), `gpui-component` 0.10.0 and the Lucide icons. |
 | Async, networking, JSON | `tokio`, `tokio-tungstenite`, `serde`, `serde_json` |
 | Perfetto protobuf decoding | `prost` |
 | Parallel analysis | `rayon` |
@@ -397,7 +398,7 @@ VM service / DTD ──WebSocket──► fdt_vm (async runtime, own threads)
 | MCP | `rmcp` (official Rust MCP SDK) |
 | Benchmarks | `criterion` |
 
-GPUI and `gpui-component` versions are pinned in `Cargo.lock` and upgraded only on purpose.
+The `gpui-kit` version is pinned exactly in the workspace manifest and upgraded only on purpose.
 
 ## 10. UI quality requirements
 
@@ -455,7 +456,7 @@ UI quality is part of done. A feature that works but misses these targets is not
 
 Everything visual comes from tokens in `fdt_ui::theme`. Views never hard-code colours, sizes, radii or durations; the builder adds a check that enforces this.
 
-**Colour.** Semantic tokens, each defined for dark and light. Starting values come from the approved mockups; the builder tunes them and verifies contrast.
+**Colour.** Semantic tokens, each defined for dark and light. Values started from the approved mockups and were tuned during M1 planning to meet the contrast rules below. `fdt_ui::tokens` is the source of truth.
 
 | Token | Dark | Light |
 |-------|------|-------|
@@ -465,15 +466,18 @@ Everything visual comes from tokens in `fdt_ui::theme`. Views never hard-code co
 | `border` | `#23262D` | `#E3E5E9` |
 | `text` | `#E7E8EB` | `#16181D` |
 | `text-muted` | `#8A8F99` | `#5C6370` |
-| `text-faint` | `#5B606A` | `#8B919C` |
-| `accent` | `#7B8CFF` | `#5B6CF0` |
-| `success` / frame ok | `#3FB27F` | `#1F9D63` |
-| `warning` / frame slow | `#E2A336` | `#B7791F` |
-| `danger` / frame janky | `#E5534B` | `#D23B33` |
-| `lane-network` | `#4EA1FF` | `#2F80ED` |
-| `lane-state` | `#B07CFF` | `#8B5CF6` |
+| `text-faint` | `#626772` | `#888E9A` |
+| `accent` | `#7B8CFF` | `#4E60EF` |
+| `success` / frame ok | `#3FB27F` | `#198051` |
+| `warning` / frame slow | `#E2A336` | `#99651A` |
+| `danger` / frame janky | `#E5534B` | `#D0362E` |
+| `lane-network` | `#4EA1FF` | `#146CE2` |
+| `lane-state` | `#B07CFF` | `#804CF5` |
 
-- **Contrast** meets WCAG AA in both themes: 4.5:1 for body text and 3:1 for UI elements and chart marks.
+- **Contrast** meets WCAG AA in both themes, measured against `bg`, `surface` and `elevated`:
+  - `text` and `text-muted`: 4.5:1.
+  - `accent`, the status colours and the lane colours: 4.5:1, so they work as text as well as marks.
+  - `text-faint`: 3:1. It is used only for disabled text and decorative labels, never for information.
 - **Colour is never the only signal.** Janky frames are also taller and labelled, and statuses carry text or icons.
 - **Lane colours** stay distinguishable under deuteranopia and protanopia.
 
@@ -541,7 +545,9 @@ The project is open source in a public GitHub repository.
   - Companies can adopt it without legal review.
 - **The `fdt_probe` Dart package: BSD-3-Clause**, the Dart and Flutter ecosystem convention. It is compiled into other people's apps, so it must stay permissive. It is published on pub.dev; the publisher is chosen at first release.
 - **Zed's GPL-3.0 crates must not be copied.** Zed's `gpui` crate is Apache-2.0, but its application crates (`ui`, `picker`, `title_bar`, `workspace` and others) are GPL-3.0. They can be read for ideas but never copied. The command palette, title bar and other chrome are built on `gpui` and `gpui-component`.
-- **Licence check in CI.** `cargo-deny` enforces an allow-list of compatible dependency licences: Apache-2.0, MIT, BSD, ISC, Zlib, Unicode, and OFL for fonts.
+- **Licence check in CI.** `cargo-deny` enforces an allow-list of compatible dependency licences: Apache-2.0, MIT, BSD, ISC, Zlib, Unicode, 0BSD and CC0. OFL covers the bundled fonts, which are assets rather than crates.
+  - MPL-2.0 is allowed only for crates named one by one: `dwrote` (GPUI's Windows font backend), `option-ext` (through `dirs`) and `cbindgen` (a build-time tool). MPL-2.0 is file-level copyleft, and these crates are used unmodified. Any new MPL crate needs a decision first.
+  - GPL, LGPL and AGPL dependencies are not allowed.
 - **Bundled assets:** Inter (OFL), JetBrains Mono (OFL) and Lucide icons (ISC).
 
 ### 12.2 Packages and releases
@@ -596,7 +602,7 @@ These were not discussed explicitly. Each is a proposal with a reason:
 
 ## 15. Left to the builder
 
-- Exact crate versions, and the GPUI revision to pin (match what `gpui-component` pins).
+- Exact crate versions. (The GPUI pin was settled in M1 planning: `gpui-kit` 0.10.0.)
 - Perfetto protobuf compared with the JSON timeline, and the polling cadence for timeline and HTTP profile updates.
 - The concrete design of the level-of-detail summaries and the store's chunk format.
 - The slow-frame explanation heuristics, iterated against `jank_lab` scenarios.
