@@ -27,6 +27,7 @@ gpui_kit::actions!(
         Minimize,
         Zoom,
         ToggleFullScreen,
+        CloseWindow,
         Hide,
         HideOthers,
         ShowAll

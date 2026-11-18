@@ -1,5 +1,6 @@
 //! The keyboard shortcut cheat sheet, built from the registry and the live keymap.
 
+use crate::actions::OpenPalette;
 use crate::keymap::shortcut_hint;
 use crate::palette::registry::{CommandSpec, Group, commands};
 use fdt_ui::theme::TokensExt as _;
@@ -31,7 +32,18 @@ pub fn bound_commands(
     shell_focus: &FocusHandle,
     window: &Window,
 ) -> Vec<(Group, Vec<CommandSpec>)> {
-    let all = commands();
+    let mut all = commands();
+    // Opening the palette is not a palette command, but it is the most useful shortcut to list.
+    all.insert(
+        0,
+        CommandSpec {
+            id: "palette.open",
+            label: "Open command palette",
+            keywords: &[],
+            group: Group::Navigation,
+            action: || Box::new(OpenPalette),
+        },
+    );
     GROUPS
         .into_iter()
         .filter_map(|group| {
@@ -98,6 +110,7 @@ impl RowId for CommandSpec {
 
 #[cfg(test)]
 mod tests {
+    use super::bound_commands;
     use crate::actions::ShowShortcuts;
     use crate::test_support::{exists, open_shell, press};
     use gpui_kit::TestAppContext;
@@ -114,6 +127,21 @@ mod tests {
         assert!(dialog_open(cx));
         assert!(exists(cx, "shortcut-row-tool.memory"));
         assert!(exists(cx, "shortcut-row-nav.back"));
+    }
+
+    #[gpui_kit::test]
+    fn the_cheat_sheet_lists_the_command_palette_first(cx: &mut TestAppContext) {
+        let (shell, cx) = open_shell(cx);
+        cx.dispatch_action(ShowShortcuts);
+        cx.run_until_parked();
+        assert!(exists(cx, "shortcut-row-palette.open"));
+        let focus = shell.read_with(cx, |s, _| s.focus_handle());
+        let first = cx.update(|window, _| {
+            bound_commands(&focus, window)
+                .first()
+                .and_then(|(_, rows)| rows.first().map(|r| r.id))
+        });
+        assert_eq!(first, Some("palette.open"));
     }
 
     #[gpui_kit::test]

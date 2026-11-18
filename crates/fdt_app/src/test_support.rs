@@ -7,7 +7,10 @@ use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AppContext as _, Entity, TestAppContext, VisualTestContext};
 use std::cell::RefCell;
 
-/// App-level setup shared with production, without fonts or the OS motion probe.
+/// App-level setup shared with production, without fonts.
+///
+/// The OS reduced-motion probe still runs when a shell window activates
+/// (`MainWindow::new` observes activation), so tests see the host's setting unless they set it.
 pub fn init(cx: &mut TestAppContext) {
     cx.update(|cx| {
         crate::app::init(cx);

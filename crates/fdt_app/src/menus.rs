@@ -2,8 +2,9 @@
 
 use crate::actions::show_tool;
 use crate::actions::{
-    About, GoBack, GoForward, Minimize, OpenPalette, OpenSettings, Quit, ShowShortcuts,
-    ToggleFrameHud, ToggleFullScreen, UseDarkTheme, UseLightTheme, UseSystemTheme, Zoom,
+    About, CloseWindow, GoBack, GoForward, Minimize, OpenPalette, OpenSettings, Quit,
+    ShowShortcuts, ToggleFrameHud, ToggleFullScreen, UseDarkTheme, UseLightTheme, UseSystemTheme,
+    Zoom,
 };
 #[cfg(target_os = "macos")]
 use crate::actions::{Hide, HideOthers, ShowAll};
@@ -66,6 +67,7 @@ pub fn app_menus() -> Vec<Menu> {
         ]),
         Menu::new("Go").items(go),
         Menu::new("Window").items([
+            MenuItem::action("Close Window", CloseWindow),
             MenuItem::action("Minimize", Minimize),
             MenuItem::action("Zoom", Zoom),
         ]),

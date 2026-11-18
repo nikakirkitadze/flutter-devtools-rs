@@ -8,9 +8,10 @@ mod title_bar;
 mod tool_page;
 
 use crate::actions::{
-    About, ClearSelection, GoBack, GoForward, Minimize, OpenPalette, OpenSettings, ShowLogs,
-    ShowMemory, ShowNetwork, ShowPerformance, ShowShortcuts, ShowState, ShowTimeline, ShowWidgets,
-    ToggleFrameHud, ToggleFullScreen, UseDarkTheme, UseLightTheme, UseSystemTheme, Zoom,
+    About, ClearSelection, CloseWindow, GoBack, GoForward, Minimize, OpenPalette, OpenSettings,
+    ShowLogs, ShowMemory, ShowNetwork, ShowPerformance, ShowShortcuts, ShowState, ShowTimeline,
+    ShowWidgets, ToggleFrameHud, ToggleFullScreen, UseDarkTheme, UseLightTheme, UseSystemTheme,
+    Zoom,
 };
 use crate::keymap::SHELL_CONTEXT;
 use crate::nav::{Location, NavHistory, Page, Tool};
@@ -231,6 +232,7 @@ impl Render for MainWindow {
             .on_action(cx.listener(|this, _: &ToggleFrameHud, w, cx| {
                 this.hud.update(cx, |hud, cx| hud.toggle(w, cx));
             }))
+            .on_action(cx.listener(|_, _: &CloseWindow, w, _| w.remove_window()))
             .on_action(cx.listener(|_, _: &Minimize, w, _| w.minimize_window()))
             .on_action(cx.listener(|_, _: &Zoom, w, _| w.zoom_window()))
             .on_action(cx.listener(|_, _: &ToggleFullScreen, w, _| w.toggle_fullscreen()))
@@ -283,6 +285,17 @@ mod tests {
 
     fn page(shell: &gpui_kit::Entity<MainWindow>, cx: &mut gpui_kit::VisualTestContext) -> Page {
         shell.read_with(cx, |s, _| s.current().page)
+    }
+
+    #[gpui_kit::test]
+    fn close_window_removes_the_window(cx: &mut TestAppContext) {
+        let (shell, cx) = open_shell(cx);
+        assert_eq!(cx.update(|_, cx| cx.windows().len()), 1);
+        press(cx, "cmd-w", "ctrl-w");
+        let weak = shell.downgrade();
+        drop(shell);
+        cx.run_until_parked();
+        assert!(weak.upgrade().is_none(), "the window should be gone");
     }
 
     #[gpui_kit::test]

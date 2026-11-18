@@ -1,8 +1,8 @@
 //! The command registry the palette, menus and cheat sheet are built from.
 
 use crate::actions::{
-    About, ClearSelection, GoBack, GoForward, Minimize, OpenSettings, Quit, ShowLogs, ShowMemory,
-    ShowNetwork, ShowPerformance, ShowShortcuts, ShowState, ShowTimeline, ShowWidgets,
+    About, ClearSelection, CloseWindow, GoBack, GoForward, Minimize, OpenSettings, Quit, ShowLogs,
+    ShowMemory, ShowNetwork, ShowPerformance, ShowShortcuts, ShowState, ShowTimeline, ShowWidgets,
     ToggleFrameHud, ToggleFullScreen, UseDarkTheme, UseLightTheme, UseSystemTheme, Zoom,
 };
 #[cfg(target_os = "macos")]
@@ -180,6 +180,13 @@ pub fn commands() -> Vec<CommandSpec> {
             keywords: &["appearance"],
             group: Group::View,
             action: || Box::new(UseLightTheme),
+        },
+        CommandSpec {
+            id: "window.close",
+            label: "Close Window",
+            keywords: &[],
+            group: Group::Window,
+            action: || Box::new(CloseWindow),
         },
         CommandSpec {
             id: "window.minimize",
