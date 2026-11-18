@@ -246,7 +246,7 @@ impl Render for MainWindow {
                 div()
                     .flex()
                     .flex_1()
-                    .overflow_hidden()
+                    .min_h_0()
                     .w_full()
                     .child(self.render_sidebar(cx))
                     .child(
