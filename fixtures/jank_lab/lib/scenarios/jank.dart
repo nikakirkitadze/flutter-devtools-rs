@@ -15,11 +15,29 @@ class JankScreen extends StatefulWidget {
 
 class _JankScreenState extends State<JankScreen>
     with SingleTickerProviderStateMixin {
-  late final AnimationController _controller = AnimationController(
-    vsync: this,
-    duration: const Duration(seconds: 2),
-  )..repeat();
+  late final AnimationController _controller;
   bool _raster = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // Created here, not lazily: first touching a `late final` ticker inside
+    // `dispose` looks up the (deactivated) ancestor chain, which throws in
+    // debug on Flutter 3.41-3.44.
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 2),
+    );
+  }
+
+  void _setRaster(bool value) {
+    setState(() => _raster = value);
+    if (value) {
+      _controller.repeat();
+    } else {
+      _controller.stop();
+    }
+  }
 
   @override
   void dispose() {
@@ -37,7 +55,7 @@ class _JankScreenState extends State<JankScreen>
           SwitchListTile(
             title: const Text('Raster heavy'),
             value: _raster,
-            onChanged: (v) => setState(() => _raster = v),
+            onChanged: _setRaster,
           ),
           if (_raster)
             Expanded(child: _RasterHeavy(animation: _controller))

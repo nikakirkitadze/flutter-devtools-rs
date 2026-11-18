@@ -84,4 +84,20 @@ void main() {
       expect(find.text(label), findsOneWidget, reason: label);
     }
   });
+
+  testWidgets('jank screen toggles raster and disposes cleanly', (
+    tester,
+  ) async {
+    await tester.pumpWidget(const MaterialApp(home: JankScreen()));
+    await tester.tap(find.byType(Switch));
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.tap(find.byType(Switch));
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.tap(find.byType(Switch));
+    await tester.pump(const Duration(milliseconds: 100));
+
+    await tester.pumpWidget(const MaterialApp(home: SizedBox()));
+    await tester.pump();
+    expect(tester.takeException(), isNull);
+  });
 }
