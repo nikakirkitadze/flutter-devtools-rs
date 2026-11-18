@@ -207,7 +207,9 @@ pub fn run_with_startup_trace(t0: Instant, main_entry_unix_ms: f64) -> ExitCode 
                 });
             });
             if let Err(err) = result {
-                fatal(&format!("startup trace could not reach the window: {err:#}"));
+                fatal(&format!(
+                    "startup trace could not reach the window: {err:#}"
+                ));
             }
         });
     if ok.get() {

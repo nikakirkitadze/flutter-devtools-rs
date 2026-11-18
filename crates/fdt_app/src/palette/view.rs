@@ -7,12 +7,12 @@ use crate::actions::OpenPalette;
 use crate::keymap::shortcut_hint;
 use crate::settings::{settings, update_settings};
 use fdt_ui::theme::TokensExt as _;
-use fdt_ui::tokens::{font, layout, space};
+use fdt_ui::tokens::{font, layout, radius, space};
 use gpui_kit::component::command::{Command, CommandItem, CommandState};
 use gpui_kit::component::{IndexPath, WindowExt as _};
 use gpui_kit::{
     App, AppContext as _, Entity, FocusHandle, Hsla, InteractiveElement as _, ParentElement as _,
-    Styled as _, Window, div,
+    Styled as _, Window, div, relative,
 };
 use std::cell::Cell;
 use std::rc::Rc;
@@ -142,6 +142,8 @@ pub fn open_palette(
             });
 
         dialog
+            .rounded(radius::DIALOG)
+            .line_height(relative(font::LINE_HEIGHT_UI))
             .w(layout::PALETTE_WIDTH)
             .margin_top(layout::PALETTE_TOP_OFFSET)
             .close_button(false)

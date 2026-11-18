@@ -23,7 +23,7 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::{
     AppContext as _, Context, Entity, FocusHandle, Focusable, Hsla, InteractiveElement as _,
     IntoElement, MouseButton, NavigationDirection, ParentElement as _, Render, Styled as _,
-    TestSupportExt as _, Window, div,
+    TestSupportExt as _, Window, div, relative,
 };
 
 /// A count shown beside a tool in the sidebar.
@@ -190,6 +190,7 @@ impl Render for MainWindow {
             .flex()
             .flex_col()
             .font_family(fdt_ui::tokens::font::UI)
+            .line_height(relative(fdt_ui::tokens::font::LINE_HEIGHT_UI))
             .text_color(Hsla::from(t.text))
             .on_action(
                 cx.listener(|this, _: &ShowTimeline, w, cx| this.show(Tool::Timeline, w, cx)),

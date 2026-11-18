@@ -3,12 +3,12 @@
 use crate::keymap::shortcut_hint;
 use crate::palette::registry::{CommandSpec, Group, commands};
 use fdt_ui::theme::TokensExt as _;
-use fdt_ui::tokens::{font, space};
+use fdt_ui::tokens::{font, radius, space};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::{
     App, FocusHandle, Hsla, InteractiveElement as _, ParentElement as _, Styled as _,
-    TestSupportExt as _, Window, div,
+    TestSupportExt as _, Window, div, relative,
 };
 
 const GROUPS: [Group; 4] = [Group::Navigation, Group::View, Group::Window, Group::App];
@@ -78,7 +78,11 @@ pub fn open_shortcuts(shell_focus: FocusHandle, window: &mut Window, cx: &mut Ap
             }
             body = body.child(section);
         }
-        dialog.title("Keyboard shortcuts").child(body)
+        dialog
+            .rounded(radius::DIALOG)
+            .line_height(relative(font::LINE_HEIGHT_UI))
+            .title("Keyboard shortcuts")
+            .child(body)
     });
 }
 

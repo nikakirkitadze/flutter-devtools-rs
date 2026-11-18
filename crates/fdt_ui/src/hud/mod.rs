@@ -248,12 +248,21 @@ impl Render for FrameHud {
             .font_features(font::tabular_figures())
             .text_color(Hsla::from(t.text))
             .child(row("Draw        ", self.stats.draw_percentiles(), "ms", cx))
-            .child(row("Frame (anim)", self.stats.interval_percentiles(), "ms", cx))
+            .child(row(
+                "Frame (anim)",
+                self.stats.interval_percentiles(),
+                "ms",
+                cx,
+            ))
             .child(
                 div()
                     .flex()
                     .gap(space::S6)
-                    .child(div().text_color(Hsla::from(t.text_muted)).child("Dropped (anim)"))
+                    .child(
+                        div()
+                            .text_color(Hsla::from(t.text_muted))
+                            .child("Dropped (anim)"),
+                    )
                     .child(self.stats.dropped_frames().to_string()),
             )
             .child(graph)
@@ -349,7 +358,8 @@ mod tests {
         cx.update(|_, cx| {
             hud.update(cx, |h, _| {
                 h.stats.record_draw(Duration::from_millis(9));
-                h.stats.record_interval(Duration::from_millis(40), DEFAULT_REFRESH);
+                h.stats
+                    .record_interval(Duration::from_millis(40), DEFAULT_REFRESH);
                 h.refresh = Duration::from_millis(8);
             })
         });

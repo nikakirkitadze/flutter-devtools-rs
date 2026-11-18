@@ -25,7 +25,10 @@ fn violations(source: &str) -> Vec<(usize, String)> {
     for (i, line) in lines.iter().enumerate() {
         if line.trim_start().starts_with("#[cfg(test)]") {
             // Only the test module ends the scan; a `#[cfg(test)] use` or fn does not.
-            let next = lines[i + 1..].iter().map(|l| l.trim()).find(|l| !l.is_empty());
+            let next = lines[i + 1..]
+                .iter()
+                .map(|l| l.trim())
+                .find(|l| !l.is_empty());
             if next.is_some_and(|l| l.starts_with("mod ")) {
                 break;
             }
@@ -105,7 +108,10 @@ fn views_use_tokens_not_literals() {
     for entry in crates.flatten() {
         rust_files(&entry.path().join("src"), &mut files);
     }
-    assert!(!files.is_empty(), "no source files found under crates/*/src");
+    assert!(
+        !files.is_empty(),
+        "no source files found under crates/*/src"
+    );
     let mut report = Vec::new();
     for file in files {
         if file.canonicalize().ok() == tokens.canonicalize().ok() {
