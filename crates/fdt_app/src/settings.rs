@@ -7,6 +7,8 @@ use fdt_ui::theme::ThemePreference;
 use gpui_kit::{App, Global};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -72,28 +74,46 @@ impl SettingsStore {
     }
 }
 
-struct AppSettings(SettingsStore);
+struct AppSettings {
+    store: SettingsStore,
+    /// Bumped on every update; a save only writes while it is still the latest.
+    generation: Arc<AtomicU64>,
+    /// Serialises writes so they never share the temporary file.
+    write_lock: Arc<Mutex<()>>,
+}
 
 impl Global for AppSettings {}
 
 pub fn init_settings(cx: &mut App, store: SettingsStore) {
-    cx.set_global(AppSettings(store));
+    cx.set_global(AppSettings {
+        store,
+        generation: Arc::new(AtomicU64::new(0)),
+        write_lock: Arc::new(Mutex::new(())),
+    });
 }
 
 pub fn settings(cx: &App) -> &Settings {
-    cx.global::<AppSettings>().0.get()
+    cx.global::<AppSettings>().store.get()
 }
 
 /// Changes the settings now and saves them in the background. A failed save is logged.
 pub fn update_settings(cx: &mut App, f: impl FnOnce(&mut Settings)) {
-    let store = &mut cx.global_mut::<AppSettings>().0;
-    f(&mut store.current);
-    let Some(path) = store.path.clone() else {
+    let app = cx.global_mut::<AppSettings>();
+    f(&mut app.store.current);
+    let generation = app.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let Some(path) = app.store.path.clone() else {
         return;
     };
-    let snapshot = store.current.clone();
+    let snapshot = app.store.current.clone();
+    let latest = app.generation.clone();
+    let lock = app.write_lock.clone();
     cx.background_executor()
         .spawn(async move {
+            let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            // A newer update has queued its own write; skip this stale one.
+            if latest.load(Ordering::SeqCst) != generation {
+                return;
+            }
             if let Err(err) = SettingsStore::write(&path, &snapshot) {
                 log::warn!("saving settings to {} failed: {err}", path.display());
             }
@@ -187,6 +207,30 @@ mod tests {
         });
         cx.run_until_parked();
         cx.update(|cx| assert_eq!(settings(cx).theme, ThemePreference::Dark));
+    }
+
+    #[gpui_kit::test]
+    fn rapid_updates_leave_the_newest_settings_on_disk(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_in(dir.path());
+        cx.update(|cx| {
+            init_settings(cx, SettingsStore::load(path.clone()));
+            for i in 0..20 {
+                update_settings(cx, |s| {
+                    s.recent_commands.push(format!("cmd-{i}"));
+                    s.theme = if i % 2 == 0 {
+                        ThemePreference::Dark
+                    } else {
+                        ThemePreference::Light
+                    };
+                });
+            }
+        });
+        cx.executor().allow_parking();
+        cx.run_until_parked();
+        let on_disk = SettingsStore::load(path);
+        cx.update(|cx| assert_eq!(on_disk.get(), settings(cx)));
+        assert_eq!(on_disk.get().recent_commands.len(), 20);
     }
 
     #[gpui_kit::test]
