@@ -36,9 +36,14 @@ impl AssetSource for FdtAssets {
         if let Some(bytes) = FdtIcons.load(path)? {
             return Ok(Some(bytes));
         }
-        // The component bundle reports a missing path as an error; its only
-        // failure is "not found", so treat that as absent.
-        Ok(Assets.load(path).unwrap_or(None))
+        // The component bundle errors on a missing path, so check that it has
+        // the path first. Any error after that is real: log it and pass it on.
+        if !Assets.list(path)?.iter().any(|name| name.as_ref() == path) {
+            return Ok(None);
+        }
+        Assets.load(path).inspect_err(|err| {
+            log::warn!("loading component asset {path:?} failed: {err:#}");
+        })
     }
 
     fn list(&self, path: &str) -> anyhow::Result<Vec<SharedString>> {
