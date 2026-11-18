@@ -6,10 +6,21 @@ use std::time::{Duration, Instant};
 /// Time from `main()` entry to first paint and to an interactive (palette drawn) window.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StartupReport {
+    /// Wall-clock time at `main()` entry, in milliseconds since the Unix epoch.
+    ///
+    /// Lets a measuring script add the time between spawning the process and `main()`.
+    pub main_entry_unix_ms: f64,
     pub first_paint: Duration,
     pub interactive: Duration,
     /// Elapsed-from-`t0` timestamp at the end of each startup step, in order.
     pub phases: Vec<(&'static str, Duration)>,
+}
+
+/// The current wall-clock time in milliseconds since the Unix epoch.
+pub fn unix_ms_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64() * 1000.0)
 }
 
 /// How long the trace may run before it gives up.
@@ -66,7 +77,7 @@ pub fn mark(phases: &mut Option<&mut StartupPhases>, name: &'static str) {
 
 impl StartupReport {
     /// One JSON line, milliseconds with one decimal:
-    /// `{"first_paint_ms":123.4,"interactive_ms":234.6,"phases":{"a":1.0}}`.
+    /// `{"main_entry_unix_ms":1700000000000.0,"first_paint_ms":123.4,"interactive_ms":234.6,"phases":{"a":1.0}}`.
     pub fn to_json(&self) -> String {
         let phases: Vec<String> = self
             .phases
@@ -74,7 +85,8 @@ impl StartupReport {
             .map(|(name, d)| format!("\"{name}\":{:.1}", d.as_secs_f64() * 1000.0))
             .collect();
         format!(
-            "{{\"first_paint_ms\":{:.1},\"interactive_ms\":{:.1},\"phases\":{{{}}}}}",
+            "{{\"main_entry_unix_ms\":{:.1},\"first_paint_ms\":{:.1},\"interactive_ms\":{:.1},\"phases\":{{{}}}}}",
+            self.main_entry_unix_ms,
             self.first_paint.as_secs_f64() * 1000.0,
             self.interactive.as_secs_f64() * 1000.0,
             phases.join(",")
@@ -89,19 +101,21 @@ mod tests {
     #[test]
     fn report_json_uses_one_decimal_milliseconds() {
         let report = StartupReport {
+            main_entry_unix_ms: 1_700_000_000_123.46,
             first_paint: Duration::from_micros(123_440),
             interactive: Duration::from_micros(234_560),
             phases: Vec::new(),
         };
         assert_eq!(
             report.to_json(),
-            r#"{"first_paint_ms":123.4,"interactive_ms":234.6,"phases":{}}"#
+            r#"{"main_entry_unix_ms":1700000000123.5,"first_paint_ms":123.4,"interactive_ms":234.6,"phases":{}}"#
         );
     }
 
     #[test]
     fn report_json_lists_phases_in_order() {
         let report = StartupReport {
+            main_entry_unix_ms: 1_700_000_000_123.46,
             first_paint: Duration::from_millis(10),
             interactive: Duration::from_millis(20),
             phases: vec![
@@ -111,13 +125,14 @@ mod tests {
         };
         assert_eq!(
             report.to_json(),
-            r#"{"first_paint_ms":10.0,"interactive_ms":20.0,"phases":{"settings_loaded":1.2,"app_started":5.0}}"#
+            r#"{"main_entry_unix_ms":1700000000123.5,"first_paint_ms":10.0,"interactive_ms":20.0,"phases":{"settings_loaded":1.2,"app_started":5.0}}"#
         );
     }
 
     #[test]
     fn emit_prints_json_and_succeeds_when_the_palette_is_open() {
         let report = StartupReport {
+            main_entry_unix_ms: 1_700_000_000_123.46,
             first_paint: Duration::from_millis(1),
             interactive: Duration::from_millis(2),
             phases: Vec::new(),
@@ -134,6 +149,7 @@ mod tests {
     #[test]
     fn emit_still_prints_json_but_fails_when_the_palette_did_not_open() {
         let report = StartupReport {
+            main_entry_unix_ms: 1_700_000_000_123.46,
             first_paint: Duration::from_millis(1),
             interactive: Duration::from_millis(2),
             phases: Vec::new(),

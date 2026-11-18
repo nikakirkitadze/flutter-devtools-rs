@@ -125,28 +125,36 @@ fn load_store() -> SettingsStore {
     }
 }
 
+/// Reports a startup failure that leaves the user without a window, then exits non-zero.
+///
+/// `cx.quit()` ends in AppKit's `exit(0)` on macOS, so a failure has to exit directly.
+fn fatal(message: &str) -> ! {
+    eprintln!("fdt: {message}");
+    std::process::exit(1);
+}
+
 /// Runs the app until the last window closes.
-pub fn run() {
+pub fn run() -> ExitCode {
     let store = load_store();
     gpui_kit::application()
         .with_assets(FdtAssets)
         .run(|cx: &mut App| {
             if let Err(err) = start(cx, store, None) {
-                log::error!("opening the main window failed: {err:#}");
-                cx.quit();
+                fatal(&format!("could not open the main window: {err:#}"));
             }
         });
+    ExitCode::SUCCESS
 }
 
 /// Like [`run`], but measures cold start, prints one `StartupReport` JSON line and quits.
 ///
-/// Times are measured from `t0` (the first statement of `main()`), not from process exec, and
-/// presentation is approximated by the next-frame callback: a nested `on_next_frame` runs after
+/// Times are measured from `t0` (the start of `main()`); the report also carries the wall-clock
+/// time of `main()` entry so a script can add the time before it. Presentation is approximated by the next-frame callback: a nested `on_next_frame` runs after
 /// the first frame was drawn. "Interactive" is when the command palette has been opened and drawn.
 ///
-/// Returns a failure exit code when the palette did not open; a watchdog ends the process with
+/// Exits 1 directly when the palette did not open; a watchdog ends the process with
 /// exit code 1 if no report was printed within [`WATCHDOG`].
-pub fn run_with_startup_trace(t0: Instant) -> ExitCode {
+pub fn run_with_startup_trace(t0: Instant, main_entry_unix_ms: f64) -> ExitCode {
     std::thread::spawn(|| {
         std::thread::sleep(WATCHDOG);
         eprintln!("startup-trace: timed out");
@@ -164,15 +172,10 @@ pub fn run_with_startup_trace(t0: Instant) -> ExitCode {
             phases.mark("app_started");
             let shell = match start(cx, store, Some(&mut phases)) {
                 Ok(shell) => shell,
-                Err(err) => {
-                    log::error!("opening the main window failed: {err:#}");
-                    cx.quit();
-                    return;
-                }
+                Err(err) => fatal(&format!("could not open the main window: {err:#}")),
             };
             let Some(handle) = cx.windows().first().copied() else {
-                cx.quit();
-                return;
+                fatal("the main window is missing");
             };
             let result = handle.update(cx, move |_, window, cx| {
                 after_next_paint(window, cx, move |window, cx| {
@@ -182,6 +185,7 @@ pub fn run_with_startup_trace(t0: Instant) -> ExitCode {
                     window.dispatch_action(Box::new(OpenPalette), cx);
                     after_next_paint(window, cx, move |window, cx| {
                         let report = StartupReport {
+                            main_entry_unix_ms,
                             first_paint,
                             interactive: t0.elapsed(),
                             phases: phases.into_marks(),
@@ -194,13 +198,16 @@ pub fn run_with_startup_trace(t0: Instant) -> ExitCode {
                             &mut std::io::stderr(),
                         );
                         ok.set(printed);
+                        if !printed {
+                            // `cx.quit()` would exit 0 on macOS.
+                            std::process::exit(1);
+                        }
                         cx.quit();
                     });
                 });
             });
             if let Err(err) = result {
-                log::error!("startup trace could not reach the window: {err:#}");
-                cx.quit();
+                fatal(&format!("startup trace could not reach the window: {err:#}"));
             }
         });
     if ok.get() {
