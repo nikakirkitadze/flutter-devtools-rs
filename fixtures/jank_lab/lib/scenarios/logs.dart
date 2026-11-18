@@ -26,7 +26,6 @@ class _LogsScreenState extends State<LogsScreen> {
 
   void _printBurst() {
     for (var i = 0; i < 1000; i++) {
-      debugPrint('burst line $i');
       // ignore: avoid_print
       print('burst line $i');
     }

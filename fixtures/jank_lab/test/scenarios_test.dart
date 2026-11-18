@@ -38,6 +38,17 @@ void main() {
     await tester.pumpWidget(const SizedBox());
   });
 
+  testWidgets('cart ticks rebuild the whole grid', (tester) async {
+    await tester.pumpWidget(const MaterialApp(home: CartScreen()));
+    final before = ProductTile.buildCount;
+    await tester.pump(const Duration(milliseconds: 20));
+    expect(ProductTile.buildCount - before, greaterThanOrEqualTo(64));
+    final mid = ProductTile.buildCount;
+    await tester.pump(const Duration(milliseconds: 20));
+    expect(ProductTile.buildCount - mid, greaterThanOrEqualTo(64));
+    await tester.pumpWidget(const SizedBox());
+  });
+
   testWidgets('deep tree builds the requested shape', (tester) async {
     await tester.pumpWidget(
       const MaterialApp(home: DeepTreeScreen(depth: 20, nodes: 1000)),

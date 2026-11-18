@@ -38,7 +38,7 @@ class _CartScreenState extends State<CartScreen> {
       body: Column(
         children: [
           CartBadge(count: _count),
-          const Expanded(child: ProductGrid()),
+          Expanded(child: ProductGrid()),
         ],
       ),
     );
@@ -89,8 +89,12 @@ class ProductTile extends StatelessWidget {
 
   final int index;
 
+  /// Total number of tile builds, so tests can observe rebuilds.
+  static int buildCount = 0;
+
   @override
   Widget build(BuildContext context) {
+    buildCount++;
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(4),
