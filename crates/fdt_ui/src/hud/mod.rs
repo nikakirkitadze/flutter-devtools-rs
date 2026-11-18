@@ -122,6 +122,8 @@ impl FrameHud {
         }
         self.visible = visible;
         if visible {
+            self.stats.reset();
+            self.refresh = DEFAULT_REFRESH;
             add_trace_user(cx);
             self.collector = FrameTimingCollector::new();
             self.poll = Some(cx.spawn_in(window, async move |this, cx| {
@@ -245,13 +247,13 @@ impl Render for FrameHud {
             .text_size(font::LABEL)
             .font_features(font::tabular_figures())
             .text_color(Hsla::from(t.text))
-            .child(row("Draw  ", self.stats.draw_percentiles(), "ms", cx))
-            .child(row("Frame ", self.stats.interval_percentiles(), "ms", cx))
+            .child(row("Draw        ", self.stats.draw_percentiles(), "ms", cx))
+            .child(row("Frame (anim)", self.stats.interval_percentiles(), "ms", cx))
             .child(
                 div()
                     .flex()
                     .gap(space::S6)
-                    .child(div().text_color(Hsla::from(t.text_muted)).child("Dropped"))
+                    .child(div().text_color(Hsla::from(t.text_muted)).child("Dropped (anim)"))
                     .child(self.stats.dropped_frames().to_string()),
             )
             .child(graph)
@@ -337,6 +339,30 @@ mod tests {
         cx.update(|window, cx| hud.update(cx, |h, cx| h.toggle(window, cx)));
         assert!(!exists(cx, "frame-hud"));
         assert_eq!(cx.update(|_, cx| trace_users(cx)), 0);
+    }
+
+    #[gpui_kit::test]
+    fn showing_the_hud_again_clears_old_samples(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (hud, cx) = cx.add_window_view(FrameHud::new);
+        cx.update(|window, cx| hud.update(cx, |h, cx| h.set_visible(true, window, cx)));
+        cx.update(|_, cx| {
+            hud.update(cx, |h, _| {
+                h.stats.record_draw(Duration::from_millis(9));
+                h.stats.record_interval(Duration::from_millis(40), DEFAULT_REFRESH);
+                h.refresh = Duration::from_millis(8);
+            })
+        });
+        assert!(hud.read_with(cx, |h, _| h.stats().draw_percentiles().is_some()));
+
+        cx.update(|window, cx| hud.update(cx, |h, cx| h.set_visible(false, window, cx)));
+        cx.update(|window, cx| hud.update(cx, |h, cx| h.set_visible(true, window, cx)));
+        hud.read_with(cx, |h, _| {
+            assert!(h.stats().draw_percentiles().is_none());
+            assert!(h.stats().interval_percentiles().is_none());
+            assert_eq!(h.stats().dropped_frames(), 0);
+            assert_eq!(h.refresh, DEFAULT_REFRESH);
+        });
     }
 
     #[gpui_kit::test]
