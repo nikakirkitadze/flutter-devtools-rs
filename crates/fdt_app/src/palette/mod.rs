@@ -2,3 +2,4 @@
 pub mod rank;
 pub mod recent;
 pub mod registry;
+pub mod view;

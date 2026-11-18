@@ -5,16 +5,18 @@ mod sidebar;
 mod tool_page;
 
 use crate::actions::{
-    ClearSelection, GoBack, GoForward, OpenSettings, ShowLogs, ShowMemory, ShowNetwork,
-    ShowPerformance, ShowState, ShowTimeline, ShowWidgets, ToggleFrameHud, UseDarkTheme,
-    UseLightTheme, UseSystemTheme,
+    ClearSelection, GoBack, GoForward, OpenPalette, OpenSettings, ShowLogs, ShowMemory,
+    ShowNetwork, ShowPerformance, ShowState, ShowTimeline, ShowWidgets, ToggleFrameHud,
+    UseDarkTheme, UseLightTheme, UseSystemTheme,
 };
 use crate::keymap::SHELL_CONTEXT;
 use crate::nav::{Location, NavHistory, Page, Tool};
+use crate::palette::view::{PaletteModel, open_palette};
 use crate::settings::{settings, update_settings};
 use fdt_ui::hud::FrameHud;
 use fdt_ui::theme::{self, ThemePreference, TokensExt as _};
 use fdt_ui::tokens::Appearance;
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::{
     AppContext as _, Context, Entity, FocusHandle, Focusable, Hsla, InteractiveElement as _,
     IntoElement, MouseButton, NavigationDirection, ParentElement as _, Render, Styled as _,
@@ -33,6 +35,7 @@ pub struct MainWindow {
     counts: [Option<ToolCount>; 7],
     hud: Entity<FrameHud>,
     focus: FocusHandle,
+    palette: Option<Entity<PaletteModel>>,
     _appearance: gpui_kit::Subscription,
 }
 
@@ -56,6 +59,7 @@ impl MainWindow {
             counts: [None; 7],
             hud,
             focus,
+            palette: None,
             _appearance: appearance,
         }
     }
@@ -81,6 +85,19 @@ impl MainWindow {
 
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus.clone()
+    }
+
+    /// The most recently opened palette's model.
+    pub fn palette(&self) -> Option<&Entity<PaletteModel>> {
+        self.palette.as_ref()
+    }
+
+    fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            window.close_dialog(cx);
+        } else {
+            self.palette = Some(open_palette(self.focus_handle(), window, cx));
+        }
     }
 
     pub fn hud(&self) -> &Entity<FrameHud> {
@@ -174,6 +191,7 @@ impl Render for MainWindow {
             .on_action(cx.listener(|this, _: &ShowLogs, w, cx| this.show(Tool::Logs, w, cx)))
             .on_action(cx.listener(|this, _: &ShowWidgets, w, cx| this.show(Tool::Widgets, w, cx)))
             .on_action(cx.listener(|this, _: &ShowState, w, cx| this.show(Tool::State, w, cx)))
+            .on_action(cx.listener(|this, _: &OpenPalette, w, cx| this.toggle_palette(w, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, w, cx| this.open_settings(w, cx)))
             .on_action(cx.listener(|this, _: &UseSystemTheme, w, cx| {
                 this.set_theme(ThemePreference::System, w, cx)
