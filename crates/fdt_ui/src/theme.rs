@@ -236,7 +236,18 @@ pub fn os_appearance(window: Option<&Window>, cx: &App) -> Appearance {
 
 /// Applies the preference and returns the appearance now showing.
 pub fn apply(pref: ThemePreference, window: Option<&mut Window>, cx: &mut App) -> Appearance {
-    let appearance = resolve(pref, os_appearance(window.as_deref(), cx));
+    let os = os_appearance(window.as_deref(), cx);
+    apply_with_os(pref, os, window, cx)
+}
+
+/// Like [`apply`], with the OS appearance given instead of read from the window.
+pub fn apply_with_os(
+    pref: ThemePreference,
+    os: Appearance,
+    window: Option<&mut Window>,
+    cx: &mut App,
+) -> Appearance {
+    let appearance = resolve(pref, os);
     let mode = match appearance {
         Appearance::Dark => ThemeMode::Dark,
         Appearance::Light => ThemeMode::Light,

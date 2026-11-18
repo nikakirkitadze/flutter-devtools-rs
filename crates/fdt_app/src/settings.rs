@@ -1,0 +1,251 @@
+//! Persisted user settings: the theme preference and recent palette commands.
+//!
+//! The pure parts (`Settings`, `SettingsStore`) need no GPUI. The file is read
+//! once before the event loop starts; writes go through the background executor.
+
+use fdt_ui::theme::ThemePreference;
+use gpui_kit::{App, Global};
+use std::io;
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    pub theme: ThemePreference,
+    pub recent_commands: Vec<String>,
+}
+
+/// Holds the current settings and where they are saved.
+pub struct SettingsStore {
+    path: Option<PathBuf>,
+    current: Settings,
+}
+
+impl SettingsStore {
+    /// `<config dir>/fdt/settings.json`, when the platform has a config directory.
+    pub fn default_path() -> Option<PathBuf> {
+        dirs::config_dir().map(|dir| dir.join("fdt").join("settings.json"))
+    }
+
+    /// Reads `path`. A missing, unreadable or invalid file gives the defaults.
+    pub fn load(path: PathBuf) -> Self {
+        let current = match std::fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|err| {
+                log::warn!("ignoring invalid settings file {}: {err}", path.display());
+                Settings::default()
+            }),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Settings::default(),
+            Err(err) => {
+                log::warn!("could not read settings file {}: {err}", path.display());
+                Settings::default()
+            }
+        };
+        Self {
+            path: Some(path),
+            current,
+        }
+    }
+
+    /// A store with no file: saves are no-ops.
+    pub fn in_memory() -> Self {
+        Self {
+            path: None,
+            current: Settings::default(),
+        }
+    }
+
+    pub fn get(&self) -> &Settings {
+        &self.current
+    }
+
+    /// Writes `settings` to `path` through a temporary file, so a crash never leaves half a file.
+    pub fn write(path: &Path, settings: &Settings) -> io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_vec_pretty(settings).map_err(io::Error::other)?;
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, path)
+    }
+}
+
+struct AppSettings(SettingsStore);
+
+impl Global for AppSettings {}
+
+pub fn init_settings(cx: &mut App, store: SettingsStore) {
+    cx.set_global(AppSettings(store));
+}
+
+pub fn settings(cx: &App) -> &Settings {
+    cx.global::<AppSettings>().0.get()
+}
+
+/// Changes the settings now and saves them in the background. A failed save is logged.
+pub fn update_settings(cx: &mut App, f: impl FnOnce(&mut Settings)) {
+    let store = &mut cx.global_mut::<AppSettings>().0;
+    f(&mut store.current);
+    let Some(path) = store.path.clone() else {
+        return;
+    };
+    let snapshot = store.current.clone();
+    cx.background_executor()
+        .spawn(async move {
+            if let Err(err) = SettingsStore::write(&path, &snapshot) {
+                log::warn!("saving settings to {} failed: {err}", path.display());
+            }
+        })
+        .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actions::{UseDarkTheme, UseLightTheme};
+    use crate::test_support::{exists, open_shell, press};
+    use fdt_ui::theme::TokensExt as _;
+    use fdt_ui::tokens::Appearance;
+    use gpui_kit::TestAppContext;
+    use gpui_kit::component::ActiveTheme as _;
+    use gpui_kit::test::TestWindowExt as _;
+
+    fn file_in(dir: &Path) -> PathBuf {
+        dir.join("settings.json")
+    }
+
+    #[test]
+    fn missing_file_gives_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SettingsStore::load(file_in(dir.path()));
+        assert_eq!(store.get(), &Settings::default());
+    }
+
+    #[test]
+    fn write_then_load_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_in(dir.path());
+        let s = Settings {
+            theme: ThemePreference::Dark,
+            recent_commands: vec!["a".into(), "b".into()],
+        };
+        SettingsStore::write(&path, &s).unwrap();
+        assert_eq!(SettingsStore::load(path).get(), &s);
+    }
+
+    #[test]
+    fn corrupt_file_gives_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_in(dir.path());
+        std::fs::write(&path, "{not json").unwrap();
+        assert_eq!(SettingsStore::load(path).get(), &Settings::default());
+    }
+
+    #[test]
+    fn wrong_types_give_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_in(dir.path());
+        std::fs::write(&path, r#"{"theme": 5}"#).unwrap();
+        assert_eq!(SettingsStore::load(path).get(), &Settings::default());
+    }
+
+    #[test]
+    fn unknown_fields_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_in(dir.path());
+        std::fs::write(&path, r#"{"theme":"dark","future":1}"#).unwrap();
+        assert_eq!(SettingsStore::load(path).get().theme, ThemePreference::Dark);
+    }
+
+    #[test]
+    fn write_creates_parent_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a").join("b").join("settings.json");
+        SettingsStore::write(&path, &Settings::default()).unwrap();
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn write_to_an_unwritable_path_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file.txt");
+        std::fs::write(&file, "x").unwrap();
+        let path = file.join("settings.json");
+        assert!(SettingsStore::write(&path, &Settings::default()).is_err());
+    }
+
+    #[gpui_kit::test]
+    fn failed_save_keeps_the_app_running(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file.txt");
+        std::fs::write(&file, "x").unwrap();
+        cx.update(|cx| {
+            init_settings(cx, SettingsStore::load(file.join("settings.json")));
+            update_settings(cx, |s| s.theme = ThemePreference::Dark);
+        });
+        cx.run_until_parked();
+        cx.update(|cx| assert_eq!(settings(cx).theme, ThemePreference::Dark));
+    }
+
+    #[gpui_kit::test]
+    fn theme_actions_apply_and_persist_in_memory(cx: &mut TestAppContext) {
+        let (_shell, cx) = open_shell(cx);
+        cx.dispatch_action(UseDarkTheme);
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert!(cx.theme().is_dark());
+            assert_eq!(settings(cx).theme, ThemePreference::Dark);
+        });
+        cx.dispatch_action(UseLightTheme);
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert!(!cx.theme().is_dark());
+            assert_eq!(settings(cx).theme, ThemePreference::Light);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn system_preference_follows_os_but_pinned_does_not(cx: &mut TestAppContext) {
+        let (shell, cx) = open_shell(cx);
+        cx.update(|_, cx| assert_eq!(settings(cx).theme, ThemePreference::System));
+        shell.update_in(cx, |s, w, cx| {
+            s.appearance_changed(Appearance::Light, w, cx)
+        });
+        cx.update(|_, cx| assert_eq!(cx.appearance(), Appearance::Light));
+        shell.update_in(cx, |s, w, cx| s.appearance_changed(Appearance::Dark, w, cx));
+        cx.update(|_, cx| assert_eq!(cx.appearance(), Appearance::Dark));
+        cx.dispatch_action(UseLightTheme);
+        cx.run_until_parked();
+        shell.update_in(cx, |s, w, cx| s.appearance_changed(Appearance::Dark, w, cx));
+        cx.update(|_, cx| assert_eq!(cx.appearance(), Appearance::Light));
+    }
+
+    #[gpui_kit::test]
+    fn settings_shortcut_opens_settings_and_back_returns(cx: &mut TestAppContext) {
+        let (_shell, cx) = open_shell(cx);
+        press(cx, "cmd-,", "ctrl-,");
+        assert!(exists(cx, "settings-page"));
+        press(cx, "cmd-[", "ctrl-[");
+        assert!(exists(cx, "tool-page-timeline"));
+    }
+
+    #[gpui_kit::test]
+    fn clicking_theme_buttons_applies_theme(cx: &mut TestAppContext) {
+        let (_shell, cx) = open_shell(cx);
+        press(cx, "cmd-,", "ctrl-,");
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click("theme-light", cx);
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(!cx.theme().is_dark()));
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click("theme-dark", cx);
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(cx.theme().is_dark()));
+    }
+}

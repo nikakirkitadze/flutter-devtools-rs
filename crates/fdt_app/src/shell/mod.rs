@@ -1,16 +1,20 @@
 //! The main window: sidebar, current tool page and overlays.
 
+mod settings_page;
 mod sidebar;
 mod tool_page;
 
 use crate::actions::{
-    ClearSelection, GoBack, GoForward, ShowLogs, ShowMemory, ShowNetwork, ShowPerformance,
-    ShowState, ShowTimeline, ShowWidgets, ToggleFrameHud,
+    ClearSelection, GoBack, GoForward, OpenSettings, ShowLogs, ShowMemory, ShowNetwork,
+    ShowPerformance, ShowState, ShowTimeline, ShowWidgets, ToggleFrameHud, UseDarkTheme,
+    UseLightTheme, UseSystemTheme,
 };
 use crate::keymap::SHELL_CONTEXT;
 use crate::nav::{Location, NavHistory, Page, Tool};
+use crate::settings::{settings, update_settings};
 use fdt_ui::hud::FrameHud;
-use fdt_ui::theme::TokensExt as _;
+use fdt_ui::theme::{self, ThemePreference, TokensExt as _};
+use fdt_ui::tokens::Appearance;
 use gpui_kit::{
     AppContext as _, Context, Entity, FocusHandle, Focusable, Hsla, InteractiveElement as _,
     IntoElement, MouseButton, NavigationDirection, ParentElement as _, Render, Styled as _,
@@ -29,6 +33,7 @@ pub struct MainWindow {
     counts: [Option<ToolCount>; 7],
     hud: Entity<FrameHud>,
     focus: FocusHandle,
+    _appearance: gpui_kit::Subscription,
 }
 
 impl MainWindow {
@@ -41,12 +46,17 @@ impl MainWindow {
             }
         })
         .detach();
+        let appearance = cx.observe_window_appearance(window, |this, window, cx| {
+            let os = theme::os_appearance(Some(window), cx);
+            this.appearance_changed(os, window, cx);
+        });
         window.focus(&focus, cx);
         Self {
             history: NavHistory::new(Location::at(Page::Tool(Tool::Timeline))),
             counts: [None; 7],
             hud,
             focus,
+            _appearance: appearance,
         }
     }
 
@@ -75,6 +85,31 @@ impl MainWindow {
 
     pub fn hud(&self) -> &Entity<FrameHud> {
         &self.hud
+    }
+
+    /// Re-applies the theme after the OS switched, only when the preference is "match system".
+    pub fn appearance_changed(
+        &mut self,
+        os: Appearance,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pref = settings(cx).theme;
+        if pref == ThemePreference::System {
+            theme::apply_with_os(pref, os, Some(window), cx);
+            cx.notify();
+        }
+    }
+
+    fn set_theme(&mut self, pref: ThemePreference, window: &mut Window, cx: &mut Context<Self>) {
+        update_settings(cx, |s| s.theme = pref);
+        theme::apply(pref, Some(window), cx);
+        cx.notify();
+    }
+
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let to = self.current().with_page(Page::Settings);
+        self.navigate(to, window, cx);
     }
 
     fn show(&mut self, tool: Tool, window: &mut Window, cx: &mut Context<Self>) {
@@ -116,8 +151,7 @@ impl Render for MainWindow {
         let t = cx.tokens();
         let page: gpui_kit::AnyElement = match self.current().page {
             Page::Tool(tool) => tool_page::render(tool, cx).into_any_element(),
-            // Task 10 adds the settings page.
-            Page::Settings => div().into_any_element(),
+            Page::Settings => settings_page::render(settings(cx).theme, cx).into_any_element(),
         };
         let nav = |dir| MouseButton::Navigate(dir);
         div()
@@ -140,6 +174,16 @@ impl Render for MainWindow {
             .on_action(cx.listener(|this, _: &ShowLogs, w, cx| this.show(Tool::Logs, w, cx)))
             .on_action(cx.listener(|this, _: &ShowWidgets, w, cx| this.show(Tool::Widgets, w, cx)))
             .on_action(cx.listener(|this, _: &ShowState, w, cx| this.show(Tool::State, w, cx)))
+            .on_action(cx.listener(|this, _: &OpenSettings, w, cx| this.open_settings(w, cx)))
+            .on_action(cx.listener(|this, _: &UseSystemTheme, w, cx| {
+                this.set_theme(ThemePreference::System, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &UseDarkTheme, w, cx| {
+                this.set_theme(ThemePreference::Dark, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &UseLightTheme, w, cx| {
+                this.set_theme(ThemePreference::Light, w, cx)
+            }))
             .on_action(cx.listener(|this, _: &GoBack, _, cx| this.go_back(cx)))
             .on_action(cx.listener(|this, _: &GoForward, _, cx| this.go_forward(cx)))
             .on_action(cx.listener(|this, _: &ClearSelection, w, cx| {
@@ -256,6 +300,18 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(exists(cx, "tool-page-network"));
+    }
+
+    #[gpui_kit::test]
+    fn shortcuts_still_work_after_clicking_a_sidebar_row(cx: &mut TestAppContext) {
+        let (shell, cx) = open_shell(cx);
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click("sidebar-memory", cx);
+        });
+        cx.run_until_parked();
+        press(cx, "cmd-2", "ctrl-2");
+        assert_eq!(page(&shell, cx), Page::Tool(Tool::Performance));
     }
 
     #[gpui_kit::test]

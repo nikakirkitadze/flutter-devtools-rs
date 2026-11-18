@@ -4,7 +4,7 @@ use crate::nav::Tool;
 use crate::shell::sidebar::tool_icon;
 use fdt_ui::empty_state::EmptyState;
 use fdt_ui::theme::TokensExt as _;
-use fdt_ui::tokens::{font, layout, space};
+use fdt_ui::tokens::{font, space};
 use gpui_kit::{
     App, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, Styled as _,
     TestSupportExt as _, div,
@@ -76,5 +76,4 @@ pub fn render(tool: Tool, cx: &App) -> impl IntoElement {
                     body,
                 )),
         )
-        .min_w(layout::EMPTY_STATE_MAX_WIDTH)
 }

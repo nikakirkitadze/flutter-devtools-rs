@@ -2,9 +2,10 @@
 
 use crate::actions::{Hide, HideOthers, Quit, ShowAll};
 use crate::keymap;
+use crate::settings::{SettingsStore, init_settings, settings};
 use crate::shell::MainWindow;
 use fdt_ui::assets::FdtAssets;
-use fdt_ui::theme::{self, ThemePreference};
+use fdt_ui::theme;
 use fdt_ui::tokens::layout;
 use gpui_kit::component::TitleBar;
 use gpui_kit::{App, AppContext as _, Bounds, Entity, WindowBounds, WindowOptions};
@@ -50,6 +51,11 @@ pub fn open_main_window(cx: &mut App) -> anyhow::Result<Entity<MainWindow>> {
 
 /// Runs the app until the last window closes.
 pub fn run() {
+    // The one main-thread file read: settings, before the event loop starts.
+    let store = match SettingsStore::default_path() {
+        Some(path) => SettingsStore::load(path),
+        None => SettingsStore::in_memory(),
+    };
     gpui_kit::application()
         .with_assets(FdtAssets)
         .run(|cx: &mut App| {
@@ -57,7 +63,9 @@ pub fn run() {
             if let Err(err) = fdt_ui::fonts::load(cx) {
                 log::warn!("loading bundled fonts failed, using system fonts: {err:#}");
             }
-            theme::apply(ThemePreference::System, None, cx);
+            init_settings(cx, store);
+            let pref = settings(cx).theme;
+            theme::apply(pref, None, cx);
             fdt_ui::os::sync_reduced_motion(cx);
             if let Err(err) = open_main_window(cx) {
                 log::error!("opening the main window failed: {err:#}");

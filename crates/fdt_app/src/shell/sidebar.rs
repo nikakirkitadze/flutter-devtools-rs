@@ -182,11 +182,14 @@ impl MainWindow {
                     id: "sidebar-settings".into(),
                     icon: icons::SETTINGS,
                     label: "Settings",
-                    active: false,
+                    active: self.current().page == Page::Settings,
                     disabled: false,
                     tooltip: None,
                     count: None,
-                    on_click: None,
+                    on_click: Some(Box::new(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        let to = this.current().with_page(Page::Settings);
+                        this.navigate(to, window, cx);
+                    }))),
                 },
                 cx,
             ))

@@ -9,7 +9,10 @@ use std::cell::RefCell;
 
 /// App-level setup shared with production, without fonts or the OS motion probe.
 pub fn init(cx: &mut TestAppContext) {
-    cx.update(crate::app::init);
+    cx.update(|cx| {
+        crate::app::init(cx);
+        crate::settings::init_settings(cx, crate::settings::SettingsStore::in_memory());
+    });
 }
 
 /// Opens the shell in a test window with focus on it.
