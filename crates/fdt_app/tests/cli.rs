@@ -20,9 +20,7 @@ fn unknown_argument_prints_usage_and_exits_2() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
-    assert!(
-        String::from_utf8(out.stderr)
-            .unwrap()
-            .starts_with("usage: fdt")
-    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.starts_with("usage: fdt"));
+    assert!(stderr.contains("--startup-trace"));
 }
