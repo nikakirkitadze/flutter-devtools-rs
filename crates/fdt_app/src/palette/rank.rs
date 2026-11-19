@@ -269,11 +269,9 @@ mod tests {
             runs.sort_unstable();
             let (worst, p90) = (runs[runs.len() - 1], runs[44]);
             eprintln!("budget query len {} worst {worst:?} p90 {p90:?}", q.len());
-            assert!(
-                p90 <= std::time::Duration::from_millis(8),
-                "query of {} bytes: p90 {p90:?} (worst {worst:?})",
-                q.len()
-            );
+            fdt_store::budget::check(p90 <= std::time::Duration::from_millis(8), || {
+                format!("query of {} bytes: p90 {p90:?} (worst {worst:?})", q.len())
+            });
         }
     }
 }

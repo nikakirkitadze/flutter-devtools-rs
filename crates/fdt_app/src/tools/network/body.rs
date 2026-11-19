@@ -397,7 +397,9 @@ mod tests {
                 "a capped JSON body is text without the invalid note"
             );
             println!("render of the 50 MB body's stored MiB: {elapsed:?}");
-            assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+            fdt_store::budget::check(elapsed < Duration::from_millis(500), || {
+                format!("{elapsed:?}")
+            });
             // A well-formed 1 MiB JSON document pretty-prints within the same bound.
             let mut doc = String::from("[");
             while doc.len() < (1 << 20) - 64 {
@@ -409,7 +411,9 @@ mod tests {
             let elapsed = start.elapsed();
             println!("pretty-print of 1 MiB JSON: {elapsed:?}");
             assert!(pretty.lines.len() > 1000 && pretty.note.is_none());
-            assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+            fdt_store::budget::check(elapsed < Duration::from_millis(500), || {
+                format!("{elapsed:?}")
+            });
         }
     }
 }

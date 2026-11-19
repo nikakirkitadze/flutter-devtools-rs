@@ -1,6 +1,7 @@
 //! The session store: time axis, ids, run clocks, chunked copy-on-write
 //! storage, runs and immutable snapshots. Pure data; no GPUI.
 
+pub mod budget;
 pub mod chunked;
 pub mod clock;
 pub mod frames;

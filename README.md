@@ -40,6 +40,18 @@ trees and log bursts, for trying the tools against something real.
 cargo test --workspace
 ```
 
+### Release budgets
+
+The performance budget tests (`-- budget`, release mode only) always run and print what they
+measured. They fail the build only when `FDT_BUDGETS=strict` is set, which is how to run them on
+the reference machine:
+
+```
+FDT_BUDGETS=strict cargo test --workspace --release -- budget
+```
+
+Hosted CI runners are slower and noisier than that machine, so CI runs them report-only.
+
 ### Live integration test
 
 `crates/fdt_capture/tests/jank_lab_live.rs` runs the real capture against a running `jank_lab`

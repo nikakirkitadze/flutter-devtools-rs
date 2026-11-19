@@ -456,6 +456,6 @@ mod tests {
         }
         let (p90, worst) = p90_worst(ms);
         println!("strip_bars 72k frames, width 1000: p90 {p90:.4} ms, worst {worst:.4} ms");
-        assert!(p90 <= 1.0, "p90 {p90} ms");
+        crate::budget::check(p90 <= 1.0, || format!("p90 {p90} ms"));
     }
 }

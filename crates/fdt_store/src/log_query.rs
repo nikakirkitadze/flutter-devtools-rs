@@ -653,7 +653,7 @@ mod tests {
                 .collect();
             let (p90, worst) = p90_worst(times);
             eprintln!("full scan {name}: p90 {p90:.1} ms, worst {worst:.1} ms");
-            assert!(p90 <= 100.0, "{name}: p90 {p90:.1} ms");
+            crate::budget::check(p90 <= 100.0, || format!("{name}: p90 {p90:.1} ms"));
         }
     }
 
@@ -682,7 +682,7 @@ mod tests {
                 .collect();
             let (p90, worst) = p90_worst(times);
             eprintln!("first results {name}: p90 {p90:.1} ms, worst {worst:.1} ms");
-            assert!(p90 <= 16.0, "{name}: p90 {p90:.1} ms");
+            crate::budget::check(p90 <= 16.0, || format!("{name}: p90 {p90:.1} ms"));
         }
     }
 }

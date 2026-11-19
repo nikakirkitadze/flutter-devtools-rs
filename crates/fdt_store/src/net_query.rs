@@ -386,7 +386,7 @@ mod tests {
                 .collect();
             let (p90, worst) = p90_worst(times);
             eprintln!("net filter {name}: p90 {p90:.2} ms, worst {worst:.2} ms");
-            assert!(p90 <= 16.0, "{name}: p90 {p90:.2} ms");
+            crate::budget::check(p90 <= 16.0, || format!("{name}: p90 {p90:.2} ms"));
         }
     }
 }
