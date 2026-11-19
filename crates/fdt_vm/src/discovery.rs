@@ -11,12 +11,12 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tokio::sync::watch;
 
-use crate::dtd::{DtdClient, parse_app_label};
+use crate::dtd::{DtdClient, VmServiceEntry, parse_app_label};
 use crate::events::{StreamEvent, decode_notification};
 use crate::rpc::{ConnectOptions, connect};
 use crate::service::{Mode, VmService, detect_mode};
 
-/// A failed probe or DTD connection is retried after this long.
+/// Default for `DiscoveryConfig::retry_after`.
 const RETRY_AFTER: Duration = Duration::from_secs(5);
 /// How long a probe waits for the `flutterVersion` service to be announced.
 const VERSION_WAIT: Duration = Duration::from_secs(1);
@@ -124,17 +124,42 @@ pub fn read_registry(dir: &Path) -> Vec<DtdEntry> {
     out
 }
 
+/// How long `dart tooling-daemon --list` may run before it is killed.
+const CLI_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Runs `dart tooling-daemon --list --machine`. Used where the registry directory is unknown.
+/// The child is killed if it takes longer than five seconds.
 pub fn list_via_cli(dart: &Path) -> Vec<DtdEntry> {
-    let Ok(out) = std::process::Command::new(dart)
+    use std::io::Read;
+    let Ok(mut child) = std::process::Command::new(dart)
         .args(["tooling-daemon", "--list", "--machine"])
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .output()
+        .spawn()
     else {
         return Vec::new();
     };
-    let Ok(Value::Array(items)) = serde_json::from_slice::<Value>(&out.stdout) else {
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Vec::new();
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    let out = rx.recv_timeout(CLI_TIMEOUT);
+    if out.is_err() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let Ok(out) = out else {
+        return Vec::new();
+    };
+    let Ok(Value::Array(items)) = serde_json::from_slice::<Value>(&out) else {
         return Vec::new();
     };
     let mut v: Vec<DtdEntry> = items.iter().filter_map(entry_from_value).collect();
@@ -212,6 +237,8 @@ pub struct DiscoveryConfig {
     pub registry_dir: Option<PathBuf>,
     /// The `dart` executable, used only when no registry directory is known.
     pub dart_cli: Option<PathBuf>,
+    /// A failed probe, a failed DTD or a closed DTD is not retried for this long.
+    pub retry_after: Duration,
 }
 
 impl Default for DiscoveryConfig {
@@ -221,6 +248,7 @@ impl Default for DiscoveryConfig {
             probe_timeout: Duration::from_secs(2),
             registry_dir: None,
             dart_cli: None,
+            retry_after: RETRY_AFTER,
         }
     }
 }
@@ -317,29 +345,75 @@ impl Discovery {
     }
 }
 
+enum Event {
+    Connected(DtdEntry, Option<DtdClient>),
+    Listed(String, Option<Vec<VmServiceEntry>>),
+    Probed(String, Result<ProbeInfo, String>),
+}
+
+struct Dtd {
+    entry: DtdEntry,
+    client: DtdClient,
+    services: Vec<VmServiceEntry>,
+    listing: bool,
+}
+
+enum ProbeState {
+    Running,
+    Done(ProbeInfo),
+    Failed(Instant),
+}
+
+/// All state of the scan loop. Every network step (connect, list, probe) runs as its own task
+/// in `tasks` and reports back through `events`, so a slow or hung peer never delays the
+/// others, nor the publishing of what is already known. Dropping the scanner aborts the tasks.
 struct Scanner {
     config: DiscoveryConfig,
-    clients: HashMap<String, (DtdEntry, DtdClient)>,
-    /// DTD connections that failed: retried after `RETRY_AFTER`.
-    connect_failed: HashMap<String, Instant>,
-    probes: HashMap<String, Result<ProbeInfo, Instant>>,
+    clients: HashMap<String, Dtd>,
+    connecting: HashSet<String>,
+    /// ws uris that must not be (re)connected to until the instant passes.
+    backoff: HashMap<String, Instant>,
+    probes: HashMap<String, ProbeState>,
+    live: HashSet<String>,
     cli_cache: (Option<Instant>, Vec<DtdEntry>),
+    tasks: tokio::task::JoinSet<()>,
+    events: tokio::sync::mpsc::UnboundedSender<Event>,
 }
 
 async fn run(config: DiscoveryConfig, tx: watch::Sender<Arc<[DiscoveredApp]>>) {
+    let (events, mut inbox) = tokio::sync::mpsc::unbounded_channel();
+    let interval = config.interval;
     let mut s = Scanner {
         config,
         clients: HashMap::new(),
-        connect_failed: HashMap::new(),
+        connecting: HashSet::new(),
+        backoff: HashMap::new(),
         probes: HashMap::new(),
+        live: HashSet::new(),
         cli_cache: (None, Vec::new()),
+        tasks: tokio::task::JoinSet::new(),
+        events,
     };
-    let mut first = true;
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let started = Instant::now();
+    let mut first_published = false;
     loop {
-        let apps: Arc<[DiscoveredApp]> = Arc::from(s.scan().await);
-        if first {
-            first = false;
-            tx.send_replace(apps);
+        tokio::select! {
+            _ = ticker.tick() => s.tick().await,
+            Some(ev) = inbox.recv() => s.apply(ev),
+            _ = s.any_closed() => {}
+        }
+        while s.tasks.try_join_next().is_some() {}
+        s.prune_closed();
+        let apps: Arc<[DiscoveredApp]> = Arc::from(s.apps());
+        if !first_published {
+            // The first scan publishes even an empty list, but waits for its in-flight work
+            // (at most one interval) so the start page does not flash "none found".
+            if s.idle() || started.elapsed() >= interval {
+                first_published = true;
+                tx.send_replace(apps);
+            }
         } else {
             tx.send_if_modified(|cur| {
                 if **cur == *apps {
@@ -350,23 +424,42 @@ async fn run(config: DiscoveryConfig, tx: watch::Sender<Arc<[DiscoveredApp]>>) {
                 }
             });
         }
-        s.wait_for_next_tick().await;
     }
 }
 
 impl Scanner {
-    /// Sleeps for the interval, but wakes early when a DTD connection closes.
-    async fn wait_for_next_tick(&self) {
-        let sleep = tokio::time::sleep(self.config.interval);
-        if self.clients.is_empty() {
-            sleep.await;
-            return;
+    /// Resolves when any DTD connection closes. Owns clones, so it does not borrow `self`.
+    fn any_closed(&self) -> impl std::future::Future<Output = ()> + use<> {
+        let clients: Vec<DtdClient> = self.clients.values().map(|d| d.client.clone()).collect();
+        async move {
+            if clients.is_empty() {
+                std::future::pending::<()>().await;
+            }
+            futures_util::future::select_all(clients.iter().map(|c| Box::pin(c.closed()))).await;
         }
-        let closes = self.clients.values().map(|(_, c)| Box::pin(c.closed()));
-        tokio::select! {
-            _ = sleep => {}
-            _ = futures_util::future::select_all(closes) => {}
-        }
+    }
+
+    fn idle(&self) -> bool {
+        self.connecting.is_empty()
+            && self.clients.values().all(|d| !d.listing)
+            && self
+                .probes
+                .values()
+                .all(|p| !matches!(p, ProbeState::Running))
+    }
+
+    /// A DTD that closed means its app quit; its registry file may linger until the pid dies,
+    /// so it is not reconnected to for `retry_after`.
+    fn prune_closed(&mut self) {
+        let until = Instant::now() + self.config.retry_after;
+        let backoff = &mut self.backoff;
+        self.clients.retain(|k, d| {
+            let keep = !d.client.is_closed();
+            if !keep {
+                backoff.insert(k.clone(), until);
+            }
+            keep
+        });
     }
 
     async fn entries(&mut self) -> Vec<DtdEntry> {
@@ -380,7 +473,10 @@ impl Scanner {
             return Vec::new();
         };
         // Spawning a process every tick would be wasteful.
-        let stale = self.cli_cache.0.is_none_or(|t| t.elapsed() >= RETRY_AFTER);
+        let stale = self
+            .cli_cache
+            .0
+            .is_none_or(|t| t.elapsed() >= self.config.retry_after);
         if stale {
             let list = tokio::task::spawn_blocking(move || list_via_cli(&dart))
                 .await
@@ -390,101 +486,161 @@ impl Scanner {
         self.cli_cache.1.clone()
     }
 
-    async fn scan(&mut self) -> Vec<DiscoveredApp> {
+    async fn tick(&mut self) {
         let entries: Vec<DtdEntry> = self
             .entries()
             .await
             .into_iter()
             .filter(|e| pid_alive(e.pid))
             .collect();
-        let live: HashSet<&str> = entries.iter().map(|e| e.ws_uri.as_str()).collect();
-        // A DTD that closed means its app quit; its registry file may linger until the pid dies,
-        // so it is not reconnected to for a while.
-        let failed = &mut self.connect_failed;
-        self.clients.retain(|k, (_, c)| {
-            let keep = live.contains(k.as_str()) && !c.is_closed();
-            if !keep {
-                failed.insert(k.clone(), Instant::now());
-            }
-            keep
-        });
-        self.connect_failed.retain(|k, _| live.contains(k.as_str()));
+        self.live = entries.iter().map(|e| e.ws_uri.clone()).collect();
+        let live = &self.live;
+        self.clients.retain(|k, _| live.contains(k));
+        self.backoff
+            .retain(|k, until| live.contains(k) && *until > Instant::now());
 
         for e in &entries {
-            if self.clients.contains_key(&e.ws_uri) {
-                continue;
-            }
-            if self
-                .connect_failed
-                .get(&e.ws_uri)
-                .is_some_and(|t| t.elapsed() < RETRY_AFTER)
+            if self.clients.contains_key(&e.ws_uri)
+                || self.connecting.contains(&e.ws_uri)
+                || self.backoff.contains_key(&e.ws_uri)
             {
                 continue;
             }
-            let attempt = async {
-                let url = url::Url::parse(&e.ws_uri).ok()?;
-                DtdClient::connect(&url).await.ok()
-            };
-            match tokio::time::timeout(self.config.probe_timeout, attempt).await {
-                Ok(Some(c)) => {
-                    self.connect_failed.remove(&e.ws_uri);
-                    self.clients.insert(e.ws_uri.clone(), (e.clone(), c));
-                }
-                _ => {
-                    self.connect_failed.insert(e.ws_uri.clone(), Instant::now());
-                }
-            }
+            self.connecting.insert(e.ws_uri.clone());
+            let (e, timeout, events) = (e.clone(), self.config.probe_timeout, self.events.clone());
+            self.tasks.spawn(async move {
+                let attempt = async {
+                    let url = url::Url::parse(&e.ws_uri).ok()?;
+                    DtdClient::connect(&url).await.ok()
+                };
+                let client = tokio::time::timeout(timeout, attempt).await.ok().flatten();
+                let _ = events.send(Event::Connected(e, client));
+            });
         }
 
-        // One getVmServices per DTD; a failing DTD is dropped and reconnected later.
-        let timeout = self.config.probe_timeout;
-        let mut listed: Vec<(DtdEntry, Vec<crate::dtd::VmServiceEntry>)> = Vec::new();
-        let mut broken = Vec::new();
-        for (ws, (entry, client)) in &self.clients {
-            match tokio::time::timeout(timeout, client.get_vm_services()).await {
-                Ok(Ok(v)) => listed.push((entry.clone(), v)),
-                _ => broken.push(ws.clone()),
-            }
+        let ws_uris: Vec<String> = self.clients.keys().cloned().collect();
+        for ws in ws_uris {
+            self.spawn_list(&ws);
         }
-        for ws in broken {
-            self.clients.remove(&ws);
-        }
-        listed.sort_by_key(|a| std::cmp::Reverse(a.0.epoch));
 
-        // Probe uncached VMs concurrently.
-        let seen: HashSet<&str> = listed
-            .iter()
-            .flat_map(|(_, v)| v.iter().map(|s| s.uri.as_str()))
+        // Forget probe results for VMs no DTD lists any more.
+        let seen: HashSet<&str> = self
+            .clients
+            .values()
+            .flat_map(|d| d.services.iter().map(|s| s.uri.as_str()))
             .collect();
         self.probes.retain(|k, _| seen.contains(k.as_str()));
-        let mut todo: Vec<String> = Vec::new();
-        for uri in &seen {
-            let needs = match self.probes.get(*uri) {
-                None => true,
-                Some(Ok(_)) => false,
-                Some(Err(at)) => at.elapsed() >= RETRY_AFTER,
-            };
-            if needs && !todo.iter().any(|t| t == uri) {
-                todo.push(uri.to_string());
-            }
-        }
-        let results = futures_util::future::join_all(todo.iter().map(|u| probe(u, timeout))).await;
-        for (uri, r) in todo.into_iter().zip(results) {
-            match r {
-                Ok(info) => {
-                    self.probes.insert(uri, Ok(info));
-                }
-                Err(e) => {
-                    log::debug!("probe of a VM service failed: {e}");
-                    self.probes.insert(uri, Err(Instant::now()));
-                }
-            }
-        }
+        self.spawn_probes();
+    }
 
+    fn spawn_list(&mut self, ws: &str) {
+        let Some(d) = self.clients.get_mut(ws) else {
+            return;
+        };
+        if d.listing {
+            return;
+        }
+        d.listing = true;
+        let (client, ws, timeout, events) = (
+            d.client.clone(),
+            ws.to_string(),
+            self.config.probe_timeout,
+            self.events.clone(),
+        );
+        self.tasks.spawn(async move {
+            let r = tokio::time::timeout(timeout, client.get_vm_services())
+                .await
+                .ok()
+                .and_then(Result::ok);
+            let _ = events.send(Event::Listed(ws, r));
+        });
+    }
+
+    fn spawn_probes(&mut self) {
+        let now = Instant::now();
+        let mut todo: Vec<String> = Vec::new();
+        for d in self.clients.values() {
+            for svc in &d.services {
+                let needs = match self.probes.get(&svc.uri) {
+                    None => true,
+                    Some(ProbeState::Running | ProbeState::Done(_)) => false,
+                    Some(ProbeState::Failed(until)) => *until <= now,
+                };
+                if needs && !todo.contains(&svc.uri) {
+                    todo.push(svc.uri.clone());
+                }
+            }
+        }
+        for uri in todo {
+            self.probes.insert(uri.clone(), ProbeState::Running);
+            let (timeout, events) = (self.config.probe_timeout, self.events.clone());
+            self.tasks.spawn(async move {
+                let r = probe(&uri, timeout).await;
+                let _ = events.send(Event::Probed(uri, r));
+            });
+        }
+    }
+
+    fn apply(&mut self, ev: Event) {
+        match ev {
+            Event::Connected(entry, client) => {
+                self.connecting.remove(&entry.ws_uri);
+                let ws = entry.ws_uri.clone();
+                match client {
+                    Some(client) if self.live.contains(&ws) => {
+                        self.clients.insert(
+                            ws.clone(),
+                            Dtd {
+                                entry,
+                                client,
+                                services: Vec::new(),
+                                listing: false,
+                            },
+                        );
+                        self.spawn_list(&ws);
+                    }
+                    Some(_) => {}
+                    None => {
+                        self.backoff
+                            .insert(ws, Instant::now() + self.config.retry_after);
+                    }
+                }
+            }
+            Event::Listed(ws, result) => match result {
+                Some(services) => {
+                    if let Some(d) = self.clients.get_mut(&ws) {
+                        d.listing = false;
+                        d.services = services;
+                        self.spawn_probes();
+                    }
+                }
+                None => {
+                    if self.clients.remove(&ws).is_some() {
+                        self.backoff
+                            .insert(ws, Instant::now() + self.config.retry_after);
+                    }
+                }
+            },
+            Event::Probed(uri, result) => {
+                let Some(slot) = self.probes.get_mut(&uri) else {
+                    return;
+                };
+                *slot = match result {
+                    Ok(info) => ProbeState::Done(info),
+                    Err(e) => {
+                        log::debug!("probe of a VM service failed: {e}");
+                        ProbeState::Failed(Instant::now() + self.config.retry_after)
+                    }
+                };
+            }
+        }
+    }
+
+    fn apps(&self) -> Vec<DiscoveredApp> {
         let mut apps = Vec::new();
-        for (entry, services) in &listed {
-            for svc in services {
-                let Some(Ok(info)) = self.probes.get(&svc.uri) else {
+        for d in self.clients.values() {
+            for svc in &d.services {
+                let Some(ProbeState::Done(info)) = self.probes.get(&svc.uri) else {
                     continue;
                 };
                 let label = svc.name.as_deref().map(parse_app_label).unwrap_or_default();
@@ -498,14 +654,14 @@ impl Scanner {
                     key: AppKey {
                         package: name.clone(),
                         device: device.clone(),
-                        workspace: entry.workspace_root.clone().unwrap_or_default(),
+                        workspace: d.entry.workspace_root.clone().unwrap_or_default(),
                     },
                     vm_uri: svc.uri.clone(),
                     name,
                     device,
                     mode: Some(info.mode),
                     flutter_version: info.flutter_version.clone(),
-                    workspace: entry.workspace_root.clone(),
+                    workspace: d.entry.workspace_root.clone(),
                     pid: info.pid,
                 });
             }
@@ -520,7 +676,7 @@ impl Scanner {
 mod tests {
     use super::*;
     use crate::testing::ScriptedServer;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::collections::HashMap;
     use std::time::Duration;
 
@@ -624,12 +780,23 @@ mod tests {
     }
 
     fn vm_server() -> Arc<ScriptedServer> {
-        let server = Arc::new(ScriptedServer::start(|method, _| match method {
-            "getVM" => Ok(json!({"pid": 4242, "operatingSystem": "macos",
-                "isolates": [{"id": "isolates/1", "name": "main", "isSystemIsolate": false}]})),
+        vm_server_with("jank_lab", 0)
+    }
+
+    /// A VM whose first `fail_first` `getVM` calls fail.
+    fn vm_server_with(package: &'static str, fail_first: usize) -> Arc<ScriptedServer> {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let server = Arc::new(ScriptedServer::start(move |method, _| match method {
+            "getVM" => {
+                if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < fail_first {
+                    return Err((-32000, "not ready".into()));
+                }
+                Ok(json!({"pid": 4242, "operatingSystem": "macos",
+                    "isolates": [{"id": "isolates/1", "name": "main", "isSystemIsolate": false}]}))
+            }
             "getIsolate" => Ok(json!({"id": "isolates/1", "name": "main",
                 "extensionRPCs": ["ext.flutter.reassemble"],
-                "rootLib": {"uri": "package:jank_lab/main.dart"}})),
+                "rootLib": {"uri": format!("package:{package}/main.dart")}})),
             "streamListen" => Ok(json!({"type": "Success"})),
             "s1.flutterVersion" => Ok(json!({"flutterVersion": "3.47.9"})),
             _ => Err((-32601, "nope".into())),
@@ -652,11 +819,25 @@ mod tests {
     }
 
     fn dtd_server(vm: &ScriptedServer) -> ScriptedServer {
-        let uri = vm.ws_uri().to_string();
+        dtd_server_listing(Arc::new(std::sync::Mutex::new(vec![(
+            vm.ws_uri().to_string(),
+            "jank_lab".to_string(),
+        )])))
+    }
+
+    /// A DTD that lists whatever `(uri, package)` pairs are in `vms` at the time of the call.
+    fn dtd_server_listing(vms: Arc<std::sync::Mutex<Vec<(String, String)>>>) -> ScriptedServer {
         ScriptedServer::start(move |method, _| match method {
             "ConnectedApp.getVmServices" => {
-                Ok(json!({"type": "VmServicesResponse", "vmServices": [
-                {"uri": uri, "name": "Kind: Flutter - Device: macOS - Package: jank_lab"}]}))
+                let list: Vec<Value> = vms
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(uri, pkg)| {
+                        json!({"uri": uri, "name": format!("Kind: Flutter - Device: macOS - Package: {pkg}")})
+                    })
+                    .collect();
+                Ok(json!({"type": "VmServicesResponse", "vmServices": list}))
             }
             _ => Err((-32601, "nope".into())),
         })
@@ -674,6 +855,7 @@ mod tests {
             probe_timeout: Duration::from_secs(2),
             registry_dir: Some(dir.to_path_buf()),
             dart_cli: None,
+            retry_after: Duration::from_secs(5),
         }
     }
 
@@ -747,5 +929,133 @@ mod tests {
         drop(disc);
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(dtd.open_connections(), 0);
+    }
+
+    async fn wait_for(
+        rx: &mut watch::Receiver<Arc<[DiscoveredApp]>>,
+        ms: u64,
+        what: &str,
+        ok: impl Fn(&[DiscoveredApp]) -> bool,
+    ) -> Arc<[DiscoveredApp]> {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+        loop {
+            let cur = rx.borrow_and_update().clone();
+            if ok(&cur) {
+                return cur;
+            }
+            tokio::time::timeout_at(deadline, rx.changed())
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for: {what}"))
+                .unwrap();
+        }
+    }
+
+    fn count(server: &ScriptedServer, method: &str) -> usize {
+        server
+            .received()
+            .iter()
+            .filter(|(m, _)| m == method)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn probe_failure_is_retried_after_the_retry_interval() {
+        let vm = vm_server_with("jank_lab", 1);
+        let dtd = dtd_server(&vm);
+        let dir = tempfile::tempdir().unwrap();
+        write_entry(dir.path(), &dtd.ws_uri());
+        let mut cfg = config(dir.path());
+        cfg.retry_after = Duration::from_millis(700);
+        let (_disc, mut rx) = Discovery::spawn(&tokio::runtime::Handle::current(), cfg);
+        // Several ticks pass inside the retry window: one failed attempt, no second one yet.
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert_eq!(count(&vm, "getVM"), 1);
+        assert!(rx.borrow().is_empty());
+        let apps = wait_for(&mut rx, 3000, "app after retry", |a| a.len() == 1).await;
+        assert_eq!(apps[0].name, "jank_lab");
+        assert_eq!(count(&vm, "getVM"), 2);
+    }
+
+    #[tokio::test]
+    async fn app_leaves_when_its_uri_leaves_get_vm_services() {
+        let vm = vm_server();
+        let list = Arc::new(std::sync::Mutex::new(vec![(
+            vm.ws_uri().to_string(),
+            "jank_lab".to_string(),
+        )]));
+        let dtd = dtd_server_listing(list.clone());
+        let dir = tempfile::tempdir().unwrap();
+        write_entry(dir.path(), &dtd.ws_uri());
+        let (_disc, mut rx) =
+            Discovery::spawn(&tokio::runtime::Handle::current(), config(dir.path()));
+        wait_for(&mut rx, 3000, "app", |a| a.len() == 1).await;
+        list.lock().unwrap().clear();
+        wait_for(&mut rx, 500, "app gone", |a| a.is_empty()).await;
+    }
+
+    #[tokio::test]
+    async fn hung_vm_does_not_block_other_apps() {
+        let hung = vm_server_with("hung_app", 0);
+        hung.set_latency(Duration::from_secs(30));
+        let ok = vm_server_with("ok_app", 0);
+        let dtd = dtd_server_listing(Arc::new(std::sync::Mutex::new(vec![
+            (hung.ws_uri().to_string(), "hung_app".to_string()),
+            (ok.ws_uri().to_string(), "ok_app".to_string()),
+        ])));
+        let dir = tempfile::tempdir().unwrap();
+        write_entry(dir.path(), &dtd.ws_uri());
+        let mut cfg = config(dir.path());
+        cfg.probe_timeout = Duration::from_secs(10);
+        let (_disc, mut rx) = Discovery::spawn(&tokio::runtime::Handle::current(), cfg);
+        let apps = wait_for(&mut rx, 1500, "healthy app", |a| !a.is_empty()).await;
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].name, "ok_app");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hung_dtd_does_not_block_other_apps() {
+        let vm = vm_server();
+        let ok_dtd = dtd_server(&vm);
+        let hung_dtd = dtd_server(&vm);
+        hung_dtd.set_latency(Duration::from_secs(30));
+        let dir = tempfile::tempdir().unwrap();
+        // Two registry files with live pids: this process and its parent.
+        let body = |ws: &url::Url, epoch: i64, pid: u32| {
+            json!({"wsUri": ws.to_string(), "epoch": epoch, "pid": pid}).to_string()
+        };
+        let me = std::process::id();
+        let parent = std::os::unix::process::parent_id();
+        std::fs::write(
+            dir.path().join(me.to_string()),
+            body(&hung_dtd.ws_uri(), 2, me),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(parent.to_string()),
+            body(&ok_dtd.ws_uri(), 1, parent),
+        )
+        .unwrap();
+        let mut cfg = config(dir.path());
+        cfg.probe_timeout = Duration::from_secs(10);
+        let (_disc, mut rx) = Discovery::spawn(&tokio::runtime::Handle::current(), cfg);
+        let apps = wait_for(&mut rx, 1500, "app via the healthy DTD", |a| !a.is_empty()).await;
+        assert_eq!(apps[0].name, "jank_lab");
+    }
+
+    #[tokio::test]
+    async fn failing_dtd_is_backed_off() {
+        let dtd = ScriptedServer::start(|_, _| Err((-32000, "broken".into())));
+        let dir = tempfile::tempdir().unwrap();
+        write_entry(dir.path(), &dtd.ws_uri());
+        let mut cfg = config(dir.path());
+        cfg.retry_after = Duration::from_millis(600);
+        let (_disc, _rx) = Discovery::spawn(&tokio::runtime::Handle::current(), cfg);
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        // Many 50 ms ticks have passed, but the DTD was asked once.
+        assert_eq!(count(&dtd, "ConnectedApp.getVmServices"), 1);
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        let n = count(&dtd, "ConnectedApp.getVmServices");
+        assert!((2..=3).contains(&n), "retried {n} times");
     }
 }
