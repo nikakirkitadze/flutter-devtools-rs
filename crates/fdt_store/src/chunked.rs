@@ -88,7 +88,7 @@ impl<T: Clone> Chunked<T> {
         ChunkedSnapshot {
             chunk_size: self.chunk_size,
             sealed,
-            tail: self.tail.clone().into(),
+            tail: Arc::from(self.tail.as_slice()),
         }
     }
 }
@@ -98,6 +98,15 @@ pub struct ChunkedSnapshot<T: Clone> {
     chunk_size: usize,
     sealed: Arc<[Arc<Vec<T>>]>,
     tail: Arc<[T]>,
+}
+
+impl<T: Clone> std::fmt::Debug for ChunkedSnapshot<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChunkedSnapshot")
+            .field("len", &self.len())
+            .field("chunk_size", &self.chunk_size)
+            .finish()
+    }
 }
 
 impl<T: Clone> Default for ChunkedSnapshot<T> {

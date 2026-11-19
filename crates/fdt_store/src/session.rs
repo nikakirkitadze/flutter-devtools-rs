@@ -1,8 +1,9 @@
 //! The single writer and the immutable snapshots views read.
 
 use crate::clock::RunClock;
+use crate::logs::{LOG_CHUNK, LogInput, LogStore, LogsSnapshot};
 use crate::run::{AppInfo, RunInfo};
-use crate::time::{RunId, SessionTime};
+use crate::time::{EntryId, RunId, SessionTime};
 use std::sync::Arc;
 
 /// An immutable, cheaply clonable view of the session at one generation.
@@ -11,6 +12,7 @@ pub struct Snapshot {
     pub generation: u64,
     pub origin_host_us: i64,
     pub runs: Arc<[RunInfo]>,
+    pub logs: LogsSnapshot,
     latest: SessionTime,
 }
 
@@ -21,6 +23,7 @@ impl Snapshot {
             generation: 0,
             origin_host_us: 0,
             runs: Arc::from(Vec::new()),
+            logs: LogsSnapshot::default(),
             latest: SessionTime(0),
         }
     }
@@ -38,6 +41,7 @@ impl Snapshot {
 pub struct SessionWriter {
     origin_host_us: i64,
     runs: Vec<RunInfo>,
+    logs: LogStore,
     latest: SessionTime,
     generation: u64,
     dirty: bool,
@@ -46,11 +50,21 @@ pub struct SessionWriter {
 
 impl SessionWriter {
     pub fn new(origin_host_us: i64) -> Self {
+        Self::with_log_chunk(origin_host_us, LOG_CHUNK)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_log_chunk(origin_host_us: i64, chunk: usize) -> Self {
+        Self::with_log_chunk(origin_host_us, chunk)
+    }
+
+    fn with_log_chunk(origin_host_us: i64, chunk: usize) -> Self {
         let mut empty = Snapshot::empty();
         empty.origin_host_us = origin_host_us;
         Self {
             origin_host_us,
             runs: Vec::new(),
+            logs: LogStore::new(chunk),
             latest: SessionTime(0),
             generation: 0,
             dirty: false,
@@ -71,6 +85,13 @@ impl SessionWriter {
             ended: None,
             clock,
         });
+        self.touch(at);
+        id
+    }
+
+    pub fn push_log(&mut self, input: LogInput) -> EntryId {
+        let at = input.time;
+        let id = self.logs.push(input);
         self.touch(at);
         id
     }
@@ -108,6 +129,7 @@ impl SessionWriter {
                 generation: self.generation,
                 origin_host_us: self.origin_host_us,
                 runs: self.runs.clone().into(),
+                logs: self.logs.snapshot(),
                 latest: self.latest,
             });
         }

@@ -1742,6 +1742,12 @@ dependencies = [
 [[package]]
 name = "fdt_store"
 version = "0.1.0"
+dependencies = [
+ "criterion",
+ "memchr",
+ "rayon",
+ "regex",
+]
 
 [[package]]
 name = "fdt_ui"

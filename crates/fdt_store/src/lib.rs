@@ -3,8 +3,11 @@
 
 pub mod chunked;
 pub mod clock;
+pub mod log_query;
+pub mod logs;
 pub mod run;
 pub mod session;
+pub mod synth;
 pub mod time;
 
 pub use session::{SessionWriter, Snapshot};

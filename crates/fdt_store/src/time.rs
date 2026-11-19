@@ -29,7 +29,7 @@ impl TimeRange {
     }
 
     pub fn duration_ns(&self) -> u64 {
-        self.end.0 - self.start.0
+        self.end.0.saturating_sub(self.start.0)
     }
 }
 
