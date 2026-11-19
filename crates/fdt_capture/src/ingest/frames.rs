@@ -42,7 +42,7 @@ mod tests {
                 timeline_to_wall_us: 1_000_000,
             },
         );
-        let sink = Sink::new(RunId(1), clock, tx);
+        let sink = Sink::new(RunId(1), clock, 1, tx);
         let f = frame_input(
             &sink,
             &json!({"number": 2, "startTime": 500, "elapsed": 48615, "build": 3180, "raster": 15895, "vsyncOverhead": 29501}),

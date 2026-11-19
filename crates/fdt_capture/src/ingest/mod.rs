@@ -9,7 +9,7 @@ pub(crate) mod stdout;
 
 use std::time::Duration;
 
-use fdt_store::clock::RunClock;
+use fdt_store::clock::{Calibration, RunClock};
 use fdt_store::frames::FrameInput;
 use fdt_store::logs::{LogInput, LogLevel, LogSource};
 use fdt_store::run::AppInfo;
@@ -25,10 +25,16 @@ use stdout::QuietLines;
 
 /// What a connection task asks the session task to store.
 pub(crate) enum Ingest {
+    /// The session creates its store at the first of these, so its origin is the first success.
     StartRun {
         app: Box<AppInfo>,
-        clock: RunClock,
-        reply: oneshot::Sender<RunId>,
+        calibration: Calibration,
+        reply: oneshot::Sender<(RunId, RunClock)>,
+    },
+    /// The connect sequence failed.
+    Failed {
+        message: String,
+        details: String,
     },
     Log(LogInput),
     Frame(FrameInput),
@@ -43,16 +49,27 @@ pub(crate) enum Ingest {
 pub(crate) struct Sink {
     pub(crate) run: RunId,
     pub(crate) clock: RunClock,
+    conn: u64,
     tx: mpsc::UnboundedSender<SessionMsg>,
 }
 
 impl Sink {
-    pub(crate) fn new(run: RunId, clock: RunClock, tx: mpsc::UnboundedSender<SessionMsg>) -> Sink {
-        Sink { run, clock, tx }
+    pub(crate) fn new(
+        run: RunId,
+        clock: RunClock,
+        conn: u64,
+        tx: mpsc::UnboundedSender<SessionMsg>,
+    ) -> Sink {
+        Sink {
+            run,
+            clock,
+            conn,
+            tx,
+        }
     }
 
     pub(crate) fn send(&self, i: Ingest) {
-        let _ = self.tx.send(SessionMsg::Ingest(i));
+        let _ = self.tx.send(SessionMsg::Ingest(self.conn, i));
     }
 
     pub(crate) fn log(&self, time_ms: i64, level: LogLevel, source: LogSource, text: String) {

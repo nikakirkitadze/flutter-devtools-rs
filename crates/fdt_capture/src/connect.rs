@@ -1,8 +1,6 @@
 //! The connect sequence and the event loop of one connection.
 
-use std::sync::Arc;
-
-use fdt_store::clock::{Calibration, RunClock, calibrate, host_now_us};
+use fdt_store::clock::{Calibration, calibrate, host_now_us};
 use fdt_store::run::{AppInfo, Mode as StoreMode};
 use fdt_vm::dart_io::HTTP_CALIBRATION_SINCE;
 use fdt_vm::events::decode_notification;
@@ -10,12 +8,11 @@ use fdt_vm::rpc::{ConnectOptions, connect};
 use fdt_vm::service::{Mode, VmService, detect_mode};
 use fdt_vm::types::{Isolate, IsolateRef, Vm};
 use fdt_vm::uri::VmServiceUri;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::capture::{SessionMsg, Target};
 use crate::config::CaptureConfig;
 use crate::ingest::{Ingest, Router, Sink};
-use crate::status::ConnStatus;
 
 const STREAMS: [&str; 6] = [
     "Logging",
@@ -70,14 +67,14 @@ fn store_mode(m: Mode) -> StoreMode {
     }
 }
 
-async fn calibrate_clock(svc: &VmService, main: &str, origin: i64) -> RunClock {
+async fn calibrate_clock(svc: &VmService, main: &str) -> Calibration {
     let before = host_now_us();
     let timeline = svc.get_vm_timeline_micros().await;
     let profile = svc
         .get_http_profile(main, Some(HTTP_CALIBRATION_SINCE))
         .await;
     let after = host_now_us();
-    let cal = match (timeline, profile) {
+    match (timeline, profile) {
         (Ok(t), Ok(p)) => calibrate(before, after, p.timestamp, t),
         (timeline, _) => {
             log::warn!("clock calibration failed; assuming the device clock matches the host");
@@ -86,25 +83,26 @@ async fn calibrate_clock(svc: &VmService, main: &str, origin: i64) -> RunClock {
                 timeline_to_wall_us: timeline.map_or(0, |t| (before + after) / 2 - t),
             }
         }
-    };
-    RunClock::new(origin, cal)
+    }
 }
 
 pub(crate) async fn run(
     target: Target,
     cfg: CaptureConfig,
-    origin: i64,
+    conn: u64,
     tx: mpsc::UnboundedSender<SessionMsg>,
-    status: Arc<watch::Sender<ConnStatus>>,
 ) {
-    match connect_and_ingest(target, &cfg, origin, &tx, &status).await {
+    match connect_and_ingest(target, &cfg, conn, &tx).await {
         Ok(reason) => log::info!("connection ended: {reason}"),
         Err(f) => {
             log::info!("connect failed: {}", f.message);
-            status.send_replace(ConnStatus::Failed {
-                message: f.message,
-                details: f.details,
-            });
+            let _ = tx.send(SessionMsg::Ingest(
+                conn,
+                Ingest::Failed {
+                    message: f.message,
+                    details: f.details,
+                },
+            ));
         }
     }
 }
@@ -112,9 +110,8 @@ pub(crate) async fn run(
 async fn connect_and_ingest(
     target: Target,
     cfg: &CaptureConfig,
-    origin: i64,
+    conn: u64,
     tx: &mpsc::UnboundedSender<SessionMsg>,
-    status: &watch::Sender<ConnStatus>,
 ) -> Result<String, Fail> {
     let (uri, preset) = match &target {
         Target::Uri(u) => (u.clone(), None),
@@ -156,11 +153,8 @@ async fn connect_and_ingest(
         }
         Ok(())
     };
-    let (isolate, listened, clock) = tokio::join!(
-        svc.get_isolate(&main),
-        listen,
-        calibrate_clock(&svc, &main, origin)
-    );
+    let (isolate, listened, calibration) =
+        tokio::join!(svc.get_isolate(&main), listen, calibrate_clock(&svc, &main));
     let isolate = isolate.map_err(Fail::rpc)?;
     listened.map_err(Fail::rpc)?;
 
@@ -184,22 +178,19 @@ async fn connect_and_ingest(
     };
 
     let (reply, run_rx) = oneshot::channel();
-    let _ = tx.send(SessionMsg::Ingest(Ingest::StartRun {
-        app: Box::new(app.clone()),
-        clock,
-        reply,
-    }));
-    let run = run_rx.await.map_err(|_| Fail {
+    let _ = tx.send(SessionMsg::Ingest(
+        conn,
+        Ingest::StartRun {
+            app: Box::new(app),
+            calibration,
+            reply,
+        },
+    ));
+    let (run, clock) = run_rx.await.map_err(|_| Fail {
         message: "The session closed.".into(),
         details: String::new(),
     })?;
-    status.send_replace(ConnStatus::Connected {
-        run,
-        app,
-        recording: true,
-    });
-
-    let sink = Sink::new(run, clock, tx.clone());
+    let sink = Sink::new(run, clock, conn, tx.clone());
     let mut router = Router::new(sink, svc, main, cfg.stdout_flush, cfg.string_fetch_timeout);
     loop {
         let flush = router.next_flush();

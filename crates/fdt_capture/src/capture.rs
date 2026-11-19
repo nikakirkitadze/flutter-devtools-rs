@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use fdt_store::clock::host_now_us;
+use fdt_store::clock::{RunClock, host_now_us};
 use fdt_store::net::{BodyKind, BodyLimits};
 use fdt_store::time::{EntryId, RunId, SessionTime};
 use fdt_store::{SessionWriter, Snapshot};
@@ -34,11 +34,14 @@ pub(crate) enum Command {
     LoadFullBody(EntryId, BodyKind),
     SetFreeAppHttpMemory(bool),
     SetBodyLimits(BodyLimits),
+    /// Sent when the `Capture` is dropped.
+    Shutdown,
 }
 
 pub(crate) enum SessionMsg {
     Command(Command),
-    Ingest(Ingest),
+    /// From the connection task of generation `.0`; stale generations are ignored.
+    Ingest(u64, Ingest),
 }
 
 /// The app's handle on capture. Cheap to use from any thread; nothing here blocks.
@@ -61,8 +64,9 @@ impl Capture {
         let session = Session {
             cfg: config,
             _discovery: discovery,
-            tx: tx.clone(),
-            status: Arc::new(status_tx),
+            tx: tx.downgrade(),
+            status: status_tx,
+            conn_gen: 0,
             snap_tx,
             writer: None,
             conn: None,
@@ -118,13 +122,24 @@ impl Capture {
     }
 }
 
+impl Drop for Capture {
+    fn drop(&mut self) {
+        // Connection tasks hold senders too, so the channel would never close by itself.
+        self.command(Command::Shutdown);
+    }
+}
+
 struct Session {
     cfg: CaptureConfig,
     _discovery: Option<watch::Receiver<Arc<[DiscoveredApp]>>>,
-    tx: mpsc::UnboundedSender<SessionMsg>,
-    status: Arc<watch::Sender<ConnStatus>>,
+    /// Weak: only connection tasks (and the `Capture`) keep the channel open.
+    tx: mpsc::WeakUnboundedSender<SessionMsg>,
+    /// Only the session task writes the status.
+    status: watch::Sender<ConnStatus>,
+    /// The current connection's generation; messages from older ones are stale.
+    conn_gen: u64,
     snap_tx: watch::Sender<Arc<Snapshot>>,
-    /// Created at the first connect, because its origin is that moment.
+    /// Created at the first successful connect, because its origin is that moment.
     writer: Option<SessionWriter>,
     conn: Option<JoinHandle<()>>,
     current_run: Option<RunId>,
@@ -137,8 +152,10 @@ impl Session {
         loop {
             tokio::select! {
                 msg = rx.recv() => match msg {
+                    Some(SessionMsg::Command(Command::Shutdown)) => break,
                     Some(SessionMsg::Command(c)) => self.command(c),
-                    Some(SessionMsg::Ingest(i)) => self.ingest(i),
+                    Some(SessionMsg::Ingest(g, i)) if g == self.conn_gen => self.ingest(i),
+                    Some(SessionMsg::Ingest(g, _)) => log::debug!("ignoring stale connection {g}"),
                     None => break,
                 },
                 _ = async {
@@ -184,6 +201,7 @@ impl Session {
                 }
             }
             // Filled in by later tasks; accepted and ignored for now.
+            Command::Shutdown => {} // handled by the run loop
             Command::Disconnect => log::debug!("command: disconnect"),
             Command::StopWaiting => log::debug!("command: stop_waiting"),
             Command::SetRecording(on) => log::debug!("command: set_recording({on})"),
@@ -202,36 +220,56 @@ impl Session {
         if let Some(old) = self.conn.take() {
             old.abort();
         }
-        let limits = self.cfg.body_limits;
-        let writer = self.writer.get_or_insert_with(|| {
-            let mut w = SessionWriter::new(host_now_us());
-            w.set_body_limits(limits);
-            w
-        });
-        let origin = writer.origin_host_us();
+        let Some(tx) = self.tx.upgrade() else {
+            return;
+        };
+        self.conn_gen += 1;
         self.status.send_replace(ConnStatus::Connecting {
             label: connect::label_of(&target),
         });
         self.conn = Some(tokio::spawn(connect::run(
             target,
             self.cfg.clone(),
-            origin,
-            self.tx.clone(),
-            self.status.clone(),
+            self.conn_gen,
+            tx,
         )));
     }
 
     fn ingest(&mut self, i: Ingest) {
+        if let Ingest::StartRun {
+            app,
+            calibration,
+            reply,
+        } = i
+        {
+            let limits = self.cfg.body_limits;
+            let w = self.writer.get_or_insert_with(|| {
+                let mut w = SessionWriter::new(host_now_us());
+                w.set_body_limits(limits);
+                w
+            });
+            let clock = RunClock::new(w.origin_host_us(), calibration);
+            let us = (host_now_us() - clock.origin_host_us).max(0) as u64;
+            let id = w.start_run((*app).clone(), clock, SessionTime(us.saturating_mul(1000)));
+            self.current_run = Some(id);
+            self.status.send_replace(ConnStatus::Connected {
+                run: id,
+                app: *app,
+                recording: true,
+            });
+            let _ = reply.send((id, clock));
+            return;
+        }
+        if let Ingest::Failed { message, details } = i {
+            self.status
+                .send_replace(ConnStatus::Failed { message, details });
+            return;
+        }
         let Some(w) = self.writer.as_mut() else {
             return;
         };
         match i {
-            Ingest::StartRun { app, clock, reply } => {
-                let us = (host_now_us() - clock.origin_host_us).max(0) as u64;
-                let id = w.start_run(*app, clock, SessionTime(us.saturating_mul(1000)));
-                self.current_run = Some(id);
-                let _ = reply.send(id);
-            }
+            Ingest::StartRun { .. } | Ingest::Failed { .. } => {}
             Ingest::Log(l) => {
                 w.push_log(l);
             }
@@ -250,5 +288,52 @@ impl Session {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session() -> (Session, mpsc::UnboundedSender<SessionMsg>) {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (status, _) = watch::channel(ConnStatus::Idle);
+        let (snap_tx, _) = watch::channel(Arc::new(Snapshot::empty()));
+        let s = Session {
+            cfg: CaptureConfig::default(),
+            _discovery: None,
+            tx: tx.downgrade(),
+            status,
+            conn_gen: 0,
+            snap_tx,
+            writer: None,
+            conn: None,
+            current_run: None,
+            last_publish: None,
+        };
+        (s, tx)
+    }
+
+    #[test]
+    fn stale_connection_cannot_overwrite_status() {
+        let (mut s, _tx) = session();
+        s.conn_gen = 2;
+        s.status
+            .send_replace(ConnStatus::Connecting { label: "b".into() });
+        // The run loop drops messages whose generation is not current; mirror its check.
+        let deliver = |s: &mut Session, g: u64| {
+            if g == s.conn_gen {
+                s.ingest(Ingest::Failed {
+                    message: format!("from {g}"),
+                    details: String::new(),
+                });
+            }
+        };
+        deliver(&mut s, 1);
+        assert!(matches!(*s.status.borrow(), ConnStatus::Connecting { .. }));
+        deliver(&mut s, 2);
+        assert!(
+            matches!(&*s.status.borrow(), ConnStatus::Failed { message, .. } if message == "from 2")
+        );
     }
 }
