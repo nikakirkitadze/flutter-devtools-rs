@@ -537,6 +537,24 @@ impl NetStore {
         self.evict();
     }
 
+    /// Closes a request that never finished: it ends at `at` (not before it started) with
+    /// `error`. A request that already has an end is left alone.
+    pub(crate) fn abort_request(&mut self, id: EntryId, at: SessionTime, error: &str) {
+        let Some(slot) = self
+            .requests
+            .get_mut(id.seq as usize)
+            .filter(|r| r.id == id)
+        else {
+            return;
+        };
+        if slot.end.is_some() {
+            return;
+        }
+        let rec = Arc::make_mut(slot);
+        rec.end = Some(at.max(rec.start));
+        rec.error = Some(error.to_string());
+    }
+
     pub(crate) fn set_body_state(&mut self, id: EntryId, kind: BodyKind, state: BodyState) {
         let idx = id.seq as usize;
         if self.requests.get(idx).is_none_or(|r| r.id != id) {

@@ -8,7 +8,7 @@ use std::time::Duration;
 use fdt_store::SessionWriter;
 use fdt_store::clock::RunClock;
 use fdt_store::net::{BodyKind, BodyState, HttpUpdate};
-use fdt_store::time::{EntryId, RunId};
+use fdt_store::time::{EntryId, RunId, SessionTime};
 use fdt_vm::dart_io::{HttpProfileEntry, HttpProfileRequestFull};
 use fdt_vm::rpc::RpcError;
 use fdt_vm::service::VmService;
@@ -22,6 +22,7 @@ use super::{Ingest, SharedSink, sockets};
 pub(crate) const ENABLE_RPC: &str = "ext.dart.io.httpEnableTimelineLogging";
 const MAX_FETCHES_PER_RUN: usize = 4;
 pub(crate) const TIMEOUT_REASON: &str = "The body took too long to copy.";
+pub(crate) const STOPPED_REQUEST_REASON: &str = "The app stopped before this request finished.";
 pub(crate) const STOPPED_REASON: &str = "The app stopped before the body was copied.";
 
 /// Maps one profile entry onto the store's update. HTTP profile times are epoch microseconds.
@@ -437,7 +438,11 @@ impl NetState {
     }
 
     /// The run is over: bodies still being copied never will be, and nothing can be fetched.
-    pub(crate) fn end_run(&mut self, w: &mut SessionWriter) {
+    pub(crate) fn end_run(&mut self, w: &mut SessionWriter, at: SessionTime) {
+        let isolates: Vec<String> = self.incomplete.keys().cloned().collect();
+        for isolate in isolates {
+            self.isolate_exit(w, &isolate, at);
+        }
         for id in self.pending.drain() {
             for kind in [BodyKind::Request, BodyKind::Response] {
                 w.set_body_state(
@@ -451,6 +456,23 @@ impl NetState {
         }
         self.fetcher = None;
         self.new_run();
+    }
+
+    /// An isolate (or the whole app) stopped: its requests that never finished end now, with an
+    /// error, so they stop showing as pending and the waterfall has an end for them.
+    pub(crate) fn isolate_exit(&mut self, w: &mut SessionWriter, isolate: &str, at: SessionTime) {
+        let Some(open) = self.incomplete.remove(isolate) else {
+            return;
+        };
+        let ids: Vec<EntryId> = self
+            .keys
+            .iter()
+            .filter(|(_, (iso, vm_id))| iso == isolate && open.contains(vm_id))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            w.abort_request(id, at, STOPPED_REQUEST_REASON);
+        }
     }
 
     /// A new session starts on the same connection: forget the old one's requests, and ignore

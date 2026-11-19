@@ -631,3 +631,78 @@ fn every_running_isolate_with_the_profile_is_polled_at_connect() {
         );
     });
 }
+
+const STOPPED: &str = "The app stopped before this request finished.";
+
+#[test]
+fn an_in_flight_request_ends_with_an_error_when_the_app_dies() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let server = ScriptedServer::start(|m, p| {
+            base(m, p).unwrap_or_else(|| match m {
+                "ext.dart.io.getHttpProfile" => profile(vec![in_flight("7")]),
+                _ => Err((-32601, "Method not found".into())),
+            })
+        });
+        let cap = start(&server, config(), &rt);
+        let snap = common::wait_for(&cap, Duration::from_secs(5), "a pending request", |s| {
+            s.net.len() == 1
+        })
+        .await;
+        assert!(snap.net.request(0).end.is_none());
+        server.close_abruptly();
+        let snap = common::wait_for(&cap, Duration::from_secs(5), "the request to end", |s| {
+            s.net.request(0).end.is_some()
+        })
+        .await;
+        let r = snap.net.request(0);
+        assert_eq!(r.error.as_deref(), Some(STOPPED));
+        assert_eq!(r.status_class(), fdt_store::net::StatusClass::Failed);
+        assert!(r.end.unwrap() >= r.start);
+    });
+}
+
+#[test]
+fn a_hot_restart_ends_only_the_old_isolates_in_flight_requests() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let server = ScriptedServer::start(|m, p| {
+            base(m, p).unwrap_or_else(|| match m {
+                "ext.dart.io.getHttpProfile" => match p["isolateId"].as_str() {
+                    Some("isolates/2") => profile(vec![in_flight("9")]),
+                    _ => profile(vec![in_flight("7")]),
+                },
+                _ => Err((-32601, "Method not found".into())),
+            })
+        });
+        let cap = start(&server, config(), &rt);
+        common::wait_for(&cap, Duration::from_secs(5), "the first request", |s| {
+            s.net.len() == 1
+        })
+        .await;
+        let note = |event: Value| {
+            server.notify(
+                "streamNotify",
+                json!({"streamId": "Isolate", "event": event}),
+            )
+        };
+        note(json!({"kind": "IsolateExit", "isolate": isolate_ref("isolates/1")}));
+        note(json!({"kind": "IsolateStart", "isolate": isolate_ref("isolates/2")}));
+        note(
+            json!({"kind": "ServiceExtensionAdded", "isolate": isolate_ref("isolates/2"),
+            "extensionRPC": ENABLE}),
+        );
+        let snap = common::wait_for(&cap, Duration::from_secs(5), "both requests", |s| {
+            s.net.len() == 2 && s.net.request(0).end.is_some()
+        })
+        .await;
+        let (old, new) = (snap.net.request(0), snap.net.request(1));
+        assert_eq!(old.vm_id, "7");
+        assert_eq!(old.error.as_deref(), Some(STOPPED));
+        assert_eq!(new.vm_id, "9");
+        assert!(
+            new.end.is_none() && new.error.is_none(),
+            "the new isolate's request is untouched"
+        );
+    });
+}

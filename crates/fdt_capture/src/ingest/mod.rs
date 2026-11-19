@@ -63,6 +63,10 @@ pub(crate) enum Ingest {
         result: http::Fetched,
     },
     Sockets(Vec<SocketUpdate>),
+    /// An isolate exited (a hot restart, or the app ending it): its unfinished requests end.
+    IsolateExit {
+        isolate: String,
+    },
 }
 
 /// One run's channel to the session task, plus what is needed to map event times.
@@ -224,7 +228,12 @@ impl Router {
                     }
                 });
             }
-            StreamEvent::IsolateExit { isolate } => self.net.stop(&isolate.id),
+            StreamEvent::IsolateExit { isolate } => {
+                self.net.stop(&isolate.id);
+                self.sink.get().send(Ingest::IsolateExit {
+                    isolate: isolate.id,
+                });
+            }
             // A hot restart: the old main isolate exits and a new one starts, in the same run.
             StreamEvent::IsolateStart { isolate }
                 if isolate.name == "main" && !isolate.is_system_isolate =>

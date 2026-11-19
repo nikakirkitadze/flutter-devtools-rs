@@ -94,7 +94,7 @@ impl Lifecycle {
     }
 }
 
-fn session_time(w: &SessionWriter) -> SessionTime {
+pub(crate) fn session_time(w: &SessionWriter) -> SessionTime {
     let us = (host_now_us() - w.origin_host_us()).max(0) as u64;
     SessionTime(us.saturating_mul(1000))
 }
@@ -144,8 +144,9 @@ impl Session {
         self.conn_gen += 1;
         self.life.shared = None;
         if let Some(w) = &mut self.writer {
-            w.end_run(run, session_time(w));
-            self.net.end_run(w);
+            let at = session_time(w);
+            w.end_run(run, at);
+            self.net.end_run(w, at);
         }
     }
 

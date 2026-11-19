@@ -141,6 +141,12 @@ impl SessionWriter {
         self.net.upsert_request(u)
     }
 
+    /// Closes a request that never finished (its app stopped): it ends at `at` with `error`.
+    pub fn abort_request(&mut self, id: EntryId, at: SessionTime, error: &str) {
+        self.net.abort_request(id, at, error);
+        self.touch(at);
+    }
+
     pub fn set_body_state(&mut self, id: EntryId, kind: BodyKind, state: BodyState) {
         self.net.set_body_state(id, kind, state);
         self.dirty = true;

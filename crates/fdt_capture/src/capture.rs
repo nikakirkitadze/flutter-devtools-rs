@@ -320,6 +320,10 @@ impl Session {
             }
             Ingest::Body { id, result } => self.net.body(w, id, result),
             Ingest::Sockets(updates) => self.net.sockets(w, recording, updates),
+            Ingest::IsolateExit { isolate } => {
+                let at = crate::lifecycle::session_time(w);
+                self.net.isolate_exit(w, &isolate, at);
+            }
             Ingest::FlutterVersion { run, version } => {
                 w.update_run_app(run, |a| a.flutter_version = Some(version.clone()));
                 if let Some(a) = &mut self.life.app {
