@@ -169,6 +169,11 @@ impl NavHistory {
         Some(&self.current)
     }
 
+    /// How many locations Back can step through.
+    pub fn back_len(&self) -> usize {
+        self.back.len()
+    }
+
     pub fn can_go_back(&self) -> bool {
         !self.back.is_empty()
     }

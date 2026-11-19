@@ -77,6 +77,7 @@ pub mod icons {
     pub const INFO: IconName = IconName::Info;
     pub const CONNECT: IconName = IconName::Plug;
     pub const WARNING: IconName = IconName::TriangleAlert;
+    pub const CLEAR: IconName = IconName::Close;
 }
 
 #[cfg(test)]

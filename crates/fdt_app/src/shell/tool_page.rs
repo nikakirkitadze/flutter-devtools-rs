@@ -2,11 +2,11 @@
 
 use crate::nav::Tool;
 use crate::shell::sidebar::tool_icon;
+use crate::tools::ToolHeader;
 use fdt_ui::empty_state::EmptyState;
-use fdt_ui::theme::TokensExt as _;
-use fdt_ui::tokens::{font, space};
+use fdt_ui::tokens::space;
 use gpui_kit::{
-    App, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, Styled as _,
+    App, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, Styled as _,
     TestSupportExt as _, div,
 };
 
@@ -81,8 +81,7 @@ pub fn render_start(cx: &App) -> impl IntoElement {
 }
 
 /// The page for `tool`: a header row and a centred empty state.
-pub fn render(tool: Tool, cx: &App) -> impl IntoElement {
-    let t = cx.tokens();
+pub fn render(tool: Tool, strip: impl IntoElement, _cx: &App) -> impl IntoElement {
     let (heading, body) = empty_copy(tool, false);
     div()
         .id(SharedString::from(format!("tool-page-{}", tool.slug())))
@@ -90,15 +89,7 @@ pub fn render(tool: Tool, cx: &App) -> impl IntoElement {
         .size_full()
         .flex()
         .flex_col()
-        .child(
-            div()
-                .px(space::S24)
-                .py(space::S16)
-                .text_size(font::PAGE)
-                .font_weight(font::SEMIBOLD)
-                .text_color(Hsla::from(t.text))
-                .child(tool.label()),
-        )
+        .child(ToolHeader::new(tool.label(), strip))
         .child(
             div()
                 .flex_1()

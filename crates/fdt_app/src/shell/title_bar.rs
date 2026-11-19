@@ -166,6 +166,49 @@ impl MainWindow {
         chip.into_any_element()
     }
 
+    /// The shared time range, with a button that clears it. Shown only while one is set.
+    fn render_range_chip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let range = self.current().range?;
+        let t = cx.tokens();
+        let label = super::strip::format_range(range);
+        let clear = div()
+            .id("range-chip-clear")
+            .test_support()
+            .aria_label("Clear time range")
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(layout::ICON_MD)
+            .rounded(radius::CONTROL)
+            .cursor_pointer()
+            .hover(|s| s.bg(t.border.with_alpha(fdt_ui::tokens::alpha::ACTIVE_ROW)))
+            .on_mouse_down(MouseButton::Left, |_, window, cx| claim_press(window, cx))
+            .on_click(cx.listener(|this, _, window, cx| this.set_range(None, window, cx)))
+            .child(Icon::new(icons::CLEAR).size(layout::ICON_SM));
+        Some(
+            div()
+                .id("range-chip")
+                .test_support()
+                .aria_label(SharedString::from(label.clone()))
+                .occlude()
+                .flex()
+                .items_center()
+                .gap(space::S4)
+                .h(row::TABLE)
+                .pl(space::S8)
+                .pr(space::S4)
+                .rounded(radius::CONTROL)
+                .bg(t.accent.with_alpha(fdt_ui::tokens::alpha::ACTIVE_ROW))
+                .text_size(font::BODY)
+                .font_family(font::MONO)
+                .text_color(Hsla::from(t.text))
+                .child(label)
+                .child(clear)
+                .into_any_element(),
+        )
+    }
+
     pub(super) fn render_title_bar(
         &self,
         window: &mut Window,
@@ -219,7 +262,8 @@ impl MainWindow {
                     .gap(space::S8)
                     .child(back)
                     .child(forward)
-                    .child(self.render_connection_chip(cx)),
+                    .child(self.render_connection_chip(cx))
+                    .children(self.render_range_chip(cx)),
             )
             .child(div().flex_1())
             .child(div().pr(space::S12).child(palette))
@@ -257,6 +301,29 @@ mod tests {
         assert_eq!(page(&shell, cx), Page::Start);
         click(cx, "nav-forward");
         assert_eq!(page(&shell, cx), Page::Tool(Tool::Performance));
+    }
+
+    #[gpui_kit::test]
+    fn range_chip_shows_and_clears(cx: &mut TestAppContext) {
+        use crate::nav::{SessionTime, TimeRange};
+        let (shell, cx) = open_shell(cx);
+        assert!(!exists(cx, "range-chip"));
+        let mut loc = shell.read_with(cx, |s, _| s.current().clone());
+        loc.range = Some(TimeRange::new(
+            SessionTime(51_000_000_000),
+            SessionTime(67_000_000_000),
+        ));
+        shell.update_in(cx, |s, w, cx| s.navigate(loc, w, cx));
+        assert!(exists(cx, "range-chip"));
+        let label = cx.update(|window, _| window.find("range-chip").label().map(str::to_string));
+        assert_eq!(label.as_deref(), Some("0:51\u{2013}1:07"));
+        let before = shell.read_with(cx, |s, _| s.history().back_len());
+        click(cx, "range-chip-clear");
+        assert!(!exists(cx, "range-chip"));
+        let (range, after) =
+            shell.read_with(cx, |s, _| (s.current().range, s.history().back_len()));
+        assert!(range.is_none());
+        assert_eq!(after, before + 1);
     }
 
     #[gpui_kit::test]

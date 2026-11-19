@@ -2,10 +2,12 @@
 
 mod about;
 mod banner;
+mod counts;
 mod settings_page;
 mod shortcuts;
 mod sidebar;
 pub(crate) mod start_page;
+mod strip;
 mod title_bar;
 mod tool_page;
 
@@ -34,6 +36,7 @@ use gpui_kit::{
 };
 use start_page::StartPage;
 use std::sync::Arc;
+use strip::StripView;
 use tokio::sync::watch;
 
 /// Makes the window actions work from inside a dialog.
@@ -65,6 +68,11 @@ pub struct ToolCount {
 pub struct MainWindow {
     history: NavHistory,
     counts: [Option<ToolCount>; 7],
+    /// The newest counts input, the job computing it, and whether one is running.
+    counts_wanted: Option<counts::CountsKey>,
+    counts_running: bool,
+    counts_task: Option<gpui_kit::Task<()>>,
+    strip: StripView,
     hud: Entity<FrameHud>,
     focus: FocusHandle,
     palette: Option<Entity<PaletteModel>>,
@@ -94,7 +102,10 @@ impl MainWindow {
         });
         window.focus(&focus, cx);
         let was_connected = matches!(session.read(cx).status(), ConnStatus::Connected { .. });
-        let observed = cx.observe(&session, |_, _, cx| cx.notify());
+        let observed = cx.observe(&session, |this, _, cx| {
+            this.refresh_counts(cx);
+            cx.notify();
+        });
         let connected = cx.subscribe_in(&session, window, |this, _, event, window, cx| {
             if *event == SessionEvent::Status {
                 this.status_changed(window, cx);
@@ -108,6 +119,10 @@ impl MainWindow {
         let mut this = Self {
             history: NavHistory::new(Location::at(Page::Start)),
             counts: [None; 7],
+            counts_wanted: None,
+            counts_running: false,
+            counts_task: None,
+            strip: StripView::default(),
             hud,
             focus,
             palette: None,
@@ -119,6 +134,7 @@ impl MainWindow {
             _session_subs: [observed, connected],
         };
         this.apps_from_host(window, cx);
+        this.refresh_counts(cx);
         this
     }
 
@@ -194,6 +210,7 @@ impl MainWindow {
     pub fn navigate(&mut self, to: Location, window: &mut Window, cx: &mut Context<Self>) {
         if self.history.navigate(to) {
             self.focus_start_if_current(window, cx);
+            self.refresh_counts(cx);
             cx.notify();
         }
     }
@@ -213,6 +230,11 @@ impl MainWindow {
     pub fn set_counts(&mut self, counts: [Option<ToolCount>; 7], cx: &mut Context<Self>) {
         self.counts = counts;
         cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn counts(&self) -> [Option<ToolCount>; 7] {
+        self.counts
     }
 
     pub fn focus_handle(&self) -> FocusHandle {
@@ -276,6 +298,7 @@ impl MainWindow {
     fn go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.history.go_back().is_some() {
             self.focus_start_if_current(window, cx);
+            self.refresh_counts(cx);
             cx.notify();
         }
     }
@@ -283,6 +306,7 @@ impl MainWindow {
     fn go_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.history.go_forward().is_some() {
             self.focus_start_if_current(window, cx);
+            self.refresh_counts(cx);
             cx.notify();
         }
     }
@@ -312,7 +336,10 @@ impl Render for MainWindow {
                 Some(page) => page.clone().into_any_element(),
                 None => tool_page::render_start(cx).into_any_element(),
             },
-            Page::Tool(tool) => tool_page::render(tool, cx).into_any_element(),
+            Page::Tool(tool) => {
+                let strip = self.render_strip(window, cx);
+                tool_page::render(tool, strip, cx).into_any_element()
+            }
             Page::Settings => {
                 let free = settings(cx).free_app_http_memory;
                 settings_page::render(settings(cx).theme, free, cx.weak_entity(), cx)

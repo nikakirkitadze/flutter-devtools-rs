@@ -241,3 +241,42 @@ pub fn press(cx: &mut VisualTestContext, mac: &'static str, other: &'static str)
     cx.simulate_keystrokes(platform(mac, other));
     cx.run_until_parked();
 }
+
+/// A snapshot built by `build` on a fresh writer with one run (id 1, started at 0).
+pub fn snapshot(build: impl FnOnce(&mut fdt_store::SessionWriter, RunId)) -> Arc<Snapshot> {
+    use fdt_store::clock::{Calibration, RunClock};
+    use fdt_store::time::SessionTime;
+    let mut w = fdt_store::SessionWriter::new(0);
+    let clock = RunClock::new(
+        0,
+        Calibration {
+            skew_us: 0,
+            timeline_to_wall_us: 0,
+        },
+    );
+    let run = w.start_run(app_info("demo"), clock, SessionTime(0));
+    build(&mut w, run);
+    w.publish()
+}
+
+/// A log record at `ms` milliseconds.
+pub fn log_at(run: RunId, ms: u64, level: fdt_store::logs::LogLevel) -> fdt_store::logs::LogInput {
+    fdt_store::logs::LogInput {
+        run,
+        time: fdt_store::time::SessionTime(ms * 1_000_000),
+        clamped: false,
+        level,
+        source: fdt_store::logs::LogSource::Log,
+        logger: String::new(),
+        text: format!("line at {ms}"),
+        error: None,
+    }
+}
+
+/// Opens the shell over a fixed session showing `snapshot`.
+pub fn open_shell_snapshot(
+    cx: &mut TestAppContext,
+    snapshot: Arc<Snapshot>,
+) -> (Entity<MainWindow>, &mut VisualTestContext) {
+    open_shell_with(cx, move |_| SessionModel::fixed(snapshot, ConnStatus::Idle))
+}
