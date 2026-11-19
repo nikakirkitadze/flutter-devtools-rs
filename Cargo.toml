@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/fdt_ui", "crates/fdt_app", "crates/fdt_store"]
+members = ["crates/fdt_ui", "crates/fdt_app", "crates/fdt_store", "crates/fdt_vm"]
 
 [workspace.package]
 version = "0.1.0"
@@ -21,6 +21,10 @@ tempfile = "3"
 criterion = "0.8"
 rayon = "1"
 memchr = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util", "process", "fs"] }
+futures-util = "0.3"
+url = "2"
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect"] }
 
 [profile.release]
 debug = "line-tables-only"
