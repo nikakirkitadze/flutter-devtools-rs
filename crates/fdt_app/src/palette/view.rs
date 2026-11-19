@@ -6,6 +6,7 @@ use super::registry::{CommandSpec, haystack};
 use crate::actions::OpenPalette;
 use crate::keymap::shortcut_hint;
 use crate::settings::{settings, update_settings};
+use crate::shell::dialog_window_actions;
 use fdt_ui::theme::TokensExt as _;
 use fdt_ui::tokens::{font, layout, radius, space};
 use gpui_kit::component::command::{Command, CommandItem, CommandState};
@@ -147,11 +148,12 @@ pub fn open_palette(
             .w(layout::PALETTE_WIDTH)
             .margin_top(layout::PALETTE_TOP_OFFSET)
             .close_button(false)
-            .child(
+            .child(dialog_window_actions(
                 div()
                     .on_action(|_: &OpenPalette, window, cx| window.close_dialog(cx))
                     .child(command),
-            )
+                shell_focus.clone(),
+            ))
     });
     model
 }
@@ -218,10 +220,7 @@ mod tests {
         open(cx);
         press(cx, "escape", "escape");
         assert!(!dialog_open(cx));
-        assert_eq!(
-            shell.read_with(cx, |s, _| s.current().page),
-            Page::Tool(Tool::Timeline)
-        );
+        assert_eq!(shell.read_with(cx, |s, _| s.current().page), Page::Start);
         assert!(!shell.read_with(cx, |s, _| s.history().can_go_back()));
     }
 
@@ -272,5 +271,15 @@ mod tests {
         cx.run_until_parked();
         let m = model(&shell, cx);
         assert!(m.read_with(cx, |m, _| m.ranked().is_empty()));
+    }
+
+    #[gpui_kit::test]
+    fn close_window_works_while_the_palette_is_open(cx: &mut TestAppContext) {
+        let (_shell, cx) = open_shell(cx);
+        open(cx);
+        assert!(dialog_open(cx));
+        press(cx, "cmd-w", "ctrl-w");
+        cx.run_until_parked();
+        assert!(cx.windows().is_empty());
     }
 }

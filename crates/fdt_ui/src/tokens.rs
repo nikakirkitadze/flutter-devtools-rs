@@ -200,6 +200,9 @@ pub mod motion {
     pub const PANEL: Duration = Duration::from_millis(160);
     pub const OVERLAY: Duration = Duration::from_millis(200);
 
+    /// How long a view waits before showing a loading skeleton or spinner.
+    pub const LOADING_DELAY: Duration = Duration::from_millis(150);
+
     /// Ease-out cubic bezier control points.
     pub const EASE_OUT: [f32; 4] = [0.0, 0.0, 0.2, 1.0];
 
@@ -233,11 +236,35 @@ pub mod layout {
     pub const ICON_MD: Pixels = px(16.);
     pub const EMPTY_STATE_MAX_WIDTH: Pixels = px(360.);
     pub const PALETTE_BUTTON_WIDTH: Pixels = px(280.);
+    /// Height of the time strip above a tool.
+    pub const STRIP_HEIGHT: Pixels = px(32.);
+    pub const TOOLBAR_HEIGHT: Pixels = px(40.);
+    pub const BANNER_HEIGHT: Pixels = px(32.);
+    pub const DETAILS_WIDTH: Pixels = px(380.);
+    pub const DETAILS_MIN: Pixels = px(280.);
+    pub const DETAILS_MAX: Pixels = px(640.);
+    pub const START_WIDTH: Pixels = px(720.);
+    pub const WATERFALL_WIDTH: Pixels = px(160.);
+    pub const STATUS_DOT: Pixels = px(8.);
+}
+
+/// Fixed column widths of the log and network tables.
+pub mod table {
+    use super::{Pixels, px};
+
+    pub const COL_METHOD: Pixels = px(72.);
+    pub const COL_STATUS: Pixels = px(64.);
+    pub const COL_DURATION: Pixels = px(80.);
+    pub const COL_SIZE: Pixels = px(80.);
+    pub const COL_TIME: Pixels = px(96.);
+    pub const COL_LEVEL: Pixels = px(48.);
+    pub const COL_LOGGER: Pixels = px(140.);
+    pub const COL_HOST: Pixels = px(180.);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Color, DARK, LIGHT, Palette, font, motion, radius, row, space};
+    use super::{Color, DARK, LIGHT, Palette, font, layout, motion, radius, row, space, table};
     use gpui_kit::px;
     use std::time::Duration;
 
@@ -382,5 +409,56 @@ mod tests {
             assert_eq!(motion::duration(m, false), Duration::from_millis(ms));
             assert_eq!(motion::duration(m, true), Duration::ZERO);
         }
+    }
+
+    #[test]
+    fn m2_layout_table_and_loading_tokens() {
+        assert_eq!(
+            [
+                layout::STRIP_HEIGHT,
+                layout::TOOLBAR_HEIGHT,
+                layout::BANNER_HEIGHT,
+                layout::DETAILS_WIDTH,
+                layout::DETAILS_MIN,
+                layout::DETAILS_MAX,
+                layout::START_WIDTH,
+                layout::WATERFALL_WIDTH,
+                layout::STATUS_DOT
+            ],
+            [
+                px(32.),
+                px(40.),
+                px(32.),
+                px(380.),
+                px(280.),
+                px(640.),
+                px(720.),
+                px(160.),
+                px(8.)
+            ]
+        );
+        assert_eq!(
+            [
+                table::COL_METHOD,
+                table::COL_STATUS,
+                table::COL_DURATION,
+                table::COL_SIZE,
+                table::COL_TIME,
+                table::COL_LEVEL,
+                table::COL_LOGGER,
+                table::COL_HOST
+            ],
+            [
+                px(72.),
+                px(64.),
+                px(80.),
+                px(80.),
+                px(96.),
+                px(48.),
+                px(140.),
+                px(180.)
+            ]
+        );
+        assert_eq!(motion::LOADING_DELAY, Duration::from_millis(150));
     }
 }

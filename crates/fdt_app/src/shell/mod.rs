@@ -22,10 +22,29 @@ use fdt_ui::theme::{self, ThemePreference, TokensExt as _};
 use fdt_ui::tokens::Appearance;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::{
-    AppContext as _, Context, Entity, FocusHandle, Focusable, Hsla, InteractiveElement as _,
-    IntoElement, MouseButton, NavigationDirection, ParentElement as _, Render, Styled as _,
-    TestSupportExt as _, Window, div, relative,
+    Action, AppContext as _, Context, Div, Entity, FocusHandle, Focusable, Hsla,
+    InteractiveElement as _, IntoElement, MouseButton, NavigationDirection, ParentElement as _,
+    Render, Styled as _, TestSupportExt as _, Window, div, relative,
 };
+
+/// Makes the window actions work from inside a dialog.
+///
+/// A dialog is not part of the shell's element tree, so the shell never sees these actions while
+/// one is open. Each one closes the dialog, focuses the shell, then runs again from there.
+pub fn dialog_window_actions(el: Div, shell: FocusHandle) -> Div {
+    fn forward<A: Action + Clone>(el: Div, shell: &FocusHandle, action: A) -> Div {
+        let shell = shell.clone();
+        el.on_action(move |_: &A, window, cx| {
+            window.close_dialog(cx);
+            shell.focus(window, cx);
+            window.dispatch_action(action.boxed_clone(), cx);
+        })
+    }
+    let el = forward(el, &shell, CloseWindow);
+    let el = forward(el, &shell, Minimize);
+    let el = forward(el, &shell, Zoom);
+    forward(el, &shell, ToggleFullScreen)
+}
 
 /// A count shown beside a tool in the sidebar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,7 +78,7 @@ impl MainWindow {
         });
         window.focus(&focus, cx);
         Self {
-            history: NavHistory::new(Location::at(Page::Tool(Tool::Timeline))),
+            history: NavHistory::new(Location::at(Page::Start)),
             counts: [None; 7],
             hud,
             focus,
@@ -178,6 +197,7 @@ impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.tokens();
         let page: gpui_kit::AnyElement = match self.current().page {
+            Page::Start => tool_page::render_start(cx).into_any_element(),
             Page::Tool(tool) => tool_page::render(tool, cx).into_any_element(),
             Page::Settings => settings_page::render(settings(cx).theme, cx).into_any_element(),
         };
@@ -206,11 +226,11 @@ impl Render for MainWindow {
             .on_action(cx.listener(|this, _: &ShowState, w, cx| this.show(Tool::State, w, cx)))
             .on_action(cx.listener(|this, _: &OpenPalette, w, cx| this.toggle_palette(w, cx)))
             .on_action(cx.listener(|this, _: &ShowShortcuts, w, cx| this.show_shortcuts(w, cx)))
-            .on_action(cx.listener(|_, _: &About, w, cx| {
+            .on_action(cx.listener(|this, _: &About, w, cx| {
                 if w.has_active_dialog(cx) {
                     w.close_dialog(cx);
                 }
-                about::open_about(w, cx);
+                about::open_about(this.focus_handle(), w, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, w, cx| this.open_settings(w, cx)))
             .on_action(cx.listener(|this, _: &UseSystemTheme, w, cx| {
@@ -274,8 +294,9 @@ impl Render for MainWindow {
 mod tests {
     use super::*;
     use crate::actions::ToggleFrameHud;
-    use crate::nav::{Location, Page, SelectionKey, SessionTime, TimeRange, Tool};
+    use crate::nav::{Location, Page, Selection, SessionTime, TimeRange, Tool};
     use crate::test_support::{exists, open_shell, press};
+    use fdt_store::time::{EntryId, RunId};
     use gpui_kit::test::{ClickOptions, TestWindowExt as _};
     use gpui_kit::{MouseButton, NavigationDirection, TestAppContext};
 
@@ -299,15 +320,18 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn starts_on_timeline_with_empty_history(cx: &mut TestAppContext) {
+    fn shell_starts_on_the_start_page(cx: &mut TestAppContext) {
         let (shell, cx) = open_shell(cx);
-        assert!(exists(cx, "tool-page-timeline"));
+        assert!(exists(cx, "start-page"));
+        assert!(!exists(cx, "tool-page-timeline"));
         assert!(!shell.read_with(cx, |s, _| s.history().can_go_back()));
     }
 
     #[gpui_kit::test]
     fn number_shortcuts_switch_tools(cx: &mut TestAppContext) {
         let (_shell, cx) = open_shell(cx);
+        press(cx, "cmd-1", "ctrl-1");
+        assert!(exists(cx, "tool-page-timeline"));
         press(cx, "cmd-2", "ctrl-2");
         assert!(exists(cx, "tool-page-performance"));
         assert!(!exists(cx, "tool-page-timeline"));
@@ -332,7 +356,7 @@ mod tests {
         for _ in 0..3 {
             press(cx, "cmd-[", "ctrl-[");
         }
-        assert!(exists(cx, "tool-page-timeline"));
+        assert!(exists(cx, "start-page"));
     }
 
     #[gpui_kit::test]
@@ -346,7 +370,7 @@ mod tests {
             window.click_with_options("shell", back, cx);
         });
         cx.run_until_parked();
-        assert!(exists(cx, "tool-page-timeline"));
+        assert!(exists(cx, "start-page"));
         let fwd =
             ClickOptions::new().with_button(MouseButton::Navigate(NavigationDirection::Forward));
         cx.update(|window, cx| {
@@ -382,19 +406,18 @@ mod tests {
     #[gpui_kit::test]
     fn escape_clears_selection_then_range(cx: &mut TestAppContext) {
         let (shell, cx) = open_shell(cx);
-        let mut loc = Location::at(Page::Tool(Tool::Timeline));
-        loc.selection = Some(SelectionKey("a".into()));
+        let mut loc = Location::at(Page::Start);
+        loc.selection = Some(Selection::Log(EntryId {
+            run: RunId(1),
+            seq: 1,
+        }));
         loc.range = Some(range());
         shell.update_in(cx, |s, window, cx| s.navigate(loc, window, cx));
         press(cx, "escape", "escape");
-        let (sel, rng) = shell.read_with(cx, |s, _| {
-            (s.current().selection.clone(), s.current().range)
-        });
+        let (sel, rng) = shell.read_with(cx, |s, _| (s.current().selection, s.current().range));
         assert!(sel.is_none() && rng.is_some());
         press(cx, "escape", "escape");
-        let (sel, rng) = shell.read_with(cx, |s, _| {
-            (s.current().selection.clone(), s.current().range)
-        });
+        let (sel, rng) = shell.read_with(cx, |s, _| (s.current().selection, s.current().range));
         assert!(sel.is_none() && rng.is_none());
         press(cx, "escape", "escape");
         // A third escape added no entry, so going back lands on the range-only location.
@@ -405,7 +428,7 @@ mod tests {
     #[gpui_kit::test]
     fn range_survives_tool_switch(cx: &mut TestAppContext) {
         let (shell, cx) = open_shell(cx);
-        let mut loc = Location::at(Page::Tool(Tool::Timeline));
+        let mut loc = Location::at(Page::Start);
         loc.range = Some(range());
         shell.update_in(cx, |s, window, cx| s.navigate(loc, window, cx));
         press(cx, "cmd-4", "ctrl-4");
@@ -456,5 +479,87 @@ mod tests {
         ] {
             assert_eq!(format_count(n), want, "n = {n}");
         }
+    }
+
+    /// A stand-in for a tool page with a text field: the shell's key context around an input.
+    struct InputHost {
+        focus: FocusHandle,
+        input: Entity<gpui_kit::component::input::InputState>,
+        shortcut_sheets: usize,
+        backs: usize,
+        escapes: usize,
+    }
+
+    impl Render for InputHost {
+        fn render(&mut self, _w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            use gpui_kit::component::input::Input;
+            div()
+                .key_context(SHELL_CONTEXT)
+                .track_focus(&self.focus)
+                .on_action(cx.listener(|this, _: &ShowShortcuts, _, _| this.shortcut_sheets += 1))
+                .on_action(cx.listener(|this, _: &GoBack, _, _| this.backs += 1))
+                .on_action(cx.listener(|this, _: &ClearSelection, _, _| this.escapes += 1))
+                .child(Input::new(&self.input))
+        }
+    }
+
+    fn input_host(
+        cx: &mut TestAppContext,
+    ) -> (Entity<InputHost>, &mut gpui_kit::VisualTestContext) {
+        use gpui_kit::component::input::InputState;
+        crate::test_support::init(cx);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let input = cx.new(|cx| InputState::new(window, cx));
+            let focus = cx.focus_handle();
+            InputHost {
+                focus,
+                input,
+                shortcut_sheets: 0,
+                backs: 0,
+                escapes: 0,
+            }
+        });
+        vcx.update(|window, cx| {
+            let input = host.read(cx).input.clone();
+            input.update(cx, |i, cx| i.focus(window, cx));
+        });
+        vcx.run_until_parked();
+        (host, vcx)
+    }
+
+    #[gpui_kit::test]
+    fn question_mark_types_into_a_focused_input(cx: &mut TestAppContext) {
+        let (host, cx) = input_host(cx);
+        cx.simulate_input("?");
+        cx.run_until_parked();
+        let (value, sheets) =
+            host.read_with(cx, |h, cx| (h.input.read(cx).value(), h.shortcut_sheets));
+        assert_eq!(value.as_ref(), "?");
+        assert_eq!(sheets, 0, "the cheat sheet must not open");
+    }
+
+    #[gpui_kit::test]
+    fn back_shortcut_does_not_fire_in_an_input(cx: &mut TestAppContext) {
+        let (host, cx) = input_host(cx);
+        press(cx, "cmd-[", "ctrl-[");
+        assert_eq!(host.read_with(cx, |h, _| h.backs), 0);
+    }
+
+    #[gpui_kit::test]
+    fn shell_shortcuts_still_fire_outside_an_input(cx: &mut TestAppContext) {
+        let (host, cx) = input_host(cx);
+        let focus = host.read_with(cx, |h, _| h.focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        press(cx, "cmd-[", "ctrl-[");
+        assert_eq!(host.read_with(cx, |h, _| h.backs), 1);
+    }
+
+    #[gpui_kit::test]
+    fn settings_page_scrolls_in_a_short_window(cx: &mut TestAppContext) {
+        let (_shell, cx) = open_shell(cx);
+        cx.simulate_resize(fdt_ui::tokens::layout::WINDOW_MIN);
+        press(cx, "cmd-,", "ctrl-,");
+        assert!(exists(cx, "settings-page"));
+        assert!(exists(cx, "settings-scroll"));
     }
 }

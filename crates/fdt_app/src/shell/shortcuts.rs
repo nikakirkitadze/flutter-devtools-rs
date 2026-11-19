@@ -3,6 +3,7 @@
 use crate::actions::OpenPalette;
 use crate::keymap::shortcut_hint;
 use crate::palette::registry::{CommandSpec, Group, commands};
+use crate::shell::dialog_window_actions;
 use fdt_ui::theme::TokensExt as _;
 use fdt_ui::tokens::{font, radius, space};
 use gpui_kit::component::WindowExt as _;
@@ -59,7 +60,13 @@ pub fn bound_commands(
 
 /// Opens the cheat sheet dialog.
 pub fn open_shortcuts(shell_focus: FocusHandle, window: &mut Window, cx: &mut App) {
+    // Focus inside the content, so window actions reach `dialog_window_actions`.
+    let content = cx.focus_handle();
+    let focused = std::cell::Cell::new(false);
     window.open_dialog(cx, move |dialog, window, cx| {
+        if !focused.replace(true) {
+            window.focus(&content, cx);
+        }
         let t = cx.tokens();
         let mut body = div()
             .id("shortcuts-dialog")
@@ -94,7 +101,10 @@ pub fn open_shortcuts(shell_focus: FocusHandle, window: &mut Window, cx: &mut Ap
             .rounded(radius::DIALOG)
             .line_height(relative(font::LINE_HEIGHT_UI))
             .title("Keyboard shortcuts")
-            .child(body)
+            .child(dialog_window_actions(
+                div().track_focus(&content).child(body),
+                shell_focus.clone(),
+            ))
     });
 }
 
@@ -160,5 +170,15 @@ mod tests {
         assert!(dialog_open(cx));
         press(cx, "escape", "escape");
         assert!(!dialog_open(cx));
+    }
+
+    #[gpui_kit::test]
+    fn close_window_works_while_the_cheat_sheet_is_open(cx: &mut TestAppContext) {
+        let (_shell, cx) = open_shell(cx);
+        press(cx, "?", "?");
+        assert!(dialog_open(cx));
+        press(cx, "cmd-w", "ctrl-w");
+        cx.run_until_parked();
+        assert!(cx.windows().is_empty());
     }
 }

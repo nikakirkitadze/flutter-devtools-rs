@@ -148,6 +148,7 @@ pub fn render(pref: ThemePreference, cx: &App) -> impl IntoElement {
         .id("settings-page")
         .test_support()
         .size_full()
+        .min_h_0()
         .flex()
         .flex_col()
         .child(
@@ -161,6 +162,11 @@ pub fn render(pref: ThemePreference, cx: &App) -> impl IntoElement {
         )
         .child(
             div()
+                .id("settings-scroll")
+                .test_support()
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
                 .px(space::S24)
                 .flex()
                 .flex_col()

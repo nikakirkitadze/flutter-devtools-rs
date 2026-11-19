@@ -2,7 +2,6 @@
 //! Pure data; no GPUI.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Tool {
@@ -57,19 +56,26 @@ impl Tool {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Page {
+    /// Connect to a running app.
+    Start,
     Tool(Tool),
     Settings,
 }
 
-pub use fdt_store::time::{SessionTime, TimeRange};
+pub use fdt_store::time::{EntryId, SessionTime, TimeRange};
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct SelectionKey(pub Arc<str>);
+/// The selected record. Ids carry their run, so a selection survives a reconnect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Selection {
+    Log(EntryId),
+    Request(EntryId),
+    Socket(EntryId),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Location {
     pub page: Page,
-    pub selection: Option<SelectionKey>,
+    pub selection: Option<Selection>,
     pub range: Option<TimeRange>,
 }
 
@@ -176,6 +182,26 @@ impl NavHistory {
 mod tests {
     use super::*;
 
+    fn eid(seq: u64) -> EntryId {
+        EntryId {
+            run: fdt_store::time::RunId(1),
+            seq,
+        }
+    }
+
+    #[test]
+    fn selection_round_trips_through_history() {
+        let mut h = NavHistory::new(Location::at(Page::Start));
+        let mut l = tl(Tool::Logs);
+        l.selection = Some(Selection::Socket(eid(7)));
+        h.navigate(l.clone());
+        h.navigate(tl(Tool::Network));
+        assert_eq!(h.go_back(), Some(&l));
+        assert_eq!(h.current().selection, Some(Selection::Socket(eid(7))));
+        h.go_back();
+        assert_eq!(h.current(), &Location::at(Page::Start));
+    }
+
     fn tl(t: Tool) -> Location {
         Location::at(Page::Tool(t))
     }
@@ -259,7 +285,7 @@ mod tests {
     #[test]
     fn with_page_keeps_range_and_drops_selection() {
         let mut l = tl(Tool::Timeline);
-        l.selection = Some(SelectionKey("frame:r1:1".into()));
+        l.selection = Some(Selection::Log(eid(1)));
         l.range = Some(TimeRange::new(SessionTime(1), SessionTime(2)));
         let m = l.with_page(Page::Tool(Tool::Memory));
         assert_eq!(m.page, Page::Tool(Tool::Memory));
@@ -270,7 +296,7 @@ mod tests {
     #[test]
     fn cleared_drops_selection_then_range() {
         let mut l = tl(Tool::Timeline);
-        l.selection = Some(SelectionKey("a".into()));
+        l.selection = Some(Selection::Request(eid(2)));
         l.range = Some(TimeRange::new(SessionTime(1), SessionTime(2)));
         let a = l.cleared().unwrap();
         assert_eq!(a.selection, None);

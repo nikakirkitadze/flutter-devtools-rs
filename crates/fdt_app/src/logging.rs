@@ -1,6 +1,7 @@
 //! A tiny stderr logger so `log::warn!` and `log::error!` are not silently dropped.
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
+use std::io::{self, Write};
 
 /// The environment variable that raises the log level (`info`, `debug` or `trace`).
 pub const LEVEL_VAR: &str = "FDT_LOG";
@@ -24,6 +25,15 @@ pub fn format_record(level: Level, target: &str, message: &std::fmt::Arguments<'
     format!("fdt {level} {target}: {message}")
 }
 
+/// Writes one record as a line. Write errors are ignored.
+fn write_record(out: &mut impl Write, record: &Record<'_>) {
+    let _ = writeln!(
+        out,
+        "{}",
+        format_record(record.level(), record.target(), record.args())
+    );
+}
+
 impl Log for StderrLogger {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
         metadata.level() <= self.level
@@ -31,10 +41,8 @@ impl Log for StderrLogger {
 
     fn log(&self, record: &Record<'_>) {
         if self.enabled(record.metadata()) {
-            eprintln!(
-                "{}",
-                format_record(record.level(), record.target(), record.args())
-            );
+            // A closed stderr must never panic the app.
+            write_record(&mut io::stderr().lock(), record);
         }
     }
 
@@ -82,5 +90,27 @@ mod tests {
         assert!(logger.enabled(&meta(Level::Error)));
         assert!(logger.enabled(&meta(Level::Warn)));
         assert!(!logger.enabled(&meta(Level::Info)));
+    }
+
+    #[test]
+    fn logger_ignores_write_errors() {
+        struct Failing;
+        impl std::io::Write for Failing {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("closed"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("closed"))
+            }
+        }
+        let record = Record::builder()
+            .level(Level::Warn)
+            .target("t")
+            .args(format_args!("hello"))
+            .build();
+        write_record(&mut Failing, &record);
+        let mut ok = Vec::new();
+        write_record(&mut ok, &record);
+        assert_eq!(String::from_utf8(ok).unwrap(), "fdt WARN t: hello\n");
     }
 }

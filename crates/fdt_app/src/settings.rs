@@ -10,11 +10,68 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
+/// How many recently used app addresses are kept.
+pub const RECENT_URLS_MAX: usize = 5;
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct Settings {
     pub theme: ThemePreference,
     pub recent_commands: Vec<String>,
+    /// Stop an app's HTTP profiling when fdt disconnects, to free its memory.
+    pub free_app_http_memory: bool,
+    /// Largest response body fetched, in KiB.
+    pub body_cap_kib: u32,
+    /// Total memory for kept response bodies, in MiB.
+    pub body_budget_mib: u32,
+    /// App addresses used recently, newest first.
+    pub recent_urls: Vec<String>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            theme: ThemePreference::default(),
+            recent_commands: Vec::new(),
+            free_app_http_memory: false,
+            body_cap_kib: 1024,
+            body_budget_mib: 200,
+            recent_urls: Vec::new(),
+        }
+    }
+}
+
+impl Settings {
+    /// Reads every known field on its own: a field of the wrong type keeps its default and logs
+    /// one warning. Unknown fields are ignored.
+    pub fn from_map(map: &serde_json::Map<String, serde_json::Value>) -> Self {
+        fn field<T: serde::de::DeserializeOwned>(
+            map: &serde_json::Map<String, serde_json::Value>,
+            name: &str,
+            out: &mut T,
+        ) {
+            let Some(value) = map.get(name) else { return };
+            match serde_json::from_value(value.clone()) {
+                Ok(v) => *out = v,
+                Err(err) => log::warn!("ignoring settings field `{name}`: {err}"),
+            }
+        }
+        let mut s = Self::default();
+        field(map, "theme", &mut s.theme);
+        field(map, "recent_commands", &mut s.recent_commands);
+        field(map, "free_app_http_memory", &mut s.free_app_http_memory);
+        field(map, "body_cap_kib", &mut s.body_cap_kib);
+        field(map, "body_budget_mib", &mut s.body_budget_mib);
+        field(map, "recent_urls", &mut s.recent_urls);
+        s.recent_urls.truncate(RECENT_URLS_MAX);
+        s
+    }
+}
+
+/// Puts `url` first, dropping any earlier copy, and keeps at most `RECENT_URLS_MAX`.
+pub fn record_recent_url(urls: &mut Vec<String>, url: &str) {
+    urls.retain(|u| u != url);
+    urls.insert(0, url.to_string());
+    urls.truncate(RECENT_URLS_MAX);
 }
 
 /// Holds the current settings and where they are saved.
@@ -32,10 +89,17 @@ impl SettingsStore {
     /// Reads `path`. A missing, unreadable or invalid file gives the defaults.
     pub fn load(path: PathBuf) -> Self {
         let current = match std::fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|err| {
-                log::warn!("ignoring invalid settings file {}: {err}", path.display());
-                Settings::default()
-            }),
+            Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(serde_json::Value::Object(map)) => Settings::from_map(&map),
+                Ok(_) => {
+                    log::warn!("ignoring settings file {}: not an object", path.display());
+                    Settings::default()
+                }
+                Err(err) => {
+                    log::warn!("ignoring invalid settings file {}: {err}", path.display());
+                    Settings::default()
+                }
+            },
             Err(err) if err.kind() == io::ErrorKind::NotFound => Settings::default(),
             Err(err) => {
                 log::warn!("could not read settings file {}: {err}", path.display());
@@ -177,6 +241,10 @@ mod tests {
         let s = Settings {
             theme: ThemePreference::Dark,
             recent_commands: vec!["a".into(), "b".into()],
+            free_app_http_memory: true,
+            body_cap_kib: 64,
+            body_budget_mib: 10,
+            recent_urls: vec!["ws://x/ws".into()],
         };
         SettingsStore::write(&path, &s).unwrap();
         assert_eq!(SettingsStore::load(path).get(), &s);
@@ -204,6 +272,47 @@ mod tests {
         let path = file_in(dir.path());
         std::fs::write(&path, r#"{"theme":"dark","future":1}"#).unwrap();
         assert_eq!(SettingsStore::load(path).get().theme, ThemePreference::Dark);
+    }
+
+    #[test]
+    fn one_bad_settings_field_keeps_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_in(dir.path());
+        std::fs::write(&path, r#"{"theme":"dark","recent_commands":5}"#).unwrap();
+        let s = SettingsStore::load(path);
+        assert_eq!(s.get().theme, ThemePreference::Dark);
+        assert!(s.get().recent_commands.is_empty());
+    }
+
+    #[test]
+    fn new_settings_fields_default() {
+        let s = Settings::default();
+        assert!(!s.free_app_http_memory);
+        assert_eq!(s.body_cap_kib, 1024);
+        assert_eq!(s.body_budget_mib, 200);
+        assert!(s.recent_urls.is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_in(dir.path());
+        std::fs::write(
+            &path,
+            r#"{"body_cap_kib":"big","recent_urls":["a"],"body_budget_mib":7}"#,
+        )
+        .unwrap();
+        let s = SettingsStore::load(path);
+        assert_eq!(s.get().body_cap_kib, 1024);
+        assert_eq!(s.get().body_budget_mib, 7);
+        assert_eq!(s.get().recent_urls, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn recent_urls_dedupe_and_cap() {
+        let mut v: Vec<String> = Vec::new();
+        for u in ["a", "b", "c", "d", "e", "f"] {
+            record_recent_url(&mut v, u);
+        }
+        assert_eq!(v, ["f", "e", "d", "c", "b"]);
+        record_recent_url(&mut v, "d");
+        assert_eq!(v, ["d", "f", "e", "c", "b"]);
     }
 
     #[test]
@@ -350,7 +459,7 @@ mod tests {
         press(cx, "cmd-,", "ctrl-,");
         assert!(exists(cx, "settings-page"));
         press(cx, "cmd-[", "ctrl-[");
-        assert!(exists(cx, "tool-page-timeline"));
+        assert!(exists(cx, "start-page"));
     }
 
     #[gpui_kit::test]

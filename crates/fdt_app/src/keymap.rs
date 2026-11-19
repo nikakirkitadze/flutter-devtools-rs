@@ -10,6 +10,10 @@ use gpui_kit::KeyBinding;
 /// Key context of the main shell.
 pub const SHELL_CONTEXT: &str = "Shell";
 
+/// The shell, but not while a text input has focus, so typing `?` or pressing Escape in a field
+/// is left to the field.
+pub const SHELL_NOT_INPUT: &str = "Shell && !Input";
+
 /// `mac` on macOS, `other` everywhere else.
 pub fn platform(mac: &'static str, other: &'static str) -> &'static str {
     if cfg!(target_os = "macos") {
@@ -22,6 +26,7 @@ pub fn platform(mac: &'static str, other: &'static str) -> &'static str {
 /// Every key binding the app registers.
 pub fn bindings() -> Vec<KeyBinding> {
     let shell = Some(SHELL_CONTEXT);
+    let not_input = Some(SHELL_NOT_INPUT);
     let mut out = vec![KeyBinding::new(
         platform("cmd-k", "ctrl-k"),
         OpenPalette,
@@ -40,10 +45,10 @@ pub fn bindings() -> Vec<KeyBinding> {
         out.push(tool_binding(platform(mac, other), tool, shell));
     }
     out.extend([
-        KeyBinding::new(platform("cmd-[", "ctrl-["), GoBack, shell),
-        KeyBinding::new(platform("cmd-]", "ctrl-]"), GoForward, shell),
-        KeyBinding::new("escape", ClearSelection, shell),
-        KeyBinding::new("?", ShowShortcuts, shell),
+        KeyBinding::new(platform("cmd-[", "ctrl-["), GoBack, not_input),
+        KeyBinding::new(platform("cmd-]", "ctrl-]"), GoForward, not_input),
+        KeyBinding::new("escape", ClearSelection, not_input),
+        KeyBinding::new("?", ShowShortcuts, not_input),
         KeyBinding::new(platform("cmd-,", "ctrl-,"), OpenSettings, None),
         KeyBinding::new(platform("cmd-q", "ctrl-q"), Quit, None),
         KeyBinding::new(platform("cmd-w", "ctrl-w"), CloseWindow, None),

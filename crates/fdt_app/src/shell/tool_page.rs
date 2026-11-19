@@ -2,6 +2,7 @@
 
 use crate::nav::Tool;
 use crate::shell::sidebar::tool_icon;
+use fdt_ui::assets::icons;
 use fdt_ui::empty_state::EmptyState;
 use fdt_ui::theme::TokensExt as _;
 use fdt_ui::tokens::{font, space};
@@ -10,8 +11,32 @@ use gpui_kit::{
     TestSupportExt as _, div,
 };
 
-/// Heading and body of a tool's empty state.
-pub fn empty_copy(tool: Tool) -> (&'static str, &'static str) {
+/// Heading and body of a tool's empty state. `connected` is true while an app is connected: the
+/// tools that are not built yet then say so instead of promising data.
+pub fn empty_copy(tool: Tool, connected: bool) -> (String, String) {
+    let (heading, body) = static_copy(tool, connected);
+    (heading.to_string(), body)
+}
+
+fn static_copy(tool: Tool, connected: bool) -> (&'static str, String) {
+    let not_built = matches!(
+        tool,
+        Tool::Timeline | Tool::Performance | Tool::Memory | Tool::Widgets | Tool::State
+    );
+    if connected && not_built {
+        return (
+            "Not available yet",
+            format!(
+                "{} isn't built yet. Logs and Network are recording this app.",
+                tool.label()
+            ),
+        );
+    }
+    let (heading, body) = idle_copy(tool);
+    (heading, body.to_string())
+}
+
+fn idle_copy(tool: Tool) -> (&'static str, &'static str) {
     match tool {
         Tool::Timeline => (
             "Nothing recorded yet",
@@ -44,10 +69,26 @@ pub fn empty_copy(tool: Tool) -> (&'static str, &'static str) {
     }
 }
 
+/// The start page: where the user connects to a running app.
+pub fn render_start(cx: &App) -> impl IntoElement {
+    let _ = cx;
+    div()
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(EmptyState::new(
+            "start-page",
+            icons::NETWORK,
+            "Connect to a running app",
+            "Running Flutter apps appear here.",
+        ))
+}
+
 /// The page for `tool`: a header row and a centred empty state.
 pub fn render(tool: Tool, cx: &App) -> impl IntoElement {
     let t = cx.tokens();
-    let (heading, body) = empty_copy(tool);
+    let (heading, body) = empty_copy(tool, false);
     div()
         .id(SharedString::from(format!("tool-page-{}", tool.slug())))
         .test_support()
@@ -76,4 +117,33 @@ pub fn render(tool: Tool, cx: &App) -> impl IntoElement {
                     body,
                 )),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::empty_copy;
+    use crate::nav::Tool;
+
+    #[test]
+    fn not_built_tools_say_so_when_connected() {
+        for tool in [
+            Tool::Timeline,
+            Tool::Performance,
+            Tool::Memory,
+            Tool::Widgets,
+            Tool::State,
+        ] {
+            let (heading, body) = empty_copy(tool, true);
+            assert_eq!(heading, "Not available yet");
+            assert_eq!(
+                body,
+                format!(
+                    "{} isn't built yet. Logs and Network are recording this app.",
+                    tool.label()
+                )
+            );
+        }
+        assert_eq!(empty_copy(Tool::Logs, false).0, "No logs yet");
+        assert_eq!(empty_copy(Tool::Logs, true).0, "No logs yet");
+    }
 }

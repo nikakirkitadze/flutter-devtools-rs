@@ -158,10 +158,10 @@ mod tests {
     fn back_button_is_inert_until_there_is_history(cx: &mut TestAppContext) {
         let (shell, cx) = open_shell(cx);
         click(cx, "nav-back");
-        assert_eq!(page(&shell, cx), Page::Tool(Tool::Timeline));
+        assert_eq!(page(&shell, cx), Page::Start);
         press(cx, "cmd-2", "ctrl-2");
         click(cx, "nav-back");
-        assert_eq!(page(&shell, cx), Page::Tool(Tool::Timeline));
+        assert_eq!(page(&shell, cx), Page::Start);
         click(cx, "nav-forward");
         assert_eq!(page(&shell, cx), Page::Tool(Tool::Performance));
     }

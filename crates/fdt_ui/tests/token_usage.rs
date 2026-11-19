@@ -106,6 +106,11 @@ fn views_use_tokens_not_literals() {
     let mut files = Vec::new();
     let crates = fs::read_dir(workspace.join("crates")).expect("crates dir");
     for entry in crates.flatten() {
+        // Core crates have no GPUI and draw nothing; their durations are timeouts, not visuals.
+        let manifest = fs::read_to_string(entry.path().join("Cargo.toml")).unwrap_or_default();
+        if !manifest.contains("gpui") && !manifest.contains("fdt_ui") {
+            continue;
+        }
         rust_files(&entry.path().join("src"), &mut files);
     }
     assert!(
