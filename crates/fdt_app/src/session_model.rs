@@ -454,6 +454,8 @@ mod tests {
 
     #[gpui_kit::test]
     fn a_window_opened_after_the_host_exists_attaches_immediately(cx: &mut TestAppContext) {
+        // The start page awaits the host's discovery, which publishes from the capture thread.
+        cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
         crate::test_support::init(cx);
         cx.update(|cx| {

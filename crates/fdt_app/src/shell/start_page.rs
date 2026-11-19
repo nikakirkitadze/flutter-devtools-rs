@@ -2,7 +2,7 @@
 
 use crate::actions::{AppListConnect, AppListNext, AppListPrev};
 use crate::keymap::APP_LIST_CONTEXT;
-use crate::session_model::SessionModel;
+use crate::session_model::{SessionEvent, SessionModel};
 use crate::settings::{record_recent_url, settings, update_settings};
 use fdt_capture::{ConnStatus, Target};
 use fdt_ui::theme::TokensExt as _;
@@ -41,14 +41,16 @@ pub struct StartPage {
     scanned: bool,
     /// Whether the first-scan grace period is over.
     scan_waited: bool,
-    selected: usize,
+    /// The highlighted app's `vm_uri`, so a reordered list keeps the same app highlighted.
+    selected: Option<String>,
+    /// Why the last attempt to connect to an app did not start.
+    connect_error: Option<&'static str>,
     list_focus: FocusHandle,
     url: Entity<InputState>,
     url_value: SharedString,
     url_error: Option<&'static str>,
     session: Entity<SessionModel>,
     pending: Option<Pending>,
-    saw_connecting: bool,
     show_spinner: bool,
     spinner_task: Option<Task<()>>,
     details_open: bool,
@@ -85,7 +87,11 @@ impl StartPage {
                 _ => {}
             },
         );
-        let session_sub = cx.observe(&session, |this, _, cx| this.session_changed(cx));
+        let session_sub = cx.subscribe(&session, |this, _, event: &SessionEvent, cx| {
+            if *event == SessionEvent::Status {
+                this.status_changed(cx);
+            }
+        });
         let watcher = cx.spawn(async move |this, cx| {
             while rx.changed().await.is_ok() {
                 let list = rx.borrow_and_update().clone();
@@ -106,21 +112,21 @@ impl StartPage {
             apps: list,
             scanned,
             scan_waited: false,
-            selected: 0,
+            selected: None,
+            connect_error: None,
             list_focus: cx.focus_handle(),
             url,
             url_value: SharedString::default(),
             url_error: None,
             session,
             pending: None,
-            saw_connecting: false,
             show_spinner: false,
             spinner_task: None,
             details_open: false,
             _tasks: [watcher, grace],
             _subs: [input_sub, session_sub],
         };
-        page.session_changed(cx);
+        page.status_changed(cx);
         page
     }
 
@@ -132,15 +138,14 @@ impl StartPage {
     fn set_apps(&mut self, apps: Arc<[DiscoveredApp]>, cx: &mut Context<Self>) {
         self.apps = apps;
         self.scanned = true;
-        self.selected = self.selected.min(self.apps.len().saturating_sub(1));
         cx.notify();
     }
 
-    fn session_changed(&mut self, cx: &mut Context<Self>) {
+    /// Runs on status changes only, so a snapshot tick never counts as a new status.
+    fn status_changed(&mut self, cx: &mut Context<Self>) {
         let status = self.session.read(cx).status().clone();
         let connecting = matches!(status, ConnStatus::Connecting { .. });
         if connecting {
-            self.saw_connecting = true;
             if self.spinner_task.is_none() && !self.show_spinner {
                 self.spinner_task = Some(cx.spawn(async move |this, cx| {
                     cx.background_executor().timer(motion::LOADING_DELAY).await;
@@ -154,16 +159,7 @@ impl StartPage {
         } else {
             self.spinner_task = None;
             self.show_spinner = false;
-            let settled = matches!(
-                status,
-                ConnStatus::Connected { .. }
-                    | ConnStatus::Failed { .. }
-                    | ConnStatus::Disconnected { .. }
-            );
-            if self.saw_connecting || settled {
-                self.pending = None;
-                self.saw_connecting = false;
-            }
+            self.pending = None;
         }
         if !matches!(status, ConnStatus::Failed { .. }) {
             self.details_open = false;
@@ -179,19 +175,28 @@ impl StartPage {
         };
         control.connect(target);
         self.pending = Some(pending);
-        self.saw_connecting = false;
         cx.notify();
         true
     }
 
+    /// The highlighted row: the tracked app if it is still listed, else the first.
+    fn selected_ix(&self) -> usize {
+        self.selected
+            .as_ref()
+            .and_then(|uri| self.apps.iter().position(|a| &a.vm_uri == uri))
+            .unwrap_or(0)
+    }
+
     fn connect_app(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.selected = ix;
         window.focus(&self.list_focus, cx);
         let Some(app) = self.apps.get(ix).cloned() else {
             return;
         };
+        self.selected = Some(app.vm_uri.clone());
         let pending = Pending::App(app.vm_uri.clone());
-        self.connect(Target::Discovered(app), pending, cx);
+        self.connect_error = (!self.connect(Target::Discovered(app), pending, cx))
+            .then_some("Not ready to connect yet. Try again in a moment.");
+        cx.notify();
     }
 
     fn submit_url(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -228,7 +233,8 @@ impl StartPage {
             return;
         }
         let last = self.apps.len() - 1;
-        self.selected = self.selected.saturating_add_signed(delta).min(last);
+        let ix = self.selected_ix().saturating_add_signed(delta).min(last);
+        self.selected = Some(self.apps[ix].vm_uri.clone());
         cx.notify();
     }
 }
@@ -283,7 +289,7 @@ impl StartPage {
 
     fn app_row(&self, ix: usize, app: &DiscoveredApp, cx: &mut Context<Self>) -> AnyElement {
         let t = cx.tokens();
-        let selected = ix == self.selected;
+        let selected = ix == self.selected_ix();
         let spinning = self.show_spinner && self.pending == Some(Pending::App(app.vm_uri.clone()));
         let muted = Hsla::from(t.text_muted);
         let mut el = div()
@@ -371,21 +377,33 @@ impl StartPage {
         } else {
             vec![note("start-looking", "Looking for running apps…")]
         };
+        let error = self.connect_error.map(|message| {
+            div()
+                .id("start-connect-error")
+                .test_support()
+                .aria_label(message)
+                .px(space::S8)
+                .text_size(font::DENSE)
+                .text_color(Hsla::from(t.danger))
+                .child(message)
+        });
         div()
             .id("start-app-list")
             .test_support()
             .key_context(APP_LIST_CONTEXT)
             .track_focus(&self.list_focus)
+            .tab_stop(true)
             .on_action(cx.listener(|this, _: &AppListPrev, _, cx| this.move_selection(-1, cx)))
             .on_action(cx.listener(|this, _: &AppListNext, _, cx| this.move_selection(1, cx)))
             .on_action(cx.listener(|this, _: &AppListConnect, window, cx| {
-                let ix = this.selected;
+                let ix = this.selected_ix();
                 this.connect_app(ix, window, cx);
             }))
             .flex()
             .flex_col()
             .gap(space::S2)
             .children(body)
+            .children(error)
             .into_any_element()
     }
 
@@ -833,5 +851,69 @@ mod tests {
         assert!(!exists(cx, "start-page"));
         click(cx, "sidebar-connect");
         assert!(exists(cx, "start-page"));
+    }
+
+    #[gpui_kit::test]
+    fn spinner_appears_on_a_retry_after_a_failure_despite_snapshot_ticks(cx: &mut TestAppContext) {
+        let (_shell, cx, fake, _tx) = open_start(cx, Some(two_apps()));
+        fake.status
+            .send(ConnStatus::Failed {
+                message: "Couldn't reach the app.".into(),
+                details: "refused".into(),
+            })
+            .unwrap();
+        cx.run_until_parked();
+        click(cx, "start-app-0");
+        fake.snaps
+            .send(std::sync::Arc::new(fdt_store::Snapshot::empty()))
+            .unwrap();
+        cx.run_until_parked();
+        fake.status
+            .send(ConnStatus::Connecting {
+                label: "jank_lab".into(),
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        assert!(exists(cx, "start-spinner"));
+    }
+
+    #[gpui_kit::test]
+    fn connect_to_app_focuses_the_list_for_keys(cx: &mut TestAppContext) {
+        let (_shell, cx, fake, _tx) = open_start(cx, Some(two_apps()));
+        click(cx, "sidebar-logs");
+        cx.dispatch_action(crate::actions::ConnectToApp);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(matches!(&fake.targets.borrow()[0], Target::Discovered(a) if a.name == "shop"));
+    }
+
+    #[gpui_kit::test]
+    fn going_back_to_start_focuses_the_list(cx: &mut TestAppContext) {
+        let (_shell, cx, fake, _tx) = open_start(cx, Some(two_apps()));
+        click(cx, "sidebar-logs");
+        cx.simulate_keystrokes(crate::keymap::platform("cmd-[", "ctrl-["));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("j enter");
+        cx.run_until_parked();
+        assert_eq!(fake.targets.borrow().len(), 1);
+    }
+
+    #[gpui_kit::test]
+    fn a_missing_capture_shows_a_plain_message(cx: &mut TestAppContext) {
+        let (shell, cx) = crate::test_support::open_shell(cx);
+        let (_tx, rx) = tokio::sync::watch::channel::<
+            std::sync::Arc<[fdt_vm::discovery::DiscoveredApp]>,
+        >(std::sync::Arc::from(two_apps()));
+        shell.update_in(cx, |s, window, cx| s.set_apps_source(rx, window, cx));
+        cx.run_until_parked();
+        click(cx, "start-app-0");
+        assert_eq!(
+            label(cx, "start-connect-error").unwrap(),
+            "Not ready to connect yet. Try again in a moment."
+        );
     }
 }

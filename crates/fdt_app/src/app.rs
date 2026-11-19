@@ -302,6 +302,8 @@ pub(crate) mod tests {
     /// `on_next_frame`, which gpui's public test API cannot drive; it was checked by hand.
     #[gpui_kit::test]
     fn host_is_absent_at_window_open_and_attached_by_the_deferred_install(cx: &mut TestAppContext) {
+        // The start page awaits the host's discovery, which publishes from the capture thread.
+        cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
         let config = empty_discovery(dir.path());
         let shell = cx.update(|cx| {

@@ -143,11 +143,8 @@ impl MainWindow {
         }
         let session = self.session.clone();
         let page = cx.new(|cx| StartPage::new(apps, session, window, cx));
-        if self.current().page == Page::Start {
-            let focus = page.read(cx).focus_handle(cx);
-            window.focus(&focus, cx);
-        }
         self.start = Some(page);
+        self.focus_start_if_current(window, cx);
         self._host_wait = None;
         cx.notify();
     }
@@ -194,9 +191,22 @@ impl MainWindow {
         &self.history
     }
 
-    pub fn navigate(&mut self, to: Location, _window: &mut Window, cx: &mut Context<Self>) {
+    pub fn navigate(&mut self, to: Location, window: &mut Window, cx: &mut Context<Self>) {
         if self.history.navigate(to) {
+            self.focus_start_if_current(window, cx);
             cx.notify();
+        }
+    }
+
+    /// Puts focus on the start page's app list whenever Start is the current page, so its keys
+    /// work after the sidebar, "Connect to an app" or back/forward bring the user here.
+    fn focus_start_if_current(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.current().page != Page::Start {
+            return;
+        }
+        if let Some(page) = &self.start {
+            let focus = page.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
         }
     }
 
@@ -263,14 +273,16 @@ impl MainWindow {
         self.navigate(to, window, cx);
     }
 
-    fn go_back(&mut self, cx: &mut Context<Self>) {
+    fn go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.history.go_back().is_some() {
+            self.focus_start_if_current(window, cx);
             cx.notify();
         }
     }
 
-    fn go_forward(&mut self, cx: &mut Context<Self>) {
+    fn go_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.history.go_forward().is_some() {
+            self.focus_start_if_current(window, cx);
             cx.notify();
         }
     }
@@ -362,8 +374,8 @@ impl Render for MainWindow {
             .on_action(cx.listener(|this, _: &UseLightTheme, w, cx| {
                 this.set_theme(ThemePreference::Light, w, cx)
             }))
-            .on_action(cx.listener(|this, _: &GoBack, _, cx| this.go_back(cx)))
-            .on_action(cx.listener(|this, _: &GoForward, _, cx| this.go_forward(cx)))
+            .on_action(cx.listener(|this, _: &GoBack, w, cx| this.go_back(w, cx)))
+            .on_action(cx.listener(|this, _: &GoForward, w, cx| this.go_forward(w, cx)))
             .on_action(cx.listener(|this, _: &ClearSelection, w, cx| {
                 if let Some(to) = this.current().cleared() {
                     this.navigate(to, w, cx);
@@ -378,11 +390,11 @@ impl Render for MainWindow {
             .on_action(cx.listener(|_, _: &ToggleFullScreen, w, _| w.toggle_fullscreen()))
             .on_mouse_down(
                 nav(NavigationDirection::Back),
-                cx.listener(|this, _, _, cx| this.go_back(cx)),
+                cx.listener(|this, _, w, cx| this.go_back(w, cx)),
             )
             .on_mouse_down(
                 nav(NavigationDirection::Forward),
-                cx.listener(|this, _, _, cx| this.go_forward(cx)),
+                cx.listener(|this, _, w, cx| this.go_forward(w, cx)),
             )
             .child(self.render_title_bar(window, cx))
             .children(self.render_banner(cx))
