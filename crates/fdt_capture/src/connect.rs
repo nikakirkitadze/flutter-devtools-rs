@@ -204,6 +204,7 @@ async fn connect_and_ingest(
         svc.clone(),
         sink.clone(),
         cfg.body_fetch_timeout,
+        cfg.auto_fetch_limit,
     ));
     sink.get().send(Ingest::NetReady(fetcher.clone()));
     let mut hub = NetHub::new(

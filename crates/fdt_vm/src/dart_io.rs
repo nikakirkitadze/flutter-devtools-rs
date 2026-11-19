@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
+use serde_json::value::RawValue;
 use serde_json::{Value, json};
 
 use crate::rpc::RpcError;
@@ -105,6 +106,113 @@ pub struct HttpProfileRequestFull {
     pub entry: HttpProfileEntry,
     pub request_body: Option<Vec<u8>>,
     pub response_body: Option<Vec<u8>>,
+    /// Set instead of the body when it was longer than the decoder's cap: its real length.
+    pub request_too_large: Option<u64>,
+    pub response_too_large: Option<u64>,
+}
+
+/// One body as read from the reply text.
+enum Side {
+    Bytes(Vec<u8>),
+    Over(u64),
+}
+
+/// Reads a JSON array of integers into bytes, keeping at most `cap` of them. Past the cap it
+/// only counts, so the real length is known without the body ever being held.
+struct CappedBytes {
+    cap: usize,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for CappedBytes {
+    type Value = Option<Side>;
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for CappedBytes {
+    type Value = Option<Side>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("an array of bytes or null")
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        use serde::de::Error;
+        let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(self.cap).min(1 << 20));
+        let mut total = 0u64;
+        while let Some(n) = seq
+            .next_element::<u8>()
+            .map_err(|_| A::Error::custom("not a byte"))?
+        {
+            total += 1;
+            if total > self.cap as u64 {
+                // Over the cap: drop what was kept and only count the rest.
+                bytes = Vec::new();
+            } else {
+                bytes.push(n);
+            }
+        }
+        Ok(Some(if total > self.cap as u64 {
+            Side::Over(total)
+        } else {
+            Side::Bytes(bytes)
+        }))
+    }
+}
+
+/// Only the two body fields of a reply, each read under the cap; everything else is skipped.
+struct Bodies {
+    request: Option<Side>,
+    response: Option<Side>,
+}
+
+struct BodiesSeed {
+    cap: usize,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for BodiesSeed {
+    type Value = Bodies;
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Bodies, D::Error> {
+        d.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for BodiesSeed {
+    type Value = Bodies;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("an object")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Bodies, A::Error> {
+        let mut out = Bodies {
+            request: None,
+            response: None,
+        };
+        while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+            match &*key {
+                "requestBody" => {
+                    out.request = map.next_value_seed(CappedBytes { cap: self.cap })?
+                }
+                "responseBody" => {
+                    out.response = map.next_value_seed(CappedBytes { cap: self.cap })?
+                }
+                _ => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 fn take_bytes(
@@ -140,7 +248,53 @@ impl HttpProfileRequestFull {
             entry: decode(Value::Object(obj))?,
             request_body,
             response_body,
+            request_too_large: None,
+            response_too_large: None,
         })
+    }
+
+    /// Decodes a reply from its JSON text without building a `Value` tree. Each body longer
+    /// than `max_body_bytes` is not kept: its length is recorded in `*_too_large` instead.
+    pub fn from_raw(raw: &RawValue, max_body_bytes: usize) -> Result<Self, RpcError> {
+        use serde::de::DeserializeSeed;
+        let decode_err = |e: serde_json::Error| RpcError::Decode(e.to_string());
+        let entry: HttpProfileEntry = serde_json::from_str(raw.get()).map_err(decode_err)?;
+        let mut de = serde_json::Deserializer::from_str(raw.get());
+        let bodies = BodiesSeed {
+            cap: max_body_bytes,
+        }
+        .deserialize(&mut de)
+        .map_err(decode_err)?;
+        let split = |side: Option<Side>| match side {
+            Some(Side::Bytes(b)) => (Some(b), None),
+            Some(Side::Over(n)) => (None, Some(n)),
+            None => (None, None),
+        };
+        let (request_body, request_too_large) = split(bodies.request);
+        let (response_body, response_too_large) = split(bodies.response);
+        Ok(HttpProfileRequestFull {
+            entry,
+            request_body,
+            response_body,
+            request_too_large,
+            response_too_large,
+        })
+    }
+
+    /// The request body, or [`RpcError::BodyTooLarge`] when it was over the cap.
+    pub fn take_request_body(&mut self) -> Result<Option<Vec<u8>>, RpcError> {
+        match self.request_too_large {
+            Some(len) => Err(RpcError::BodyTooLarge { len }),
+            None => Ok(self.request_body.take()),
+        }
+    }
+
+    /// The response body, or [`RpcError::BodyTooLarge`] when it was over the cap.
+    pub fn take_response_body(&mut self) -> Result<Option<Vec<u8>>, RpcError> {
+        match self.response_too_large {
+            Some(len) => Err(RpcError::BodyTooLarge { len }),
+            None => Ok(self.response_body.take()),
+        }
     }
 }
 
@@ -197,19 +351,23 @@ impl VmService {
         )
     }
 
+    /// Fetches one request with its bodies. A body longer than `max_body_bytes` is reported in
+    /// the `*_too_large` fields, not returned.
     pub async fn get_http_profile_request(
         &self,
         isolate: &str,
         id: &str,
+        max_body_bytes: usize,
     ) -> Result<HttpProfileRequestFull, RpcError> {
-        HttpProfileRequestFull::from_value(
-            self.call_extension(
+        let raw = self
+            .client()
+            .call_raw_with_timeout(
                 "ext.dart.io.getHttpProfileRequest",
-                isolate,
-                json!({"id": id}),
+                json!({"isolateId": isolate, "id": id}),
+                self.client().call_timeout(),
             )
-            .await?,
-        )
+            .await?;
+        HttpProfileRequestFull::from_raw(&raw, max_body_bytes)
     }
 
     pub async fn clear_http_profile(&self, isolate: &str) -> Result<(), RpcError> {
@@ -263,5 +421,53 @@ mod tests {
         assert!(take(json!([1, 256])).is_err());
         assert!(take(json!([1, -1])).is_err());
         assert!(take(json!("abc")).is_err());
+    }
+
+    fn reply(req: &[u8], resp: &[u8]) -> Box<RawValue> {
+        let v = json!({"id": "7", "isolateId": "isolates/1", "method": "GET",
+            "uri": "http://x/", "startTime": 1,
+            "requestBody": req, "responseBody": resp});
+        RawValue::from_string(v.to_string()).unwrap()
+    }
+
+    #[test]
+    fn raw_replies_decode_both_bodies() {
+        let raw = reply(&[1, 2], &[3, 4, 5]);
+        let full = HttpProfileRequestFull::from_raw(&raw, 100).unwrap();
+        assert_eq!(full.entry.id, "7");
+        assert_eq!(full.request_body, Some(vec![1, 2]));
+        assert_eq!(full.response_body, Some(vec![3, 4, 5]));
+        assert_eq!(full.request_too_large, None);
+    }
+
+    #[test]
+    fn a_body_over_the_cap_is_an_error_with_its_real_length() {
+        let raw = reply(&[1, 2], &[0; 50]);
+        let mut full = HttpProfileRequestFull::from_raw(&raw, 10).unwrap();
+        assert_eq!(full.response_body, None);
+        assert_eq!(full.response_too_large, Some(50));
+        assert_eq!(
+            full.take_response_body(),
+            Err(RpcError::BodyTooLarge { len: 50 })
+        );
+        // The other side is unaffected.
+        assert_eq!(full.take_request_body(), Ok(Some(vec![1, 2])));
+    }
+
+    #[test]
+    fn a_five_megabyte_body_decodes_from_text() {
+        let body: Vec<u8> = (0..5 << 20).map(|i| (i % 251) as u8).collect();
+        let raw = reply(&[], &body);
+        let full = HttpProfileRequestFull::from_raw(&raw, 8 << 20).unwrap();
+        assert_eq!(full.response_body.as_deref(), Some(&body[..]));
+    }
+
+    #[test]
+    fn raw_replies_reject_bad_bytes() {
+        let raw = RawValue::from_string(
+            r#"{"id":"1","method":"GET","uri":"u","startTime":1,"responseBody":[1,300]}"#.into(),
+        )
+        .unwrap();
+        assert!(HttpProfileRequestFull::from_raw(&raw, 100).is_err());
     }
 }

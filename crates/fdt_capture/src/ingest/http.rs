@@ -100,8 +100,8 @@ pub(crate) struct PollReply {
 
 pub(crate) enum Fetched {
     Auto {
-        request: Option<Vec<u8>>,
-        response: Option<Vec<u8>>,
+        request: Result<Option<Vec<u8>>, u64>,
+        response: Result<Option<Vec<u8>>, u64>,
     },
     Full {
         kind: BodyKind,
@@ -128,6 +128,8 @@ pub(crate) struct BodyFetcher {
     sink: SharedSink,
     permits: Semaphore,
     timeout: Duration,
+    /// An automatic fetch keeps no body longer than this.
+    auto_limit: usize,
     in_flight: Mutex<HashMap<String, usize>>,
 }
 
@@ -143,11 +145,17 @@ impl Drop for Counted<'_> {
 }
 
 impl BodyFetcher {
-    pub(crate) fn new(svc: VmService, sink: SharedSink, timeout: Duration) -> BodyFetcher {
+    pub(crate) fn new(
+        svc: VmService,
+        sink: SharedSink,
+        timeout: Duration,
+        auto_limit: u64,
+    ) -> BodyFetcher {
         BodyFetcher {
             svc,
             sink,
             timeout,
+            auto_limit: usize::try_from(auto_limit).unwrap_or(usize::MAX),
             permits: Semaphore::new(MAX_FETCHES_PER_RUN),
             in_flight: Mutex::default(),
         }
@@ -197,6 +205,9 @@ impl BodyFetcher {
             let reason = match e {
                 RpcError::Timeout => TIMEOUT_REASON.to_string(),
                 RpcError::Closed => STOPPED_REASON.to_string(),
+                RpcError::BodyTooLarge { len } => {
+                    format!("This body is too large to copy ({len} bytes).")
+                }
                 e => e.to_string(),
             };
             match mode {
@@ -208,32 +219,50 @@ impl BodyFetcher {
             Ok(p) => p,
             Err(_) => return failed(RpcError::Closed),
         };
+        // A whole-body reload may carry anything one frame can; an automatic fetch keeps no
+        // more than the auto-fetch limit, and reports the real length of what it dropped.
+        let cap = match mode {
+            FetchMode::Auto => self.auto_limit,
+            FetchMode::Full(_) => self.svc.client().max_body_bytes(),
+        };
         let reply = self
             .svc
             .client()
-            .call_with_timeout(
+            .call_raw_with_timeout(
                 "ext.dart.io.getHttpProfileRequest",
                 json!({"isolateId": isolate, "id": vm_id}),
                 self.timeout,
             )
             .await
-            .and_then(HttpProfileRequestFull::from_value);
+            .and_then(|raw| HttpProfileRequestFull::from_raw(&raw, cap));
         match reply {
             Err(e) => failed(e),
-            Ok(full) => match mode {
+            Ok(mut full) => match mode {
                 FetchMode::Auto => Fetched::Auto {
-                    request: full.request_body,
-                    response: full.response_body,
+                    request: side(full.take_request_body()),
+                    response: side(full.take_response_body()),
                 },
-                FetchMode::Full(kind) => Fetched::Full {
-                    kind,
-                    bytes: match kind {
-                        BodyKind::Request => full.request_body,
-                        BodyKind::Response => full.response_body,
-                    },
-                },
+                FetchMode::Full(kind) => {
+                    let bytes = match kind {
+                        BodyKind::Request => full.take_request_body(),
+                        BodyKind::Response => full.take_response_body(),
+                    };
+                    match bytes {
+                        Ok(bytes) => Fetched::Full { kind, bytes },
+                        Err(e) => failed(e),
+                    }
+                }
             },
         }
+    }
+}
+
+/// A body, or the real length of one that was over the cap.
+fn side(r: Result<Option<Vec<u8>>, RpcError>) -> Result<Option<Vec<u8>>, u64> {
+    match r {
+        Ok(b) => Ok(b),
+        Err(RpcError::BodyTooLarge { len }) => Err(len),
+        Err(_) => Ok(None),
     }
 }
 
@@ -490,7 +519,7 @@ impl NetState {
                 }
                 continue;
             }
-            let len = u.response_content_length;
+            let (req_len, len) = (u.request_content_length, u.response_content_length);
             let up = w.upsert_request(u);
             self.keys
                 .entry(up.id)
@@ -507,15 +536,19 @@ impl NetState {
             if !up.newly_completed || websocket {
                 continue;
             }
-            match len {
-                Some(n) if n > 0 && n as u64 > auto_fetch_limit => {
-                    w.set_body_state(
-                        up.id,
-                        BodyKind::Response,
-                        BodyState::TooLarge { len: n as u64 },
-                    );
+            // One fetch returns both bodies in one reply, so when either side is known to be over
+            // the limit nothing is fetched: each over-limit side is marked too large, and a
+            // known in-limit side is offered through "Load full body". An unknown length is
+            // fetched (the 10 s timeout and the decoder's cap bound it).
+            let over = |n: Option<i64>| n.filter(|&n| n > 0 && n as u64 > auto_fetch_limit);
+            if over(req_len).is_some() || over(len).is_some() {
+                for (kind, n) in [(BodyKind::Request, req_len), (BodyKind::Response, len)] {
+                    if let Some(n) = n.filter(|&n| n > 0) {
+                        w.set_body_state(up.id, kind, BodyState::TooLarge { len: n as u64 });
+                    }
                 }
-                _ => {
+            } else {
+                {
                     self.pending.insert(up.id);
                     w.set_body_state(up.id, BodyKind::Request, BodyState::Pending);
                     w.set_body_state(up.id, BodyKind::Response, BodyState::Pending);
@@ -538,8 +571,12 @@ impl NetState {
         match result {
             Fetched::Auto { request, response } => {
                 self.pending.remove(&id);
-                store(w, BodyKind::Request, request);
-                store(w, BodyKind::Response, response);
+                for (kind, side) in [(BodyKind::Request, request), (BodyKind::Response, response)] {
+                    match side {
+                        Ok(bytes) => store(w, kind, bytes),
+                        Err(len) => w.set_body_state(id, kind, BodyState::TooLarge { len }),
+                    }
+                }
             }
             Fetched::Full { kind, bytes } => {
                 self.loading.remove(&(id, kind));

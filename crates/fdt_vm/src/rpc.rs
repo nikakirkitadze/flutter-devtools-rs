@@ -6,6 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
+use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Error as WsError;
@@ -13,6 +15,15 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::tap::Tap;
+
+/// A body travels as a JSON array of integers, up to four characters a byte (`255,`), so a
+/// frame of `max_message_bytes` carries a body of at most a quarter of that.
+pub const fn max_body_bytes(max_message_bytes: usize) -> usize {
+    max_message_bytes / 4
+}
+
+/// The default frame limit.
+pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ConnectOptions {
@@ -27,7 +38,7 @@ impl Default for ConnectOptions {
         ConnectOptions {
             connect_timeout: Duration::from_secs(5),
             call_timeout: Duration::from_secs(30),
-            max_message_bytes: 256 * 1024 * 1024,
+            max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
             tap: None,
         }
     }
@@ -51,6 +62,10 @@ pub enum RpcError {
     Timeout,
     Closed,
     Decode(String),
+    /// A body longer than the decoder's cap; `len` is its real length in bytes.
+    BodyTooLarge {
+        len: u64,
+    },
 }
 
 impl std::fmt::Display for RpcError {
@@ -60,6 +75,7 @@ impl std::fmt::Display for RpcError {
             RpcError::Timeout => f.write_str("The request timed out."),
             RpcError::Closed => f.write_str("The connection closed."),
             RpcError::Decode(e) => write!(f, "Unreadable response: {e}"),
+            RpcError::BodyTooLarge { len } => write!(f, "The body is too large ({len} bytes)."),
         }
     }
 }
@@ -106,7 +122,10 @@ impl std::fmt::Display for ConnectError {
 
 impl std::error::Error for ConnectError {}
 
-type Pending = HashMap<String, oneshot::Sender<Result<Value, RpcError>>>;
+/// A result as the reader found it: the JSON text of `result`, not yet a tree.
+pub type RawResult = Box<RawValue>;
+
+type Pending = HashMap<String, oneshot::Sender<Result<RawResult, RpcError>>>;
 
 enum Outgoing {
     Text(String),
@@ -120,6 +139,7 @@ struct Inner {
     next_id: AtomicU64,
     closed: watch::Receiver<Option<CloseReason>>,
     call_timeout: Duration,
+    max_message_bytes: usize,
     tap: Option<Tap>,
 }
 
@@ -202,6 +222,7 @@ pub async fn connect(
         next_id: AtomicU64::new(1),
         closed: closed_rx.clone(),
         call_timeout: opts.call_timeout,
+        max_message_bytes: opts.max_message_bytes,
         tap: opts.tap,
     });
 
@@ -286,32 +307,66 @@ impl std::fmt::Debug for RpcClient {
     }
 }
 
+/// What routing a frame needs. `RawValue` keeps `result` and `params` as text, so a
+/// multi-megabyte reply is never built into a `serde_json::Value` tree.
+#[derive(Deserialize)]
+struct Envelope {
+    id: Option<Id>,
+    method: Option<String>,
+    #[serde(default, deserialize_with = "raw_present")]
+    params: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "raw_present")]
+    result: Option<Box<RawValue>>,
+    error: Option<ErrorBody>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Id {
+    Str(String),
+    Num(serde_json::Number),
+}
+
+#[derive(Deserialize)]
+struct ErrorBody {
+    code: Option<i64>,
+    message: Option<String>,
+    data: Option<Value>,
+}
+
+/// Keeps a present-but-`null` field as `Some("null")`, unlike `Option`'s own handling.
+fn raw_present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Box<RawValue>>, D::Error> {
+    Box::<RawValue>::deserialize(d).map(Some)
+}
+
 impl Inner {
     fn on_frame(&self, text: &str, notes: &mpsc::UnboundedSender<Notification>) {
         if let Some(tap) = &self.tap {
             tap.record("recv", text);
         }
-        let mut v: Value = match serde_json::from_str(text) {
+        let env: Envelope = match serde_json::from_str(text) {
             Ok(v) => v,
             Err(e) => {
                 log::warn!("unreadable frame: {e}");
                 return;
             }
         };
-        let id = match v.get("id") {
-            Some(Value::String(s)) => Some(s.clone()),
-            Some(Value::Number(n)) => Some(n.to_string()),
-            _ => None,
+        let id = match env.id {
+            Some(Id::Str(s)) => Some(s),
+            Some(Id::Num(n)) => Some(n.to_string()),
+            None => None,
         };
         let Some(id) = id else {
-            let method = v.get("method").and_then(Value::as_str).map(str::to_string);
-            if let Some(method) = method {
-                let params = v.get_mut("params").map(Value::take).unwrap_or(Value::Null);
+            if let Some(method) = env.method {
+                let params = env
+                    .params
+                    .and_then(|p| serde_json::from_str(p.get()).ok())
+                    .unwrap_or(Value::Null);
                 let _ = notes.send(Notification { method, params });
             }
             return;
         };
-        if v.get("method").is_some() {
+        if env.method.is_some() {
             return; // a request from the server; the VM service sends none we answer
         }
         let waiter = self
@@ -320,18 +375,14 @@ impl Inner {
             .ok()
             .and_then(|mut p| p.as_mut()?.remove(&id));
         let Some(waiter) = waiter else { return };
-        let outcome = if let Some(err) = v.get_mut("error") {
+        let outcome = if let Some(err) = env.error {
             Err(RpcError::Server {
-                code: err.get("code").and_then(Value::as_i64).unwrap_or(0),
-                message: err
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                data: err.get_mut("data").map(Value::take),
+                code: err.code.unwrap_or(0),
+                message: err.message.unwrap_or_default(),
+                data: err.data,
             })
-        } else if let Some(r) = v.get_mut("result") {
-            Ok(r.take())
+        } else if let Some(r) = env.result {
+            Ok(r)
         } else {
             Err(RpcError::Decode(
                 "response has neither result nor error".into(),
@@ -353,6 +404,18 @@ impl RpcClient {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, RpcError> {
+        let raw = self.call_raw_with_timeout(method, params, timeout).await?;
+        serde_json::from_str(raw.get()).map_err(|e| RpcError::Decode(e.to_string()))
+    }
+
+    /// Like [`call_with_timeout`](Self::call_with_timeout), but the result stays JSON text, for
+    /// replies too big to build into a tree.
+    pub async fn call_raw_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<RawResult, RpcError> {
         let id = self
             .inner
             .next_id
@@ -386,6 +449,16 @@ impl RpcClient {
             Ok(Err(_)) => Err(RpcError::Closed),
             Err(_) => Err(RpcError::Timeout),
         }
+    }
+
+    /// How long a call waits by default.
+    pub fn call_timeout(&self) -> Duration {
+        self.inner.call_timeout
+    }
+
+    /// The most bytes of one body a reply can carry (see [`max_body_bytes`]).
+    pub fn max_body_bytes(&self) -> usize {
+        max_body_bytes(self.inner.max_message_bytes)
     }
 
     #[cfg(test)]
@@ -449,6 +522,29 @@ mod tests {
         let r = c.call("getVM", json!({"a": 1})).await.unwrap();
         assert_eq!(r, json!({"method": "getVM", "params": {"a": 1}}));
         assert_eq!(s.received(), vec![("getVM".to_string(), json!({"a": 1}))]);
+    }
+
+    #[tokio::test]
+    async fn raw_calls_return_the_result_text() {
+        let s = echo_server();
+        let (c, _rx) = connect(&s.ws_uri(), ConnectOptions::default())
+            .await
+            .unwrap();
+        let raw = c
+            .call_raw_with_timeout("m", json!({"i": 1}), Duration::from_secs(5))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(raw.get()).unwrap();
+        assert_eq!(v, json!({"method": "m", "params": {"i": 1}}));
+    }
+
+    #[tokio::test]
+    async fn a_null_result_is_a_result() {
+        let s = ScriptedServer::start(|_, _| Ok(Value::Null));
+        let (c, _rx) = connect(&s.ws_uri(), ConnectOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(c.call("m", json!({})).await.unwrap(), Value::Null);
     }
 
     #[tokio::test]

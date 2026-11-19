@@ -170,6 +170,69 @@ fn oversized_bodies_are_not_fetched() {
     });
 }
 
+/// A completed request whose request body is `req_len` bytes and response is `resp_len`.
+fn done_both(id: &str, req_len: i64, resp_len: i64) -> Value {
+    let mut v = done(id, resp_len);
+    v["request"]["contentLength"] = json!(req_len);
+    v
+}
+
+#[test]
+fn an_oversized_request_body_is_not_fetched() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let server = ScriptedServer::start(|m, p| {
+            base(m, p).unwrap_or_else(|| match m {
+                "ext.dart.io.getHttpProfile" => profile(vec![done_both("7", 50_000_000, 10)]),
+                _ => Err((-32601, "Method not found".into())),
+            })
+        });
+        let cap = start(&server, config(), &rt);
+        let snap = common::wait_for(&cap, Duration::from_secs(5), "a request", |s| {
+            s.net.len() == 1
+        })
+        .await;
+        let r = snap.net.request(0);
+        assert!(matches!(
+            r.request_body,
+            BodyState::TooLarge { len: 50_000_000 }
+        ));
+        // The small response is not fetched either, and can be loaded on request.
+        assert!(matches!(r.response_body, BodyState::TooLarge { len: 10 }));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(count(&server, "ext.dart.io.getHttpProfileRequest"), 0);
+    });
+}
+
+#[test]
+fn an_unknown_length_body_over_the_cap_becomes_too_large() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let server = ScriptedServer::start(|m, p| {
+            base(m, p).unwrap_or_else(|| match m {
+                // The length is unknown (chunked), so the body is fetched, and is over the limit.
+                "ext.dart.io.getHttpProfile" => profile(vec![done("7", -1)]),
+                "ext.dart.io.getHttpProfileRequest" => Ok(json!({"id": "7",
+                    "method": "GET", "uri": "http://h:1/x", "startTime": T,
+                    "requestBody": body(3), "responseBody": body(1000)})),
+                _ => Err((-32601, "Method not found".into())),
+            })
+        });
+        let cfg = CaptureConfig {
+            auto_fetch_limit: 100,
+            ..config()
+        };
+        let cap = start(&server, cfg, &rt);
+        let snap = common::wait_for(&cap, Duration::from_secs(5), "a decided body", |s| {
+            s.net.len() == 1 && matches!(s.net.request(0).response_body, BodyState::TooLarge { .. })
+        })
+        .await;
+        let r = snap.net.request(0);
+        assert!(matches!(r.response_body, BodyState::TooLarge { len: 1000 }));
+        assert!(matches!(r.request_body, BodyState::Captured(_)));
+    });
+}
+
 #[test]
 fn duplicate_entries_from_inclusive_updated_since_do_not_duplicate() {
     let rt = CaptureRuntime::new().unwrap();
