@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 fdt_ui = { path = "../fdt_ui" }
+fdt_store = { path = "../fdt_store" }
 gpui_kit.workspace = true
 anyhow.workspace = true
 serde.workspace = true

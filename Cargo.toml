@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/fdt_ui", "crates/fdt_app"]
+members = ["crates/fdt_ui", "crates/fdt_app", "crates/fdt_store"]
 
 [workspace.package]
 version = "0.1.0"
@@ -19,6 +19,8 @@ dirs = "6"
 regex = "1"
 tempfile = "3"
 criterion = "0.8"
+rayon = "1"
+memchr = "2"
 
 [profile.release]
 debug = "line-tables-only"

@@ -1730,6 +1730,7 @@ dependencies = [
  "anyhow",
  "criterion",
  "dirs 6.0.0",
+ "fdt_store",
  "fdt_ui",
  "gpui-kit",
  "log",
@@ -1737,6 +1738,10 @@ dependencies = [
  "serde_json",
  "tempfile",
 ]
+
+[[package]]
+name = "fdt_store"
+version = "0.1.0"
 
 [[package]]
 name = "fdt_ui"

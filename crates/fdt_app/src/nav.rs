@@ -61,24 +61,7 @@ pub enum Page {
     Settings,
 }
 
-/// Nanoseconds since session start; continuous across runs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SessionTime(pub u64);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct TimeRange {
-    pub start: SessionTime,
-    pub end: SessionTime,
-}
-
-impl TimeRange {
-    pub fn new(a: SessionTime, b: SessionTime) -> Self {
-        Self {
-            start: a.min(b),
-            end: a.max(b),
-        }
-    }
-}
+pub use fdt_store::time::{SessionTime, TimeRange};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SelectionKey(pub Arc<str>);
