@@ -1,0 +1,20 @@
+[package]
+name = "fdt_capture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+fdt_store = { path = "../fdt_store" }
+fdt_vm = { path = "../fdt_vm" }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+fdt_vm = { path = "../fdt_vm", features = ["testing"] }
+tokio = { workspace = true, features = ["test-util"] }
+regex = { workspace = true }

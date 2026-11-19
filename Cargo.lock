@@ -1746,6 +1746,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fdt_capture"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "fdt_store",
+ "fdt_vm",
+ "log",
+ "regex",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "fdt_store"
 version = "0.1.0"
 dependencies = [
