@@ -40,6 +40,27 @@ impl Default for Settings {
     }
 }
 
+/// Writes `bytes` to `path`, readable by the owner only on unix: the file holds recent VM
+/// service URLs, which carry auth tokens.
+fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        // `mode` only applies to a new file; a leftover temp file may be looser.
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(bytes)
+}
+
 impl Settings {
     /// Reads every known field on its own: a field of the wrong type keeps its default and logs
     /// one warning. Unknown fields are ignored.
@@ -133,7 +154,7 @@ impl SettingsStore {
         let mut tmp = path.as_os_str().to_owned();
         tmp.push(".tmp");
         let tmp = PathBuf::from(tmp);
-        std::fs::write(&tmp, json)?;
+        write_private(&tmp, &json)?;
         std::fs::rename(&tmp, path)
     }
 }
@@ -321,6 +342,21 @@ mod tests {
         let path = dir.path().join("a").join("b").join("settings.json");
         SettingsStore::write(&path, &Settings::default()).unwrap();
         assert!(path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_are_written_for_the_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        SettingsStore::write(&path, &Settings::default()).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        // Writing again over an older, looser file tightens it.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        SettingsStore::write(&path, &Settings::default()).unwrap();
+        assert_eq!(mode(&path), 0o600);
     }
 
     #[test]
