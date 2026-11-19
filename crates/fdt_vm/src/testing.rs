@@ -1,7 +1,9 @@
 //! Local WebSocket servers for tests. Bound to 127.0.0.1 only.
 
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -234,5 +236,203 @@ fn deliver(tx: &ConnTx, reply: String, shared: &Shared) {
             tokio::time::sleep(latency).await;
             let _ = tx.send(ConnCmd::Send(reply));
         });
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// ReplayServer
+// ---------------------------------------------------------------------------------------------
+
+/// One recorded answer: `Ok(result)` or `Err(error object)`.
+type Recorded = Result<Value, Value>;
+
+/// The request parameter that identifies a call, for methods whose answer depends on it.
+fn key_param(method: &str) -> Option<&'static str> {
+    match method {
+        "getObject" => Some("objectId"),
+        "getHttpProfileRequest" | "ext.dart.io.getHttpProfileRequest" => Some("id"),
+        "ext.jank_lab.run" => Some("action"),
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct Transcript {
+    /// Answers per method (and per key for keyed methods), in recorded order.
+    answers: HashMap<(String, Option<String>), Vec<Recorded>>,
+    /// Methods with at least one recorded answer; any other method is "not found".
+    methods: HashSet<String>,
+    /// Recorded notifications per stream, in recorded order.
+    notifications: HashMap<String, Vec<Value>>,
+}
+
+impl Transcript {
+    fn load(path: &Path) -> Transcript {
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("cannot read transcript {}: {e}", path.display()));
+        let mut t = Transcript::default();
+        // Requests by id, awaiting their responses.
+        let mut pending: HashMap<String, (String, Option<String>)> = HashMap::new();
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let Ok(entry) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let msg = &entry["msg"];
+            match entry["dir"].as_str() {
+                Some("send") => {
+                    let (Some(method), Some(id)) = (msg["method"].as_str(), msg.get("id")) else {
+                        continue;
+                    };
+                    let key = key_param(method)
+                        .and_then(|k| msg["params"].get(k))
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    pending.insert(id_key(id), (method.to_string(), key));
+                }
+                Some("recv") => {
+                    if let Some(id) = msg.get("id") {
+                        let Some((method, key)) = pending.remove(&id_key(id)) else {
+                            continue;
+                        };
+                        let rec = match msg.get("error") {
+                            Some(e) => Err(e.clone()),
+                            None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
+                        };
+                        t.methods.insert(method.clone());
+                        t.answers.entry((method, key)).or_default().push(rec);
+                    } else if msg["method"] == "streamNotify"
+                        && let Some(stream) = msg["params"]["streamId"].as_str()
+                    {
+                        t.notifications
+                            .entry(stream.to_string())
+                            .or_default()
+                            .push(msg.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        t
+    }
+}
+
+fn id_key(id: &Value) -> String {
+    match id {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+struct ReplayShared {
+    transcript: Transcript,
+    /// How many times each (method, key) has been answered.
+    served: Mutex<HashMap<(String, Option<String>), usize>>,
+    received: Mutex<Vec<(String, Value)>>,
+}
+
+impl ReplayShared {
+    /// The recorded answer for this request, or the error for one nothing recorded can answer.
+    fn answer(&self, method: &str, params: &Value) -> Recorded {
+        if !self.transcript.methods.contains(method) {
+            return Err(json!({"code": -32601, "message": "Method not found"}));
+        }
+        let key = key_param(method)
+            .and_then(|k| params.get(k))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        // `isolateId` and every other parameter are ignored apart from the key.
+        let slot = (method.to_string(), key);
+        let Some(list) = self.transcript.answers.get(&slot) else {
+            return Err(json!({"code": -32602, "message": "Invalid params"}));
+        };
+        let mut served = self.served.lock().unwrap();
+        let n = served.entry(slot).or_insert(0);
+        let rec = list[(*n).min(list.len() - 1)].clone();
+        *n += 1;
+        rec
+    }
+}
+
+/// Serves the responses recorded in a JSONL transcript (as written by `tap::Tap`).
+///
+/// Matching rules:
+/// - `getObject` is matched by `objectId`, `getHttpProfileRequest` by `id` and
+///   `ext.jank_lab.run` by `action`. A key that was never recorded is `-32602 "Invalid params"`.
+/// - Every other method is answered with its recorded responses in recorded order, then the
+///   last one again. `isolateId` and all other parameters are ignored.
+/// - A method that was never recorded is `-32601 "Method not found"`.
+/// - After answering `streamListen` for stream S, every recorded notification of S is sent, in
+///   recorded order.
+pub struct ReplayServer {
+    plumbing: Plumbing,
+    shared: Arc<ReplayShared>,
+}
+
+impl ReplayServer {
+    /// Must be called inside a tokio runtime. Panics if the transcript cannot be read.
+    pub fn start(transcript: &Path) -> ReplayServer {
+        let shared = Arc::new(ReplayShared {
+            transcript: Transcript::load(transcript),
+            served: Mutex::default(),
+            received: Mutex::default(),
+        });
+        let s = shared.clone();
+        let plumbing =
+            Plumbing::start(move |ws, rx, tx| Box::pin(serve_replay(ws, rx, tx, s.clone())));
+        ReplayServer { plumbing, shared }
+    }
+
+    pub fn ws_uri(&self) -> url::Url {
+        self.plumbing.ws_uri()
+    }
+
+    pub fn received(&self) -> Vec<(String, Value)> {
+        self.shared.received.lock().unwrap().clone()
+    }
+}
+
+async fn serve_replay(
+    mut ws: WebSocketStream<TcpStream>,
+    mut rx: mpsc::UnboundedReceiver<ConnCmd>,
+    tx: ConnTx,
+    shared: Arc<ReplayShared>,
+) {
+    loop {
+        tokio::select! {
+            incoming = ws.next() => {
+                let Some(Ok(msg)) = incoming else { break };
+                let Message::Text(text) = msg else { continue };
+                let Ok(req) = serde_json::from_str::<Value>(text.as_str()) else { continue };
+                let method = req["method"].as_str().unwrap_or("").to_string();
+                let params = req.get("params").cloned().unwrap_or(Value::Null);
+                shared.received.lock().unwrap().push((method.clone(), params.clone()));
+                let Some(id) = req.get("id").cloned() else { continue };
+                let answer = shared.answer(&method, &params);
+                let ok = answer.is_ok();
+                let reply = match answer {
+                    Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+                    Err(error) => json!({"jsonrpc": "2.0", "id": id, "error": error}),
+                }
+                .to_string();
+                let _ = tx.send(ConnCmd::Send(reply));
+                if ok
+                    && method == "streamListen"
+                    && let Some(stream) = params["streamId"].as_str()
+                    && let Some(events) = shared.transcript.notifications.get(stream)
+                {
+                    for event in events {
+                        let _ = tx.send(ConnCmd::Send(event.to_string()));
+                    }
+                }
+            }
+            cmd = rx.recv() => match cmd {
+                Some(ConnCmd::Send(t)) => {
+                    if ws.send(Message::text(t)).await.is_err() {
+                        break;
+                    }
+                }
+                Some(ConnCmd::Abort) | None => break,
+            },
+        }
     }
 }
