@@ -61,9 +61,11 @@ cleanup() {
   rm -rf "$work"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-# Wait for the VM service URL (a cold build is slow, so allow 10 minutes; the app starts
-# fast once built, and the daemon is the only thing we wait on).
+# Wait for the VM service URL. This allows 10 minutes rather than 60 s because a cold CI build
+# (first Linux desktop build) is slow; a warm local run takes seconds.
 uri=""
 for _ in $(seq 1 1200); do
   uri="$(grep -o '"wsUri":"[^"]*"' "$log" | head -1 | cut -d'"' -f4 || true)"

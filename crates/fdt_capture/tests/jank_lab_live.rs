@@ -2,6 +2,15 @@
 //!
 //! Ignored unless `FDT_JANK_LAB=1`; `scripts/jank-lab-it.sh` starts the app and sets
 //! `FDT_JANK_LAB_VM_URI`. The actions are driven through a second VM service connection.
+//!
+//! Printed timings, all from `Capture::connect()` unless noted:
+//! - `attach_ms`: until the status is first `Connected`.
+//! - `attach_to_data_ms`: until the first live log record (`emit_levels`, called as soon as the
+//!   status is `Connected`) is in a published snapshot.
+//! - `first_log_ms`: from the `emit_levels` call until its record is in a snapshot.
+//!
+//! Hot restart is required in debug (the `hotRestart` service must be registered within 10 s)
+//! and skipped, with a message, in profile.
 
 mod common;
 
@@ -103,6 +112,15 @@ async fn run(rt: &CaptureRuntime, vm_uri: &str) {
         app.name, app.mode, app.vm_uri
     );
 
+    // The driving connection, opened first so it is not part of the attach timings.
+    let url = url::Url::parse(vm_uri).expect("vm uri");
+    let (client, mut notes) = connect(&url, ConnectOptions::default())
+        .await
+        .expect("driver connect");
+    let vm = VmService::new(client);
+    let mut iso = main_isolate(&vm).await;
+    vm.stream_listen("Service").await.ok();
+
     let cap = Capture::start(rt.handle(), CaptureConfig::default(), None);
     let t0 = Instant::now();
     cap.connect(Target::Discovered(app));
@@ -121,33 +139,17 @@ async fn run(rt: &CaptureRuntime, vm_uri: &str) {
     };
     println!("attach_ms={attach_ms} debug={is_debug}");
 
-    // The driving connection.
-    let url = url::Url::parse(vm_uri).expect("vm uri");
-    let (client, mut notes) = connect(&url, ConnectOptions::default())
-        .await
-        .expect("driver connect");
-    let vm = VmService::new(client);
-    let mut iso = main_isolate(&vm).await;
-    vm.stream_listen("Service").await.ok();
-    let hot_restart = tokio::time::timeout(Duration::from_secs(3), async {
-        while let Some(n) = notes.recv().await {
-            if let Some(StreamEvent::ServiceRegistered { method, .. }) = decode_notification(&n)
-                && method.ends_with("hotRestart")
-            {
-                return Some(method);
-            }
-        }
-        None
-    })
-    .await
-    .ok()
-    .flatten();
-
-    // Logs.
+    // Logs. `emit_levels` is called as soon as the status is Connected, so the first live
+    // record also gives `attach_to_data_ms`.
     act(&vm, &iso, "goto_logs").await;
     let t_logs = Instant::now();
     act(&vm, &iso, "emit_levels").await;
-    let snap = common::wait_for(&cap, WAIT, "emit_levels records", |s| {
+    common::wait_for(&cap, WAIT, "emit_levels records", |s| {
+        (0..s.logs.len()).any(|i| s.logs.row(i).source == LogSource::Log)
+    })
+    .await;
+    println!("attach_to_data_ms={}", t0.elapsed().as_millis());
+    common::wait_for(&cap, WAIT, "emit_levels records", |s| {
         (0..s.logs.len()).any(|i| {
             let r = s.logs.row(i);
             r.source == LogSource::Log && r.logger == "jank_lab.net" && r.level == LogLevel::Debug
@@ -155,7 +157,6 @@ async fn run(rt: &CaptureRuntime, vm_uri: &str) {
     })
     .await;
     println!("first_log_ms={}", t_logs.elapsed().as_millis());
-    let _ = snap;
     act(&vm, &iso, "print_burst").await;
     act(&vm, &iso, "multi_line").await;
     act(&vm, &iso, "report_error").await;
@@ -262,6 +263,24 @@ async fn run(rt: &CaptureRuntime, vm_uri: &str) {
     assert!(ws.websocket && snap.net.socket_for(ws.id).is_some());
 
     // Hot restart: the capture must keep recording in the same run.
+    // `flutter run` always registers `hotRestart` in debug; only profile may lack it.
+    let hot_restart = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(n) = notes.recv().await {
+            if let Some(StreamEvent::ServiceRegistered { method, .. }) = decode_notification(&n)
+                && method.ends_with("hotRestart")
+            {
+                return Some(method);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten();
+    assert!(
+        hot_restart.is_some() || !is_debug,
+        "no hotRestart service registered in a debug app"
+    );
     match hot_restart {
         Some(method) => {
             let before = snap.net.len();
