@@ -64,6 +64,8 @@ pub struct MainWindow {
     focus: FocusHandle,
     palette: Option<Entity<PaletteModel>>,
     session: Entity<SessionModel>,
+    /// Whether the last status seen was `Connected`, so only a new connection leaves Start.
+    was_connected: bool,
     _appearance: gpui_kit::Subscription,
     _session_subs: [gpui_kit::Subscription; 2],
 }
@@ -83,6 +85,7 @@ impl MainWindow {
             this.appearance_changed(os, window, cx);
         });
         window.focus(&focus, cx);
+        let was_connected = matches!(session.read(cx).status(), ConnStatus::Connected { .. });
         let observed = cx.observe(&session, |_, _, cx| cx.notify());
         let connected = cx.subscribe_in(&session, window, |this, _, event, window, cx| {
             if *event == SessionEvent::Status {
@@ -96,6 +99,7 @@ impl MainWindow {
             focus,
             palette: None,
             session,
+            was_connected,
             _appearance: appearance,
             _session_subs: [observed, connected],
         }
@@ -108,7 +112,9 @@ impl MainWindow {
     /// Leaves the start page for Logs once an app is connected.
     fn status_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let connected = matches!(self.session.read(cx).status(), ConnStatus::Connected { .. });
-        if connected && self.current().page == Page::Start {
+        let started = connected && !self.was_connected;
+        self.was_connected = connected;
+        if started && self.current().page == Page::Start {
             self.show(Tool::Logs, window, cx);
         }
     }

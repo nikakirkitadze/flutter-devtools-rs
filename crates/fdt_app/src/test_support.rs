@@ -72,6 +72,7 @@ pub fn open_shell_fake(
 
 /// A capture stand-in: records every command and replays whatever the test sends.
 pub struct FakeCapture {
+    dropped: Rc<std::cell::Cell<bool>>,
     log: Rc<RefCell<Vec<String>>>,
     status: watch::Receiver<ConnStatus>,
     snaps: watch::Receiver<Arc<Snapshot>>,
@@ -79,6 +80,8 @@ pub struct FakeCapture {
 
 /// The test's side of a [`FakeCapture`].
 pub struct FakeHandle {
+    /// Set when the `FakeCapture` is dropped.
+    pub dropped: Rc<std::cell::Cell<bool>>,
     pub log: Rc<RefCell<Vec<String>>>,
     pub status: watch::Sender<ConnStatus>,
     pub snaps: watch::Sender<Arc<Snapshot>>,
@@ -94,18 +97,27 @@ pub fn fake_capture() -> (FakeCapture, FakeHandle) {
     let log = Rc::new(RefCell::new(Vec::new()));
     let (status_tx, status) = watch::channel(ConnStatus::Idle);
     let (snaps_tx, snaps) = watch::channel(Arc::new(Snapshot::empty()));
+    let dropped = Rc::new(std::cell::Cell::new(false));
     (
         FakeCapture {
+            dropped: dropped.clone(),
             log: log.clone(),
             status,
             snaps,
         },
         FakeHandle {
+            dropped,
             log,
             status: status_tx,
             snaps: snaps_tx,
         },
     )
+}
+
+impl Drop for FakeCapture {
+    fn drop(&mut self) {
+        self.dropped.set(true);
+    }
 }
 
 impl FakeCapture {

@@ -28,7 +28,13 @@ pub struct SessionModel {
     snapshot: Arc<Snapshot>,
     status: ConnStatus,
     control: Option<Box<dyn CaptureControl>>,
+    /// Recording time shown by the chip: `accrued` plus the time since `running_since`, as of
+    /// the last tick.
     elapsed: Duration,
+    /// Recording time from earlier stretches of the same run (before a pause).
+    accrued: Duration,
+    /// When the current recording stretch began, on the executor clock.
+    running_since: Option<std::time::Instant>,
     /// The run whose recording time `elapsed` counts.
     clock_run: Option<RunId>,
     clock: Option<Task<()>>,
@@ -88,6 +94,8 @@ impl SessionModel {
             status: ConnStatus::Idle,
             control: None,
             elapsed: Duration::ZERO,
+            accrued: Duration::ZERO,
+            running_since: None,
             clock_run: None,
             clock: None,
             watchers: Vec::new(),
@@ -109,6 +117,11 @@ impl SessionModel {
     /// Starts following `control`, replacing any capture attached before.
     pub fn attach(&mut self, control: Box<dyn CaptureControl>, cx: &mut Context<Self>) {
         self.host_wait = None;
+        // A re-attach replaces the control; the old registration is dropped with it.
+        let me = cx.weak_entity();
+        let open = cx.default_global::<OpenSessions>();
+        open.0.retain(|w| w.upgrade().is_some() && *w != me);
+        open.0.push(me);
         let mut status_rx = control.status();
         let mut snap_rx = control.snapshots();
         self.control = Some(control);
@@ -143,8 +156,6 @@ impl SessionModel {
                 }
             }),
         ];
-        let me = cx.weak_entity();
-        cx.default_global::<OpenSessions>().0.push(me);
         cx.notify();
         cx.emit(SessionEvent::Snapshot);
     }
@@ -157,20 +168,33 @@ impl SessionModel {
                 ..
             }
         );
+        let now = cx.background_executor().now();
         if let ConnStatus::Connected { run, .. } = &status
             && self.clock_run != Some(*run)
         {
             self.clock_run = Some(*run);
+            self.accrued = Duration::ZERO;
+            self.running_since = None;
             self.elapsed = Duration::ZERO;
         }
+        // Fold the stretch that just ended, then start a new one if still recording.
+        if let Some(since) = self.running_since.take() {
+            self.accrued += now.saturating_duration_since(since);
+        }
+        self.elapsed = self.accrued;
+        self.running_since = recording.then_some(now);
         self.status = status;
         if recording {
             if self.clock.is_none() {
                 self.clock = Some(cx.spawn(async move |this, cx| {
                     loop {
                         cx.background_executor().timer(CLOCK_TICK).await;
+                        let now = cx.background_executor().now();
                         let ticked = this.update(cx, |model, cx| {
-                            model.elapsed += CLOCK_TICK;
+                            if let Some(since) = model.running_since {
+                                model.elapsed =
+                                    model.accrued + now.saturating_duration_since(since);
+                            }
                             cx.notify();
                         });
                         if ticked.is_err() {
@@ -349,6 +373,17 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn recording_clock_follows_wall_time_not_tick_count(cx: &mut TestAppContext) {
+        let (_shell, cx, fake) = open_shell_fake(cx);
+        fake.status.send(connected("jank_lab", true)).unwrap();
+        cx.run_until_parked();
+        // One long stall: a single timer wake must still show the true elapsed time.
+        cx.executor().advance_clock(Duration::from_secs(90));
+        cx.run_until_parked();
+        assert_eq!(label(cx, "rec-chip").unwrap(), "Rec 1:30");
+    }
+
+    #[gpui_kit::test]
     fn cmd_n_starts_a_new_session(cx: &mut TestAppContext) {
         let (_shell, cx, fake) = open_shell_fake(cx);
         press(cx, "cmd-n", "ctrl-n");
@@ -392,6 +427,76 @@ mod tests {
         click(cx, "banner-connect");
         assert_eq!(page(&shell, cx), Page::Start);
         assert!(!exists(cx, "disconnected-banner"), "tool pages only");
+    }
+
+    #[gpui_kit::test]
+    fn status_changes_while_connected_do_not_leave_the_start_page(cx: &mut TestAppContext) {
+        let (shell, cx, fake) = open_shell_fake(cx);
+        fake.status.send(connected("jank_lab", true)).unwrap();
+        cx.run_until_parked();
+        assert_eq!(page(&shell, cx), Page::Tool(Tool::Logs));
+        click(cx, "connection-chip");
+        assert_eq!(page(&shell, cx), Page::Start);
+        fake.status.send(connected("jank_lab", false)).unwrap();
+        cx.run_until_parked();
+        assert_eq!(page(&shell, cx), Page::Start, "pausing must not navigate");
+        fake.status.send(connected("jank_lab", true)).unwrap();
+        cx.run_until_parked();
+        assert_eq!(page(&shell, cx), Page::Start, "resuming must not navigate");
+        // A new connection (after a disconnect) does.
+        fake.status.send(disconnected(false)).unwrap();
+        cx.run_until_parked();
+        assert_eq!(page(&shell, cx), Page::Start);
+        fake.status.send(connected("jank_lab", true)).unwrap();
+        cx.run_until_parked();
+        assert_eq!(page(&shell, cx), Page::Tool(Tool::Logs));
+    }
+
+    #[gpui_kit::test]
+    fn a_window_opened_after_the_host_exists_attaches_immediately(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        crate::test_support::init(cx);
+        cx.update(|cx| {
+            CaptureHost::install_with(cx, crate::app::tests::empty_discovery(dir.path()))
+        });
+        let (shell, cx) = open_shell_with(cx, SessionModel::new);
+        let attached = shell.read_with(cx, |s, cx| s.session().read(cx).control().is_some());
+        assert!(attached);
+    }
+
+    /// The window owns its session, which owns its capture: when the session is released (as
+    /// closing the window does), the capture goes with it. A window's session is held only by
+    /// its shell, so releasing the shell is enough.
+    #[gpui_kit::test]
+    fn releasing_a_session_drops_its_capture(cx: &mut TestAppContext) {
+        crate::test_support::init(cx);
+        let (fake, handle) = crate::test_support::fake_capture();
+        let session = cx.update(|cx| {
+            let session = cx.new(SessionModel::new);
+            session.update(cx, |s, cx| s.attach(Box::new(fake), cx));
+            session
+        });
+        cx.run_until_parked();
+        assert!(!handle.dropped.get());
+        drop(session);
+        for _ in 0..2 {
+            cx.update(|_| {});
+            cx.run_until_parked();
+        }
+        assert!(
+            handle.dropped.get(),
+            "the capture must be dropped with its session"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn re_attaching_registers_the_session_once(cx: &mut TestAppContext) {
+        let (shell, cx, _fake) = open_shell_fake(cx);
+        let session = shell.read_with(cx, |s, _| s.session().clone());
+        let (second, second_handle) = crate::test_support::fake_capture();
+        session.update(cx, |s, cx| s.attach(Box::new(second), cx));
+        cx.update(|_, cx| for_each_control(cx, |c| c.set_free_app_http_memory(true)));
+        assert_eq!(second_handle.commands(), ["set_free_app_http_memory(true)"]);
     }
 
     #[gpui_kit::test]

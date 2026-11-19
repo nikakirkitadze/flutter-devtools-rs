@@ -281,7 +281,7 @@ fn after_next_paint(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::settings::SettingsStore;
     use gpui_kit::TestAppContext;
@@ -296,8 +296,12 @@ mod tests {
         }
     }
 
+    /// What this proves: opening the window does not build the host (absent after `start` and
+    /// after the executor settles), and the deferred install step, once it runs, builds it and
+    /// attaches the first window. That the step runs only after the first frame rests on
+    /// `on_next_frame`, which gpui's public test API cannot drive; it was checked by hand.
     #[gpui_kit::test]
-    fn capture_host_installs_after_the_first_frame(cx: &mut TestAppContext) {
+    fn host_is_absent_at_window_open_and_attached_by_the_deferred_install(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let config = empty_discovery(dir.path());
         let shell = cx.update(|cx| {
