@@ -6,6 +6,7 @@ mod capture;
 mod config;
 mod connect;
 mod ingest;
+mod lifecycle;
 mod runtime;
 mod status;
 

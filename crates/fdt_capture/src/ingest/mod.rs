@@ -9,7 +9,7 @@ pub(crate) mod logs;
 pub(crate) mod sockets;
 pub(crate) mod stdout;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fdt_store::clock::{Calibration, RunClock};
@@ -32,14 +32,18 @@ pub(crate) enum Ingest {
     /// The session creates its store at the first of these, so its origin is the first success.
     StartRun {
         app: Box<AppInfo>,
+        /// `getVM.startTime`; with the pid it tells a restarted app from a dropped connection.
+        vm_start_time: Option<i64>,
         calibration: Calibration,
-        reply: oneshot::Sender<(RunId, RunClock)>,
+        reply: oneshot::Sender<SharedSink>,
     },
     /// The connect sequence failed.
     Failed {
         message: String,
         details: String,
     },
+    /// The socket closed after the run started, on its own or by the app quitting.
+    Closed,
     Log(LogInput),
     Frame(FrameInput),
     FlutterVersion {
@@ -104,9 +108,28 @@ impl Sink {
     }
 }
 
+/// The sink of the current run. The session swaps it when a new session starts on the same
+/// connection; work already under way keeps the old sink, so its results are dropped as stale.
+#[derive(Clone)]
+pub(crate) struct SharedSink(Arc<Mutex<Sink>>);
+
+impl SharedSink {
+    pub(crate) fn new(sink: Sink) -> SharedSink {
+        SharedSink(Arc::new(Mutex::new(sink)))
+    }
+
+    pub(crate) fn get(&self) -> Sink {
+        self.0.lock().unwrap().clone()
+    }
+
+    pub(crate) fn set(&self, sink: Sink) {
+        *self.0.lock().unwrap() = sink;
+    }
+}
+
 /// Routes decoded events of one run. Owned by the connection task.
 pub(crate) struct Router {
-    sink: Sink,
+    sink: SharedSink,
     svc: VmService,
     main_isolate: String,
     logging: mpsc::UnboundedSender<logs::LoggingEvent>,
@@ -118,7 +141,7 @@ pub(crate) struct Router {
 
 impl Router {
     pub(crate) fn new(
-        sink: Sink,
+        sink: SharedSink,
         svc: VmService,
         main_isolate: String,
         stdout_flush: Duration,
@@ -172,8 +195,9 @@ impl Router {
                     }
                 };
                 self.last_ts[slot] = timestamp_ms;
+                let sink = self.sink.get();
                 for line in lines.push(&bytes, Instant::now()) {
-                    self.sink.log(timestamp_ms, level, source, line);
+                    sink.log(timestamp_ms, level, source, line);
                 }
             }
             StreamEvent::Extension {
@@ -185,7 +209,7 @@ impl Router {
             StreamEvent::ServiceRegistered { method, .. } if method.ends_with("flutterVersion") => {
                 let svc = self.svc.clone();
                 let isolate = self.main_isolate.clone();
-                let sink = self.sink.clone();
+                let sink = self.sink.get();
                 tokio::spawn(async move {
                     match svc.flutter_version(&method, &isolate).await {
                         Ok(v) => {
@@ -201,6 +225,12 @@ impl Router {
                 });
             }
             StreamEvent::IsolateExit { isolate } => self.net.stop(&isolate.id),
+            // A hot restart: the old main isolate exits and a new one starts, in the same run.
+            StreamEvent::IsolateStart { isolate }
+                if isolate.name == "main" && !isolate.is_system_isolate =>
+            {
+                self.main_isolate = isolate.id;
+            }
             StreamEvent::ServiceExtensionAdded { isolate, rpc } if rpc == http::ENABLE_RPC => {
                 self.net.start(&isolate.id);
             }
@@ -211,19 +241,21 @@ impl Router {
     fn on_extension(&mut self, kind: &str, data: &Value, timestamp_ms: i64) {
         match kind {
             "Flutter.Error" => {
-                let st = self.sink.clock.from_epoch_ms(timestamp_ms);
-                self.sink
-                    .send(Ingest::Log(flutter_error::record(self.sink.run, st, data)));
+                let sink = self.sink.get();
+                let st = sink.clock.from_epoch_ms(timestamp_ms);
+                sink.send(Ingest::Log(flutter_error::record(sink.run, st, data)));
             }
             "Flutter.Navigation" => {
                 if let Some(text) = navigation_text(data) {
                     self.sink
+                        .get()
                         .log(timestamp_ms, LogLevel::Info, LogSource::Navigation, text);
                 }
             }
             "Flutter.Frame" => {
-                if let Some(f) = frames::frame_input(&self.sink, data) {
-                    self.sink.send(Ingest::Frame(f));
+                let sink = self.sink.get();
+                if let Some(f) = frames::frame_input(&sink, data) {
+                    sink.send(Ingest::Frame(f));
                 }
             }
             _ => {}
@@ -241,10 +273,12 @@ impl Router {
     pub(crate) fn flush_due(&mut self, now: Instant) {
         if let Some(line) = self.stdout.flush_due(now) {
             self.sink
+                .get()
                 .log(self.last_ts[0], LogLevel::Info, LogSource::Stdout, line);
         }
         if let Some(line) = self.stderr.flush_due(now) {
             self.sink
+                .get()
                 .log(self.last_ts[1], LogLevel::Error, LogSource::Stderr, line);
         }
     }

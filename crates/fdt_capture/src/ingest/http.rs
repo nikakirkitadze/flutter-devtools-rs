@@ -17,12 +17,12 @@ use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
 
-use super::{Ingest, Sink, sockets};
+use super::{Ingest, SharedSink, sockets};
 
 pub(crate) const ENABLE_RPC: &str = "ext.dart.io.httpEnableTimelineLogging";
 const MAX_FETCHES_PER_RUN: usize = 4;
 pub(crate) const TIMEOUT_REASON: &str = "The body took too long to copy.";
-pub(crate) const RECONNECT_REASON: &str = "Reconnect to the app to load the rest.";
+pub(crate) const STOPPED_REASON: &str = "The app stopped before the body was copied.";
 
 /// Maps one profile entry onto the store's update. HTTP profile times are epoch microseconds.
 pub(crate) fn to_update(entry: &HttpProfileEntry, clock: &RunClock, run: RunId) -> HttpUpdate {
@@ -125,7 +125,7 @@ pub(crate) enum FetchMode {
 /// its own task, so polling and event ingest never wait for one.
 pub(crate) struct BodyFetcher {
     svc: VmService,
-    sink: Sink,
+    sink: SharedSink,
     permits: Semaphore,
     timeout: Duration,
     in_flight: Mutex<HashMap<String, usize>>,
@@ -143,7 +143,7 @@ impl Drop for Counted<'_> {
 }
 
 impl BodyFetcher {
-    pub(crate) fn new(svc: VmService, sink: Sink, timeout: Duration) -> BodyFetcher {
+    pub(crate) fn new(svc: VmService, sink: SharedSink, timeout: Duration) -> BodyFetcher {
         BodyFetcher {
             svc,
             sink,
@@ -178,11 +178,13 @@ impl BodyFetcher {
             .entry(isolate.clone())
             .or_insert(0) += 1;
         let me = self.clone();
+        // Stamped now: a result that lands after a new session started is dropped as stale.
+        let sink = self.sink.get();
         tokio::spawn(async move {
             let _count = Counted(&me, isolate.clone());
             let result = me.fetch(&isolate, &vm_id, mode).await;
             // Sent before the count drops, so the session sees the body before any later poll.
-            me.sink.send(Ingest::Body { id, result });
+            sink.send(Ingest::Body { id, result });
         });
     }
 
@@ -194,6 +196,7 @@ impl BodyFetcher {
         let failed = |e: RpcError| {
             let reason = match e {
                 RpcError::Timeout => TIMEOUT_REASON.to_string(),
+                RpcError::Closed => STOPPED_REASON.to_string(),
                 e => e.to_string(),
             };
             match mode {
@@ -244,7 +247,7 @@ pub(crate) struct PollerConfig {
 
 /// One poller task per isolate that exposes the HTTP profile.
 pub(crate) struct NetHub {
-    sink: Sink,
+    sink: SharedSink,
     svc: VmService,
     fetcher: Arc<BodyFetcher>,
     cfg: Arc<PollerConfig>,
@@ -253,7 +256,7 @@ pub(crate) struct NetHub {
 
 impl NetHub {
     pub(crate) fn new(
-        sink: Sink,
+        sink: SharedSink,
         svc: VmService,
         fetcher: Arc<BodyFetcher>,
         cfg: PollerConfig,
@@ -298,7 +301,7 @@ impl Drop for NetHub {
 }
 
 async fn poll_isolate(
-    sink: Sink,
+    shared: SharedSink,
     svc: VmService,
     fetcher: Arc<BodyFetcher>,
     cfg: Arc<PollerConfig>,
@@ -325,6 +328,7 @@ async fn poll_isolate(
     loop {
         tokio::select! {
             _ = http.tick() => {
+                let sink = shared.get();
                 let profile = match svc.get_http_profile(&isolate, since).await {
                     Ok(p) => p,
                     Err(RpcError::Closed) => return,
@@ -362,6 +366,7 @@ async fn poll_isolate(
                 }
             }
             _ = sock.tick() => {
+                let sink = shared.get();
                 if has_websocket && !sockets::poll(&sink, &svc, &isolate).await {
                     return;
                 }
@@ -380,6 +385,14 @@ pub(crate) struct NetState {
     websocket_isolates: HashSet<String>,
     /// Full-body reloads in flight.
     loading: HashSet<(EntryId, BodyKind)>,
+    /// Requests whose bodies are `Pending`.
+    pending: HashSet<EntryId>,
+    /// Requests `(isolate, vm_id)` the store must never see: made while paused, or still open
+    /// when a new session started.
+    ignored: HashSet<(String, String)>,
+    /// Sockets `(isolate, vm_id)` that are stored, and those made while paused.
+    known_sockets: HashSet<(String, String)>,
+    ignored_sockets: HashSet<(String, String)>,
 }
 
 impl NetState {
@@ -391,6 +404,61 @@ impl NetState {
     pub(crate) fn new_run(&mut self) {
         self.incomplete.clear();
         self.websocket_isolates.clear();
+        self.loading.clear();
+    }
+
+    /// The run is over: bodies still being copied never will be, and nothing can be fetched.
+    pub(crate) fn end_run(&mut self, w: &mut SessionWriter) {
+        for id in self.pending.drain() {
+            for kind in [BodyKind::Request, BodyKind::Response] {
+                w.set_body_state(
+                    id,
+                    kind,
+                    BodyState::Unavailable {
+                        reason: STOPPED_REASON.to_string(),
+                    },
+                );
+            }
+        }
+        self.fetcher = None;
+        self.new_run();
+    }
+
+    /// A new session starts on the same connection: forget the old one's requests, and ignore
+    /// those still open, which would otherwise show up half-finished.
+    pub(crate) fn new_session(&mut self) {
+        for (isolate, open) in self.incomplete.drain() {
+            self.ignored
+                .extend(open.into_iter().map(|vm_id| (isolate.clone(), vm_id)));
+        }
+        self.keys.clear();
+        self.pending.clear();
+        self.loading.clear();
+        self.websocket_isolates.clear();
+        self.known_sockets.clear();
+    }
+
+    /// Sockets arrive whole on every poll, so while paused they are only noted.
+    pub(crate) fn sockets(
+        &mut self,
+        w: &mut SessionWriter,
+        recording: bool,
+        updates: Vec<fdt_store::net::SocketUpdate>,
+    ) {
+        for u in updates {
+            let key = (u.isolate.clone(), u.vm_id.clone());
+            if self.ignored_sockets.contains(&key) {
+                continue;
+            }
+            if !recording {
+                if !self.known_sockets.contains(&key) {
+                    self.ignored_sockets.insert(key);
+                }
+                continue;
+            }
+            self.known_sockets.insert(key);
+            w.upsert_socket(u);
+        }
     }
 
     pub(crate) fn poll(
@@ -399,10 +467,29 @@ impl NetState {
         auto_fetch_limit: u64,
         isolate: &str,
         updates: Vec<HttpUpdate>,
+        recording: bool,
     ) -> PollReply {
         let mut fetch = Vec::new();
         for u in updates {
             let (vm_id, complete, websocket) = (u.vm_id.clone(), u.end.is_some(), u.websocket);
+            let key = (isolate.to_string(), vm_id.clone());
+            if self.ignored.contains(&key) {
+                if complete {
+                    self.ignored.remove(&key);
+                }
+                continue;
+            }
+            // While paused, only requests that were already open when it began are completed.
+            let known_open = self
+                .incomplete
+                .get(isolate)
+                .is_some_and(|s| s.contains(&vm_id));
+            if !recording && !known_open {
+                if !complete {
+                    self.ignored.insert(key);
+                }
+                continue;
+            }
             let len = u.response_content_length;
             let up = w.upsert_request(u);
             self.keys
@@ -429,6 +516,7 @@ impl NetState {
                     );
                 }
                 _ => {
+                    self.pending.insert(up.id);
                     w.set_body_state(up.id, BodyKind::Request, BodyState::Pending);
                     w.set_body_state(up.id, BodyKind::Response, BodyState::Pending);
                     fetch.push((up.id, vm_id));
@@ -449,6 +537,7 @@ impl NetState {
         };
         match result {
             Fetched::Auto { request, response } => {
+                self.pending.remove(&id);
                 store(w, BodyKind::Request, request);
                 store(w, BodyKind::Response, response);
             }
@@ -464,6 +553,7 @@ impl NetState {
                 log::debug!("loading the full body failed: {reason}");
             }
             Fetched::Failed { kinds, reason } => {
+                self.pending.remove(&id);
                 for kind in kinds {
                     w.set_body_state(
                         id,
@@ -477,31 +567,20 @@ impl NetState {
         }
     }
 
-    /// Fetches a whole body again. Only possible while connected to the request's run.
-    pub(crate) fn load_full(
-        &mut self,
-        w: &mut SessionWriter,
-        id: EntryId,
-        kind: BodyKind,
-        connected_run: Option<RunId>,
-    ) {
+    /// Fetches a whole body again. Only possible while connected to the request's run; for any
+    /// other run the stored body stays as it is (the UI explains why it can't be loaded).
+    pub(crate) fn load_full(&mut self, id: EntryId, kind: BodyKind, connected_run: Option<RunId>) {
         let Some((isolate, vm_id)) = self.keys.get(&id).cloned() else {
             return;
         };
-        match &self.fetcher {
-            Some(f) if connected_run == Some(id.run) => {
-                if !self.loading.insert((id, kind)) {
-                    return;
-                }
-                f.spawn(isolate, id, vm_id, FetchMode::Full(kind));
-            }
-            _ => w.set_body_state(
-                id,
-                kind,
-                BodyState::Unavailable {
-                    reason: RECONNECT_REASON.to_string(),
-                },
-            ),
+        if connected_run != Some(id.run) {
+            return;
+        }
+        let Some(f) = &self.fetcher else {
+            return;
+        };
+        if self.loading.insert((id, kind)) {
+            f.spawn(isolate, id, vm_id, FetchMode::Full(kind));
         }
     }
 }

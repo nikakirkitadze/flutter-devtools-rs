@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::capture::{SessionMsg, Target};
 use crate::config::CaptureConfig;
 use crate::ingest::http::{BodyFetcher, ENABLE_RPC, NetHub, PollerConfig};
-use crate::ingest::{Ingest, Router, Sink};
+use crate::ingest::{Ingest, Router};
 
 const STREAMS: [&str; 6] = [
     "Logging",
@@ -35,8 +35,8 @@ struct Fail {
 impl Fail {
     fn rpc(e: fdt_vm::rpc::RpcError) -> Fail {
         Fail {
-            message: e.to_string(),
-            details: format!("{e:?}"),
+            message: "Connected, but the app didn't answer as expected.".to_string(),
+            details: format!("{e} ({e:?})"),
         }
     }
 }
@@ -98,7 +98,10 @@ pub(crate) async fn run(
     free_app_memory: Arc<AtomicBool>,
 ) {
     match connect_and_ingest(target, &cfg, conn, &tx, free_app_memory).await {
-        Ok(reason) => log::info!("connection ended: {reason}"),
+        Ok(reason) => {
+            log::info!("connection ended: {reason}");
+            let _ = tx.send(SessionMsg::Ingest(conn, Ingest::Closed));
+        }
         Err(f) => {
             log::info!("connect failed: {}", f.message);
             let _ = tx.send(SessionMsg::Ingest(
@@ -188,21 +191,21 @@ async fn connect_and_ingest(
         conn,
         Ingest::StartRun {
             app: Box::new(app),
+            vm_start_time: vm.start_time,
             calibration,
             reply,
         },
     ));
-    let (run, clock) = run_rx.await.map_err(|_| Fail {
+    let sink = run_rx.await.map_err(|_| Fail {
         message: "The session closed.".into(),
         details: String::new(),
     })?;
-    let sink = Sink::new(run, clock, conn, tx.clone());
     let fetcher = Arc::new(BodyFetcher::new(
         svc.clone(),
         sink.clone(),
         cfg.body_fetch_timeout,
     ));
-    sink.send(Ingest::NetReady(fetcher.clone()));
+    sink.get().send(Ingest::NetReady(fetcher.clone()));
     let mut hub = NetHub::new(
         sink.clone(),
         svc.clone(),

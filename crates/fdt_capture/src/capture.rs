@@ -3,9 +3,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use fdt_store::clock::{RunClock, host_now_us};
 use fdt_store::net::{BodyKind, BodyLimits};
-use fdt_store::time::{EntryId, RunId, SessionTime};
+use fdt_store::time::{EntryId, RunId};
 use fdt_store::{SessionWriter, Snapshot};
 use fdt_vm::discovery::DiscoveredApp;
 use fdt_vm::uri::VmServiceUri;
@@ -15,12 +14,13 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 
 use crate::config::CaptureConfig;
-use crate::connect;
 use crate::ingest::Ingest;
 use crate::ingest::http::NetState;
+use crate::lifecycle::Lifecycle;
 use crate::status::ConnStatus;
 
 /// What to connect to.
+#[derive(Clone)]
 pub enum Target {
     Discovered(DiscoveredApp),
     Uri(VmServiceUri),
@@ -64,20 +64,14 @@ impl Capture {
         let (status_tx, status) = watch::channel(ConnStatus::Idle);
         let (snap_tx, snaps) = watch::channel(Arc::new(Snapshot::empty()));
         let free_app_memory = Arc::new(AtomicBool::new(config.free_app_http_memory));
-        let session = Session {
-            cfg: config,
-            _discovery: discovery,
-            tx: tx.downgrade(),
-            status: status_tx,
-            conn_gen: 0,
+        let session = Session::new(
+            config,
+            discovery,
+            tx.downgrade(),
+            status_tx,
             snap_tx,
-            writer: None,
-            conn: None,
-            current_run: None,
-            last_publish: None,
-            net: NetState::default(),
             free_app_memory,
-        };
+        );
         handle.spawn(session.run(rx));
         Capture { tx, status, snaps }
     }
@@ -134,36 +128,67 @@ impl Drop for Capture {
     }
 }
 
-struct Session {
-    cfg: CaptureConfig,
-    _discovery: Option<watch::Receiver<Arc<[DiscoveredApp]>>>,
+pub(crate) struct Session {
+    pub(crate) cfg: CaptureConfig,
+    discovery: Option<watch::Receiver<Arc<[DiscoveredApp]>>>,
     /// Weak: only connection tasks (and the `Capture`) keep the channel open.
-    tx: mpsc::WeakUnboundedSender<SessionMsg>,
+    pub(crate) tx: mpsc::WeakUnboundedSender<SessionMsg>,
     /// Only the session task writes the status.
-    status: watch::Sender<ConnStatus>,
+    pub(crate) status: watch::Sender<ConnStatus>,
     /// The current connection's generation; messages from older ones are stale.
-    conn_gen: u64,
+    pub(crate) conn_gen: u64,
     snap_tx: watch::Sender<Arc<Snapshot>>,
     /// Created at the first successful connect, because its origin is that moment.
-    writer: Option<SessionWriter>,
-    conn: Option<JoinHandle<()>>,
-    current_run: Option<RunId>,
+    pub(crate) writer: Option<SessionWriter>,
+    pub(crate) conn: Option<JoinHandle<()>>,
+    pub(crate) current_run: Option<RunId>,
     last_publish: Option<Instant>,
-    net: NetState,
+    pub(crate) net: NetState,
     /// Read live by the pollers.
-    free_app_memory: Arc<AtomicBool>,
+    pub(crate) free_app_memory: Arc<AtomicBool>,
+    pub(crate) life: Lifecycle,
 }
 
 impl Session {
+    fn new(
+        cfg: CaptureConfig,
+        discovery: Option<watch::Receiver<Arc<[DiscoveredApp]>>>,
+        tx: mpsc::WeakUnboundedSender<SessionMsg>,
+        status: watch::Sender<ConnStatus>,
+        snap_tx: watch::Sender<Arc<Snapshot>>,
+        free_app_memory: Arc<AtomicBool>,
+    ) -> Session {
+        Session {
+            cfg,
+            discovery,
+            tx,
+            status,
+            conn_gen: 0,
+            snap_tx,
+            writer: None,
+            conn: None,
+            current_run: None,
+            last_publish: None,
+            net: NetState::default(),
+            free_app_memory,
+            life: Lifecycle::new(),
+        }
+    }
+
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<SessionMsg>) {
         let mut due: Option<Instant> = None;
+        let mut discovery = self.discovery.take();
         loop {
+            let retry_due = self.life.retry_due();
             tokio::select! {
                 msg = rx.recv() => match msg {
                     Some(SessionMsg::Command(Command::Shutdown)) => break,
                     Some(SessionMsg::Command(c)) => self.command(c),
                     Some(SessionMsg::Ingest(g, i)) if g == self.conn_gen => self.ingest(i),
-                    Some(SessionMsg::Ingest(g, _)) => log::debug!("ignoring stale connection {g}"),
+                    Some(SessionMsg::Ingest(g, i)) => {
+                        log::debug!("ignoring stale connection {g}");
+                        self.on_stale(i);
+                    }
                     None => break,
                 },
                 _ = async {
@@ -172,6 +197,22 @@ impl Session {
                         None => std::future::pending().await,
                     }
                 } => {}
+                _ = async {
+                    match retry_due {
+                        Some(at) => sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => self.retry_tick(),
+                changed = async {
+                    match &mut discovery {
+                        Some(d) => d.changed().await.map(|()| d.borrow_and_update().clone()),
+                        None => std::future::pending().await,
+                    }
+                } => match changed {
+                    Ok(apps) => self.on_discovery(&apps),
+                    // The discovery side is gone; nothing more will arrive.
+                    Err(_) => discovery = None,
+                },
             }
             due = self.maybe_publish();
         }
@@ -199,26 +240,29 @@ impl Session {
         None
     }
 
+    /// Publishes now, whatever the interval.
+    pub(crate) fn publish_now(&mut self) {
+        if let Some(w) = &mut self.writer {
+            self.snap_tx.send_replace(w.publish());
+            self.last_publish = Some(Instant::now());
+        }
+    }
+
     fn command(&mut self, c: Command) {
         match c {
-            Command::Connect(target) => self.connect(target),
+            Command::Connect(target) => self.begin_connect(target, false),
             Command::SetBodyLimits(l) => {
                 self.cfg.body_limits = l;
                 if let Some(w) = &mut self.writer {
                     w.set_body_limits(l);
                 }
             }
-            // Filled in by later tasks; accepted and ignored for now.
             Command::Shutdown => {} // handled by the run loop
-            Command::Disconnect => log::debug!("command: disconnect"),
-            Command::StopWaiting => log::debug!("command: stop_waiting"),
-            Command::SetRecording(on) => log::debug!("command: set_recording({on})"),
-            Command::NewSession => log::debug!("command: new_session"),
-            Command::LoadFullBody(id, kind) => {
-                if let Some(w) = &mut self.writer {
-                    self.net.load_full(w, id, kind, self.current_run);
-                }
-            }
+            Command::Disconnect => self.disconnect(),
+            Command::StopWaiting => self.stop_waiting(),
+            Command::SetRecording(on) => self.set_recording(on),
+            Command::NewSession => self.new_session(),
+            Command::LoadFullBody(id, kind) => self.net.load_full(id, kind, self.current_run),
             Command::SetFreeAppHttpMemory(on) => {
                 self.cfg.free_app_http_memory = on;
                 self.free_app_memory.store(on, Ordering::Relaxed);
@@ -226,68 +270,33 @@ impl Session {
         }
     }
 
-    fn connect(&mut self, target: Target) {
-        if let Some(old) = self.conn.take() {
-            old.abort();
-        }
-        let Some(tx) = self.tx.upgrade() else {
-            return;
-        };
-        self.conn_gen += 1;
-        self.net.set_fetcher(None);
-        self.status.send_replace(ConnStatus::Connecting {
-            label: connect::label_of(&target),
-        });
-        self.conn = Some(tokio::spawn(connect::run(
-            target,
-            self.cfg.clone(),
-            self.conn_gen,
-            tx,
-            self.free_app_memory.clone(),
-        )));
-    }
-
     fn ingest(&mut self, i: Ingest) {
-        if let Ingest::StartRun {
-            app,
-            calibration,
-            reply,
-        } = i
-        {
-            let limits = self.cfg.body_limits;
-            let w = self.writer.get_or_insert_with(|| {
-                let mut w = SessionWriter::new(host_now_us());
-                w.set_body_limits(limits);
-                w
-            });
-            let clock = RunClock::new(w.origin_host_us(), calibration);
-            let us = (host_now_us() - clock.origin_host_us).max(0) as u64;
-            let id = w.start_run((*app).clone(), clock, SessionTime(us.saturating_mul(1000)));
-            self.current_run = Some(id);
-            self.net.new_run();
-            self.status.send_replace(ConnStatus::Connected {
-                run: id,
-                app: *app,
-                recording: true,
-            });
-            let _ = reply.send((id, clock));
-            return;
+        match i {
+            Ingest::StartRun {
+                app,
+                vm_start_time,
+                calibration,
+                reply,
+            } => return self.start_run(*app, vm_start_time, calibration, reply),
+            Ingest::Failed { message, details } => return self.on_failed(message, details),
+            Ingest::Closed => return self.on_closed(),
+            _ => {}
         }
-        if let Ingest::Failed { message, details } = i {
-            self.status
-                .send_replace(ConnStatus::Failed { message, details });
-            return;
-        }
+        let recording = self.life.recording;
         let Some(w) = self.writer.as_mut() else {
             return;
         };
         match i {
-            Ingest::StartRun { .. } | Ingest::Failed { .. } => {}
+            Ingest::StartRun { .. } | Ingest::Failed { .. } | Ingest::Closed => {}
             Ingest::Log(l) => {
-                w.push_log(l);
+                if recording {
+                    w.push_log(l);
+                }
             }
             Ingest::Frame(f) => {
-                w.push_frame(f);
+                if recording {
+                    w.push_frame(f);
+                }
             }
             Ingest::NetReady(f) => self.net.set_fetcher(Some(f)),
             Ingest::HttpPoll {
@@ -297,17 +306,16 @@ impl Session {
             } => {
                 let r = self
                     .net
-                    .poll(w, self.cfg.auto_fetch_limit, &isolate, updates);
+                    .poll(w, self.cfg.auto_fetch_limit, &isolate, updates, recording);
                 let _ = reply.send(r);
             }
             Ingest::Body { id, result } => self.net.body(w, id, result),
-            Ingest::Sockets(updates) => {
-                for u in updates {
-                    w.upsert_socket(u);
-                }
-            }
+            Ingest::Sockets(updates) => self.net.sockets(w, recording, updates),
             Ingest::FlutterVersion { run, version } => {
                 w.update_run_app(run, |a| a.flutter_version = Some(version.clone()));
+                if let Some(a) = &mut self.life.app {
+                    a.flutter_version = Some(version.clone());
+                }
                 // Keep the status in step with the stored app.
                 self.status.send_if_modified(|st| match st {
                     ConnStatus::Connected { run: r, app, .. } if *r == run => {
@@ -329,20 +337,14 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let (status, _) = watch::channel(ConnStatus::Idle);
         let (snap_tx, _) = watch::channel(Arc::new(Snapshot::empty()));
-        let s = Session {
-            cfg: CaptureConfig::default(),
-            _discovery: None,
-            tx: tx.downgrade(),
+        let s = Session::new(
+            CaptureConfig::default(),
+            None,
+            tx.downgrade(),
             status,
-            conn_gen: 0,
             snap_tx,
-            writer: None,
-            conn: None,
-            current_run: None,
-            last_publish: None,
-            net: NetState::default(),
-            free_app_memory: Arc::new(AtomicBool::new(false)),
-        };
+            Arc::new(AtomicBool::new(false)),
+        );
         (s, tx)
     }
 

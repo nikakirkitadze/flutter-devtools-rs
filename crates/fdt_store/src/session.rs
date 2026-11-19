@@ -177,6 +177,14 @@ impl SessionWriter {
         }
     }
 
+    /// Marks an ended run as running again, for a reconnect to the same VM.
+    pub fn reopen_run(&mut self, run: RunId) {
+        if let Some(r) = self.runs.iter_mut().find(|r| r.id == run) {
+            r.ended = None;
+            self.dirty = true;
+        }
+    }
+
     /// Records that something was stored at `t`.
     pub(crate) fn touch(&mut self, t: SessionTime) {
         self.latest = self.latest.max(t);
@@ -262,5 +270,20 @@ mod tests {
         assert_eq!(s.run(r2).unwrap().ended, None);
         assert_eq!(s.latest_time(), SessionTime(60));
         assert!(s.run(RunId(9)).is_none());
+    }
+
+    #[test]
+    fn a_run_can_be_reopened() {
+        let mut w = SessionWriter::new(0);
+        let r = w.start_run(app(), clock(), SessionTime(10));
+        w.end_run(r, SessionTime(50));
+        w.publish();
+        w.reopen_run(r);
+        assert!(w.is_dirty());
+        let s = w.publish();
+        assert_eq!(s.run(r).unwrap().ended, None);
+        assert_eq!(s.runs.len(), 1);
+        w.reopen_run(RunId(9));
+        assert!(!w.is_dirty());
     }
 }

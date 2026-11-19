@@ -8,7 +8,7 @@ use fdt_vm::service::VmService;
 use fdt_vm::types::InstanceRef;
 use tokio::sync::mpsc;
 
-use super::{Ingest, Sink};
+use super::{Ingest, SharedSink, Sink};
 
 pub(crate) struct LoggingEvent {
     pub(crate) isolate: String,
@@ -21,13 +21,15 @@ pub(crate) struct LoggingEvent {
 }
 
 pub(crate) fn spawn_worker(
-    sink: Sink,
+    sink: SharedSink,
     svc: VmService,
     fetch_timeout: Duration,
 ) -> mpsc::UnboundedSender<LoggingEvent> {
     let (tx, mut rx) = mpsc::unbounded_channel::<LoggingEvent>();
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
+            // The sink of the moment the event arrived decides which session it belongs to.
+            let sink = sink.get();
             let input = build(&sink, &svc, fetch_timeout, ev).await;
             sink.send(Ingest::Log(input));
         }
