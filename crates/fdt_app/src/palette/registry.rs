@@ -208,14 +208,14 @@ pub fn commands() -> Vec<CommandSpec> {
         CommandSpec {
             id: "logs.next",
             label: "Next Row",
-            keywords: &["logs", "down", "select"],
+            keywords: &["logs", "network", "down", "select"],
             group: Group::View,
             action: || Box::new(SelectNext),
         },
         CommandSpec {
             id: "logs.previous",
             label: "Previous Row",
-            keywords: &["logs", "up", "select"],
+            keywords: &["logs", "network", "up", "select"],
             group: Group::View,
             action: || Box::new(SelectPrevious),
         },
@@ -359,11 +359,14 @@ mod tests {
         for b in bindings() {
             let name = b.action().name();
             // The palette opens the palette; the app-list keys only mean something while the
-            // start page's list has focus, so they are not commands.
+            // start page's list has focus, so they are not commands. J and K in a table are the
+            // table's own row movement; the palette's Next Row and Previous Row do the same.
             let list_local = [
                 crate::actions::AppListPrev.name(),
                 crate::actions::AppListNext.name(),
                 crate::actions::AppListConnect.name(),
+                gpui_kit::base::actions::SelectDown.name(),
+                gpui_kit::base::actions::SelectUp.name(),
             ];
             if name == crate::actions::OpenPalette.name() || list_local.contains(&name) {
                 continue;

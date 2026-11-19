@@ -1,6 +1,7 @@
 //! Pieces shared by every tool page.
 
 pub mod logs;
+pub mod network;
 
 use fdt_ui::theme::TokensExt as _;
 use fdt_ui::tokens::{font, space};

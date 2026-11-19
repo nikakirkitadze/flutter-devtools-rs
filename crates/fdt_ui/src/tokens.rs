@@ -262,6 +262,11 @@ pub mod table {
     pub const COL_LEVEL: Pixels = px(48.);
     pub const COL_LOGGER: Pixels = px(140.);
     pub const COL_HOST: Pixels = px(180.);
+    pub const COL_PATH: Pixels = px(360.);
+    pub const COL_URL: Pixels = px(480.);
+    pub const COL_STATE: Pixels = px(88.);
+    pub const COL_BYTES: Pixels = px(96.);
+    pub const COL_ACTIVITY: Pixels = px(120.);
 }
 
 #[cfg(test)]

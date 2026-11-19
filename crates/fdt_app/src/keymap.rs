@@ -8,6 +8,7 @@ use crate::actions::{
 };
 use crate::nav::Tool;
 use gpui_kit::KeyBinding;
+use gpui_kit::base::actions::{SelectDown, SelectUp};
 
 /// Key context of the main shell.
 pub const SHELL_CONTEXT: &str = "Shell";
@@ -23,6 +24,9 @@ pub const APP_LIST_CONTEXT: &str = "AppList";
 /// Key context of the Logs list. The toolbar's search field is outside it, so these keys never
 /// fire while typing.
 pub const LOGS_LIST_CONTEXT: &str = "LogsList";
+
+/// Key context of gpui-kit's data tables.
+pub const TABLE_CONTEXT: &str = "DataTable";
 
 /// `mac` on macOS, `other` everywhere else.
 pub fn platform(mac: &'static str, other: &'static str) -> &'static str {
@@ -88,6 +92,12 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("enter", OpenDetails, logs),
         KeyBinding::new("end", FollowLatest, logs),
         KeyBinding::new("home", GoToFirst, logs),
+    ]);
+    // J and K move through every table's rows, like the arrow keys the table binds itself.
+    let table = Some(TABLE_CONTEXT);
+    out.extend([
+        KeyBinding::new("j", SelectDown, table),
+        KeyBinding::new("k", SelectUp, table),
     ]);
     if cfg!(target_os = "macos") {
         out.extend([

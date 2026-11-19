@@ -5,7 +5,7 @@ mod banner;
 mod counts;
 mod settings_page;
 mod shortcuts;
-mod sidebar;
+pub(crate) mod sidebar;
 pub(crate) mod start_page;
 pub(crate) mod strip;
 mod title_bar;
@@ -25,6 +25,7 @@ use crate::palette::view::{PaletteModel, open_palette};
 use crate::session_model::{SessionEvent, SessionModel};
 use crate::settings::{settings, update_settings};
 use crate::tools::logs::{LogsEvent, LogsView};
+use crate::tools::network::{NetworkEvent, NetworkView};
 use fdt_capture::ConnStatus;
 use fdt_ui::hud::FrameHud;
 use fdt_ui::theme::{self, ThemePreference, TokensExt as _};
@@ -83,11 +84,13 @@ pub struct MainWindow {
     start: Option<Entity<StartPage>>,
     /// The Logs list, kept for the life of the window.
     logs: Entity<LogsView>,
+    /// The Network table, kept for the life of the window.
+    network: Entity<NetworkView>,
     _host_wait: Option<gpui_kit::Subscription>,
     /// Whether the last status seen was `Connected`, so only a new connection leaves Start.
     was_connected: bool,
     _appearance: gpui_kit::Subscription,
-    _session_subs: [gpui_kit::Subscription; 3],
+    _session_subs: [gpui_kit::Subscription; 4],
 }
 
 impl MainWindow {
@@ -133,6 +136,24 @@ impl MainWindow {
                 }
             }
         });
+        let network = cx.new(|cx| NetworkView::new(session.clone(), window, cx));
+        let net_selected = cx.subscribe_in(&network, window, |this, _, event, window, cx| {
+            let mut to = this.current().clone();
+            match *event {
+                NetworkEvent::Selected(id) => {
+                    to.selection = id.map(Selection::Request);
+                    this.navigate(to, window, cx);
+                }
+                NetworkEvent::Moved(id) => {
+                    to.selection = id.map(Selection::Request);
+                    this.replace_location(to, cx);
+                }
+                NetworkEvent::ClearRange => {
+                    to.range = None;
+                    this.navigate(to, window, cx);
+                }
+            }
+        });
         let host_wait = (!cx.has_global::<CaptureHost>()).then(|| {
             cx.observe_global_in::<CaptureHost>(window, |this, window, cx| {
                 this.apps_from_host(window, cx);
@@ -151,10 +172,11 @@ impl MainWindow {
             session,
             start: None,
             logs,
+            network,
             _host_wait: host_wait,
             was_connected,
             _appearance: appearance,
-            _session_subs: [observed, connected, selected],
+            _session_subs: [observed, connected, selected, net_selected],
         };
         this.apps_from_host(window, cx);
         this.refresh_counts(cx);
@@ -218,6 +240,34 @@ impl MainWindow {
         };
         self.logs
             .update(cx, |logs, cx| logs.set_location(loc.range, selection, cx));
+        self.sync_network(cx);
+    }
+
+    /// Whether the Network page shows the table: there are requests, or an app is connected.
+    fn network_routed(&self, cx: &App) -> bool {
+        let session = self.session.read(cx);
+        !session.snapshot().net.is_empty()
+            || matches!(session.status(), ConnStatus::Connected { .. })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn network_view(&self) -> &Entity<NetworkView> {
+        &self.network
+    }
+
+    /// Hands the location's range and selection to the Network table, and tells it whether its
+    /// page is the one on screen.
+    fn sync_network(&mut self, cx: &mut Context<Self>) {
+        let loc = self.current().clone();
+        let selection = match loc.selection {
+            Some(Selection::Request(id)) => Some(id),
+            _ => None,
+        };
+        let active = loc.page == Page::Tool(Tool::Network) && self.network_routed(cx);
+        self.network.update(cx, |net, cx| {
+            net.set_active(active, cx);
+            net.set_location(loc.range, selection, cx);
+        });
     }
 
     /// Puts focus on the Logs list when the user arrives on the Logs page, so its keys work. A
@@ -225,6 +275,17 @@ impl MainWindow {
     fn focus_logs_on_entry(&self, before: Page, window: &mut Window, cx: &mut Context<Self>) {
         if before != Page::Tool(Tool::Logs) {
             self.focus_logs_if_current(window, cx);
+        }
+        if before != Page::Tool(Tool::Network) {
+            self.focus_network_if_current(cx);
+        }
+    }
+
+    /// Asks the Network table to take focus when it is the current page. The table declines
+    /// while an input has focus.
+    fn focus_network_if_current(&self, cx: &mut Context<Self>) {
+        if self.current().page == Page::Tool(Tool::Network) && self.network_routed(cx) {
+            self.network.update(cx, |net, cx| net.request_focus(cx));
         }
     }
 
@@ -237,11 +298,14 @@ impl MainWindow {
         }
     }
 
-    /// Focuses the current tool's search field. Only Logs has one so far.
+    /// Focuses the current tool's search field. Logs and Network have one.
     fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.current().page == Page::Tool(Tool::Logs) && self.logs_routed(cx) {
             self.logs
                 .update(cx, |logs, cx| logs.focus_search(window, cx));
+        } else if self.current().page == Page::Tool(Tool::Network) && self.network_routed(cx) {
+            self.network
+                .update(cx, |net, cx| net.focus_search(window, cx));
         }
     }
 
@@ -263,6 +327,17 @@ impl MainWindow {
         }
     }
 
+    /// Runs `f` on the Network table when it is the current page.
+    fn with_network(
+        &mut self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut NetworkView, &mut Context<NetworkView>),
+    ) {
+        if self.current().page == Page::Tool(Tool::Network) && self.network_routed(cx) {
+            self.network.update(cx, f);
+        }
+    }
+
     /// Leaves the start page for Logs once an app is connected.
     fn status_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let connected = matches!(self.session.read(cx).status(), ConnStatus::Connected { .. });
@@ -272,6 +347,7 @@ impl MainWindow {
             self.show(Tool::Logs, window, cx);
         } else {
             self.focus_logs_if_current(window, cx);
+            self.focus_network_if_current(cx);
         }
     }
 
@@ -451,6 +527,11 @@ impl Render for MainWindow {
                 let strip = self.render_strip(window, cx);
                 tool_page::render_with(Tool::Logs, strip, self.logs.clone()).into_any_element()
             }
+            Page::Tool(Tool::Network) if self.network_routed(cx) => {
+                let strip = self.render_strip(window, cx);
+                tool_page::render_with(Tool::Network, strip, self.network.clone())
+                    .into_any_element()
+            }
             Page::Tool(tool) => {
                 let strip = self.render_strip(window, cx);
                 tool_page::render(tool, strip, cx).into_any_element()
@@ -486,9 +567,11 @@ impl Render for MainWindow {
             .on_action(cx.listener(|this, _: &ShowState, w, cx| this.show(Tool::State, w, cx)))
             .on_action(cx.listener(|this, _: &SelectNext, _, cx| {
                 this.with_logs(cx, |v, cx| v.select_next(cx));
+                this.with_network(cx, |v, cx| v.select_next(cx));
             }))
             .on_action(cx.listener(|this, _: &SelectPrevious, _, cx| {
                 this.with_logs(cx, |v, cx| v.select_previous(cx));
+                this.with_network(cx, |v, cx| v.select_previous(cx));
             }))
             .on_action(cx.listener(|this, _: &ToggleExpand, _, cx| {
                 this.with_logs(cx, |v, cx| v.toggle_expand(cx));

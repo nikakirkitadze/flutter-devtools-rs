@@ -286,3 +286,40 @@ pub fn open_shell_snapshot(
 ) -> (Entity<MainWindow>, &mut VisualTestContext) {
     open_shell_with(cx, move |_| SessionModel::fixed(snapshot, ConnStatus::Idle))
 }
+
+/// Upserts one HTTP request, `start_ms` and `end_ms` in milliseconds on the session axis. The
+/// request is keyed by its start time, so each call with a new start adds a request.
+pub fn request(
+    w: &mut fdt_store::SessionWriter,
+    run: RunId,
+    method: &str,
+    url: &str,
+    status: Option<u16>,
+    start_ms: u64,
+    end_ms: Option<u64>,
+) {
+    use fdt_store::time::SessionTime;
+    const MS: u64 = 1_000_000;
+    w.upsert_request(fdt_store::net::HttpUpdate {
+        run,
+        isolate: "i".into(),
+        vm_id: start_ms.to_string(),
+        method: method.into(),
+        url: url.into(),
+        start: SessionTime(start_ms * MS),
+        start_clamped: false,
+        request_sent: None,
+        response_start: None,
+        end: end_ms.map(|m| SessionTime(m * MS)),
+        status,
+        reason: None,
+        request_headers: vec![],
+        response_headers: vec![],
+        request_content_length: None,
+        response_content_length: None,
+        events: vec![],
+        error: None,
+        websocket: status == Some(101),
+        remote: None,
+    });
+}
