@@ -3,10 +3,10 @@
 use crate::actions::{
     About, ClearSelection, CloseWindow, Collapse, ConnectToApp, Disconnect, Expand, FocusSearch,
     FollowLatest, GoBack, GoForward, GoToFirst, LoadFullBody, Minimize, NewSession, NewWindow,
-    OpenDetails, OpenSettings, Quit, SelectNext, SelectPrevious, ShowLogs, ShowMemory, ShowNetwork,
-    ShowPerformance, ShowShortcuts, ShowState, ShowTimeline, ShowWidgets, StopWaiting,
-    ToggleExpand, ToggleFrameHud, ToggleFullScreen, ToggleRecording, UseDarkTheme, UseLightTheme,
-    UseSystemTheme, Zoom,
+    OpenDetails, OpenSettings, Quit, SearchEverywhere, SelectNext, SelectPrevious, ShowLogs,
+    ShowMemory, ShowNetwork, ShowPerformance, ShowShortcuts, ShowState, ShowTimeline, ShowWidgets,
+    StopWaiting, ToggleExpand, ToggleFrameHud, ToggleFullScreen, ToggleRecording, UseDarkTheme,
+    UseLightTheme, UseSystemTheme, Zoom,
 };
 #[cfg(target_os = "macos")]
 use crate::actions::{Hide, HideOthers, ShowAll};
@@ -17,6 +17,8 @@ pub enum Group {
     View,
     Window,
     App,
+    /// Items built from live data (requests, log searches), never from the command list.
+    Data,
 }
 
 #[derive(Clone)]
@@ -108,6 +110,13 @@ pub fn commands() -> Vec<CommandSpec> {
             keywords: &["find", "filter"],
             group: Group::View,
             action: || Box::new(FocusSearch),
+        },
+        CommandSpec {
+            id: "search.everywhere",
+            label: "Search Everywhere",
+            keywords: &["find", "requests", "logs", "commands"],
+            group: Group::View,
+            action: || Box::new(SearchEverywhere),
         },
         CommandSpec {
             id: "connect.open",

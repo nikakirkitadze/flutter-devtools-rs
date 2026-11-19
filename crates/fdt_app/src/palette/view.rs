@@ -1,147 +1,301 @@
-//! The command palette: a dialog holding a non-filtering `Command` driven by our ranking.
+//! The command palette dialog: our own input and a virtualised list over [`PaletteModel`].
+//!
+//! Commands are listed at once; requests are collected on the background executor when the
+//! palette opens and merged in, because scanning a long session must not block the UI thread.
 
-use super::rank::rank;
+use super::items::{
+    ItemKind, PaletteItem, PaletteModel, REQUEST_ITEM_LIMIT, command_items, request_items,
+};
 use super::recent::record_recent;
-use super::registry::{CommandSpec, haystack};
 use crate::actions::OpenPalette;
-use crate::keymap::shortcut_hint;
+use crate::keymap::{PALETTE_CONTEXT, shortcut_hint};
+use crate::nav::{Page, Tool};
 use crate::settings::{settings, update_settings};
-use crate::shell::dialog_window_actions;
+use crate::shell::{MainWindow, dialog_window_actions};
+use fdt_store::Snapshot;
 use fdt_ui::theme::TokensExt as _;
-use fdt_ui::tokens::{font, layout, radius, space};
-use gpui_kit::component::command::{Command, CommandItem, CommandState};
-use gpui_kit::component::{IndexPath, WindowExt as _};
+use fdt_ui::tokens::{alpha, font, layout, radius, row, space};
+use gpui_kit::base::actions::{SelectDown, SelectUp};
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
 use gpui_kit::{
-    App, AppContext as _, Entity, FocusHandle, Hsla, InteractiveElement as _, ParentElement as _,
-    Styled as _, Window, div, relative,
+    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Hsla, InteractiveElement as _,
+    IntoElement, MouseButton, ParentElement as _, Render, ScrollStrategy, SharedString,
+    Styled as _, Subscription, Task, TestSupportExt as _, UniformListScrollHandle, WeakEntity,
+    Window, div, relative, uniform_list,
 };
 use std::cell::Cell;
+use std::ops::Range;
 use std::rc::Rc;
+use std::sync::Arc;
 
-/// The commands, the current query and the ranked order of the commands.
-pub struct PaletteModel {
-    specs: Vec<CommandSpec>,
-    haystacks: Vec<String>,
-    query: String,
-    ranked: Vec<usize>,
+#[cfg(test)]
+thread_local! {
+    /// Rows built by the list's item closure, for the "only visible rows" test.
+    static ROWS: Cell<usize> = const { Cell::new(0) };
 }
 
-impl PaletteModel {
-    pub fn new(specs: Vec<CommandSpec>, recent_ids: &[String]) -> Self {
-        let haystacks = specs.iter().map(haystack).collect();
-        let mut model = Self {
-            specs,
-            haystacks,
-            query: String::new(),
-            ranked: Vec::new(),
+/// The dialog's content.
+struct PaletteView {
+    model: Entity<PaletteModel>,
+    input: Entity<InputState>,
+    scroll: UniformListScrollHandle,
+    selected: usize,
+    last_query: SharedString,
+    shell: WeakEntity<MainWindow>,
+    shell_focus: FocusHandle,
+    _subs: Vec<Subscription>,
+    _load: Task<()>,
+}
+
+impl PaletteView {
+    fn new(
+        model: Entity<PaletteModel>,
+        shell: WeakEntity<MainWindow>,
+        shell_focus: FocusHandle,
+        snapshot: Arc<Snapshot>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Search commands, requests and logs\u{2026}")
+        });
+        let subs = vec![
+            cx.subscribe_in(
+                &input,
+                window,
+                |this, input, event: &InputEvent, window, cx| {
+                    match event {
+                        InputEvent::Change => {
+                            let value = input.read(cx).value();
+                            // Enter repeats a Change with the same text.
+                            if value != this.last_query {
+                                this.last_query = value.clone();
+                                this.query_changed(&value, cx);
+                            }
+                        }
+                        InputEvent::PressEnter { .. } => this.run(this.selected, window, cx),
+                        _ => {}
+                    }
+                },
+            ),
+            cx.observe(&model, |_, _, cx| cx.notify()),
+        ];
+        // R15: the request scan runs off the UI thread; the commands are usable meanwhile.
+        let scan = cx.background_spawn(async move { request_items(&snapshot, REQUEST_ITEM_LIMIT) });
+        let target = model.clone();
+        let load = cx.spawn(async move |this, cx| {
+            let items = scan.await;
+            this.update(cx, |this, cx| {
+                let recents = settings(cx).recent_commands.clone();
+                target.update(cx, |m, cx| {
+                    m.extend(items, &recents);
+                    cx.notify();
+                });
+                this.selected = 0;
+                this.scroll.scroll_to_item(0, ScrollStrategy::Top);
+            })
+            .ok();
+        });
+        Self {
+            model,
+            input,
+            scroll: UniformListScrollHandle::new(),
+            selected: 0,
+            last_query: SharedString::default(),
+            shell,
+            shell_focus,
+            _subs: subs,
+            _load: load,
+        }
+    }
+
+    fn query_changed(&mut self, query: &str, cx: &mut Context<Self>) {
+        let recents = settings(cx).recent_commands.clone();
+        self.model.update(cx, |m, cx| {
+            m.set_query(query, &recents);
+            cx.notify();
+        });
+        self.selected = 0;
+        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    fn move_selection(&mut self, down: bool, cx: &mut Context<Self>) {
+        let count = self.model.read(cx).row_count();
+        if count == 0 {
+            return;
+        }
+        self.selected = if down {
+            (self.selected + 1).min(count - 1)
+        } else {
+            self.selected.saturating_sub(1)
         };
-        model.set_query("", recent_ids);
-        model
+        self.scroll
+            .scroll_to_item(self.selected, ScrollStrategy::Nearest);
+        cx.notify();
     }
 
-    pub fn set_query(&mut self, query: &str, recent_ids: &[String]) {
-        let recent: Vec<usize> = recent_ids
-            .iter()
-            .filter_map(|id| self.specs.iter().position(|s| s.id == id))
-            .collect();
-        self.query = query.to_string();
-        self.ranked = rank(query, &self.haystacks, &recent);
+    /// Closes the dialog, focuses the shell, then does what `row` stands for.
+    fn run(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let item = {
+            let m = self.model.read(cx);
+            if row >= m.row_count() {
+                return;
+            }
+            m.item(row).clone()
+        };
+        if item.is_command() {
+            update_settings(cx, |s| record_recent(&mut s.recent_commands, &item.id));
+        }
+        window.close_dialog(cx);
+        self.shell_focus.focus(window, cx);
+        match item.kind {
+            ItemKind::Action(make) => window.dispatch_action(make(), cx),
+            ItemKind::Navigate(to) => {
+                self.shell
+                    .update(cx, |shell, cx| shell.navigate(to, window, cx))
+                    .ok();
+            }
+            ItemKind::SearchLogs(query) => {
+                self.shell
+                    .update(cx, |shell, cx| {
+                        let to = shell.current().with_page(Page::Tool(Tool::Logs));
+                        shell.navigate(to, window, cx);
+                        shell
+                            .logs_view()
+                            .update(cx, |logs, cx| logs.set_search(&query, false, window, cx));
+                    })
+                    .ok();
+            }
+        }
     }
 
-    pub fn query(&self) -> &str {
-        &self.query
+    fn render_rows(
+        &mut self,
+        range: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let t = cx.tokens();
+        let model = self.model.read(cx);
+        let end = range.end.min(model.row_count());
+        let mut out = Vec::new();
+        for ix in range.start..end {
+            #[cfg(test)]
+            ROWS.with(|c| c.set(c.get() + 1));
+            let item: &PaletteItem = model.item(ix);
+            let hint = match &item.kind {
+                ItemKind::Action(make) => shortcut_hint(make().as_ref(), &self.shell_focus, window),
+                _ => None,
+            };
+            let selected = ix == self.selected;
+            let mut el = div()
+                .id(SharedString::from(format!("palette-row-{ix}")))
+                .test_support()
+                .flex()
+                .items_center()
+                .gap(space::S8)
+                .w_full()
+                .h(row::TABLE)
+                .px(space::S12)
+                .text_size(font::BODY)
+                .text_color(Hsla::from(t.text))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| this.run(ix, window, cx)),
+                )
+                .child(div().min_w_0().truncate().child(item.label.clone()));
+            if selected {
+                el = el.bg(t.accent.with_alpha(alpha::SELECTION));
+            }
+            if let Some(detail) = &item.detail {
+                el = el.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(Hsla::from(t.text_muted))
+                        .child(detail.clone()),
+                );
+            } else {
+                el = el.child(div().flex_1());
+            }
+            out.push(el.children(hint).into_any_element());
+        }
+        out
     }
+}
 
-    pub fn ranked(&self) -> &[usize] {
-        &self.ranked
-    }
-
-    pub fn spec(&self, index: usize) -> &CommandSpec {
-        &self.specs[index]
+impl Render for PaletteView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = cx.tokens();
+        let count = self.model.read(cx).row_count();
+        let body = if count == 0 {
+            div()
+                .p(space::S16)
+                .text_size(font::BODY)
+                .text_color(Hsla::from(t.text_muted))
+                .child("No matching results")
+                .into_any_element()
+        } else {
+            // An explicit height keeps the number of built rows independent of the window.
+            let height = (row::TABLE * count as f32).min(layout::PALETTE_MAX_HEIGHT);
+            uniform_list(
+                "palette-list",
+                count,
+                cx.processor(|this, range: Range<usize>, window, cx| {
+                    this.render_rows(range, window, cx)
+                }),
+            )
+            .track_scroll(&self.scroll)
+            .h(height)
+            .into_any_element()
+        };
+        div()
+            .id("palette")
+            .key_context(PALETTE_CONTEXT)
+            .on_action(cx.listener(|this, _: &SelectDown, _, cx| this.move_selection(true, cx)))
+            .on_action(cx.listener(|this, _: &SelectUp, _, cx| this.move_selection(false, cx)))
+            .on_action(|_: &Escape, window, cx| window.close_dialog(cx))
+            .on_action(|_: &OpenPalette, window, cx| window.close_dialog(cx))
+            .child(
+                div()
+                    .id("palette-input")
+                    .test_support()
+                    .p(space::S8)
+                    .child(Input::new(&self.input)),
+            )
+            .child(body)
     }
 }
 
 /// Opens the palette dialog over the shell and returns its model.
 pub fn open_palette(
+    shell: WeakEntity<MainWindow>,
     shell_focus: FocusHandle,
+    snapshot: Arc<Snapshot>,
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<PaletteModel> {
     let recents = settings(cx).recent_commands.clone();
-    let model = cx.new(|_| PaletteModel::new(super::registry::commands(), &recents));
-    let state = cx.new(|cx| CommandState::new(window, cx));
+    let model = cx.new(|_| PaletteModel::new(command_items(), &recents));
+    let view = cx.new(|cx| {
+        PaletteView::new(
+            model.clone(),
+            shell,
+            shell_focus.clone(),
+            snapshot,
+            window,
+            cx,
+        )
+    });
     let focused = Rc::new(Cell::new(false));
-
-    let builder_model = model.clone();
     window.open_dialog(cx, move |dialog, window, cx| {
         if !focused.replace(true) {
-            state.update(cx, |s, cx| s.focus(window, cx));
+            let input = view.read(cx).input.clone();
+            input.update(cx, |s, cx| s.focus(window, cx));
         }
-        let t = cx.tokens();
-        let focus_for_rows = shell_focus.clone();
-        let items: Vec<CommandItem> = {
-            let m = builder_model.read(cx);
-            m.ranked()
-                .iter()
-                .map(|&i| {
-                    let spec = m.spec(i);
-                    let label = spec.label;
-                    let make = spec.action;
-                    let focus = focus_for_rows.clone();
-                    CommandItem::new().label(label).child(move |window, _cx| {
-                        let action = make();
-                        let hint = shortcut_hint(action.as_ref(), &focus, window);
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .w_full()
-                            .text_size(font::BODY)
-                            .text_color(Hsla::from(t.text))
-                            .child(label)
-                            .children(hint)
-                    })
-                })
-                .collect()
-        };
-
-        let model_q = builder_model.clone();
-        let model_c = builder_model.clone();
-        let focus_c = shell_focus.clone();
-        let command = Command::new(&state)
-            .filterable(false)
-            .placeholder("Search commands…")
-            .empty(move |_, _, _| {
-                div()
-                    .p(space::S16)
-                    .text_size(font::BODY)
-                    .text_color(Hsla::from(t.text_muted))
-                    .child("No matching commands")
-            })
-            .max_h(layout::PALETTE_MAX_HEIGHT)
-            .items(items)
-            .on_query(move |q: &str, _window, cx| {
-                let recents = settings(cx).recent_commands.clone();
-                model_q.update(cx, |m, cx| {
-                    m.set_query(q, &recents);
-                    cx.notify();
-                });
-            })
-            .on_confirm(move |ix: IndexPath, window, cx| {
-                let picked = {
-                    let m = model_c.read(cx);
-                    m.ranked().get(ix.row).map(|&i| {
-                        let spec = m.spec(i);
-                        (spec.id, spec.action)
-                    })
-                };
-                let Some((id, make)) = picked else { return };
-                update_settings(cx, |s| record_recent(&mut s.recent_commands, id));
-                window.close_dialog(cx);
-                focus_c.focus(window, cx);
-                window.dispatch_action(make(), cx);
-            });
-
         dialog
             .rounded(radius::DIALOG)
             .line_height(relative(font::LINE_HEIGHT_UI))
@@ -149,9 +303,7 @@ pub fn open_palette(
             .margin_top(layout::PALETTE_TOP_OFFSET)
             .close_button(false)
             .child(dialog_window_actions(
-                div()
-                    .on_action(|_: &OpenPalette, window, cx| window.close_dialog(cx))
-                    .child(command),
+                div().child(view.clone()),
                 shell_focus.clone(),
             ))
     });
@@ -161,9 +313,14 @@ pub fn open_palette(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nav::{Page, Tool};
-    use crate::test_support::{open_shell, press};
+    use crate::nav::{Page, Selection, Tool};
+    use crate::palette::items::{ItemKind, PaletteItem};
+    use crate::palette::registry::Group;
+    use crate::test_support::{
+        exists, log_at, open_shell, open_shell_snapshot, press, request, snapshot,
+    };
     use gpui_kit::TestAppContext;
+    use gpui_kit::test::TestWindowExt as _;
 
     fn open(cx: &mut gpui_kit::VisualTestContext) {
         press(cx, "cmd-k", "ctrl-k");
@@ -180,6 +337,10 @@ mod tests {
         shell.read_with(cx, |s, _| s.palette().cloned().expect("palette opened"))
     }
 
+    fn first_id(m: &Entity<PaletteModel>, cx: &mut gpui_kit::VisualTestContext) -> String {
+        m.read_with(cx, |m, _| m.item(0).id.clone())
+    }
+
     #[gpui_kit::test]
     fn cmd_k_opens_the_palette(cx: &mut TestAppContext) {
         let (_shell, cx) = open_shell(cx);
@@ -189,13 +350,21 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn cmd_k_again_closes_it(cx: &mut TestAppContext) {
+    fn cmd_k_closes(cx: &mut TestAppContext) {
         let (shell, cx) = open_shell(cx);
         open(cx);
         let first = model(&shell, cx);
         open(cx);
         assert!(!dialog_open(cx));
         assert_eq!(model(&shell, cx), first, "no second palette was created");
+    }
+
+    #[gpui_kit::test]
+    fn cmd_shift_f_opens_the_palette(cx: &mut TestAppContext) {
+        let (_shell, cx) = open_shell(cx);
+        assert!(!dialog_open(cx));
+        press(cx, "cmd-shift-f", "ctrl-shift-f");
+        assert!(dialog_open(cx));
     }
 
     #[gpui_kit::test]
@@ -215,6 +384,27 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn arrows_move_the_selection_and_enter_runs_it(cx: &mut TestAppContext) {
+        let (shell, cx) = open_shell(cx);
+        open(cx);
+        cx.run_until_parked();
+        cx.simulate_input("go to");
+        cx.run_until_parked();
+        let second = model(&shell, cx).read_with(cx, |m, _| m.item(1).id.clone());
+        press(cx, "down", "down");
+        press(cx, "enter", "enter");
+        assert!(!dialog_open(cx));
+        let slug = second
+            .strip_prefix("tool.")
+            .expect("a tool command is second");
+        let tool = Tool::ALL.into_iter().find(|t| t.slug() == slug).unwrap();
+        assert_eq!(
+            shell.read_with(cx, |s, _| s.current().page),
+            Page::Tool(tool)
+        );
+    }
+
+    #[gpui_kit::test]
     fn escape_closes_without_side_effects(cx: &mut TestAppContext) {
         let (shell, cx) = open_shell(cx);
         open(cx);
@@ -225,7 +415,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn recent_command_is_first_on_next_open(cx: &mut TestAppContext) {
+    fn recent_commands_rank_first(cx: &mut TestAppContext) {
         let (shell, cx) = open_shell(cx);
         open(cx);
         cx.run_until_parked();
@@ -233,13 +423,11 @@ mod tests {
         cx.run_until_parked();
         press(cx, "enter", "enter");
         open(cx);
-        let m = model(&shell, cx);
-        let first = m.read_with(cx, |m, _| m.spec(m.ranked()[0]).id);
-        assert_eq!(first, "tool.logs");
+        assert_eq!(first_id(&model(&shell, cx), cx), "tool.logs");
     }
 
     #[gpui_kit::test]
-    fn shortcut_characters_are_text_in_the_palette(cx: &mut TestAppContext) {
+    fn question_mark_types_into_the_palette(cx: &mut TestAppContext) {
         let (shell, cx) = open_shell(cx);
         open(cx);
         cx.run_until_parked();
@@ -257,9 +445,8 @@ mod tests {
         cx.run_until_parked();
         cx.simulate_input("go back");
         cx.run_until_parked();
-        let m = model(&shell, cx);
-        let first = m.read_with(cx, |m, _| m.spec(m.ranked()[0]).id);
-        assert_eq!(first, "nav.back");
+        assert_eq!(first_id(&model(&shell, cx), cx), "nav.back");
+        assert!(exists(cx, "palette-row-0"));
     }
 
     #[gpui_kit::test]
@@ -281,5 +468,107 @@ mod tests {
         press(cx, "cmd-w", "ctrl-w");
         cx.run_until_parked();
         assert!(cx.windows().is_empty());
+    }
+
+    #[gpui_kit::test]
+    fn only_visible_rows_render_at_5000_items(cx: &mut TestAppContext) {
+        let (shell, cx) = open_shell(cx);
+        open(cx);
+        cx.run_until_parked();
+        let many: Vec<PaletteItem> = (0..5000)
+            .map(|i| PaletteItem {
+                id: format!("fake.{i}"),
+                label: format!("GET /fake/{i}"),
+                detail: Some("host \u{b7} 200".into()),
+                keywords: Vec::new(),
+                group: Group::Data,
+                kind: ItemKind::SearchLogs(String::new()),
+            })
+            .collect();
+        model(&shell, cx).update(cx, |m, cx| {
+            m.extend(many, &[]);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        ROWS.with(|c| c.set(0));
+        cx.update(|window, cx| window.render_frame(cx));
+        let built = ROWS.with(|c| c.get());
+        assert!(built > 0, "rows were built");
+        assert!(built <= 30, "built {built} rows for 5000 items");
+    }
+
+    fn net_shell(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<crate::shell::MainWindow>,
+        &mut gpui_kit::VisualTestContext,
+    ) {
+        let snap = snapshot(|w, run| {
+            request(
+                w,
+                run,
+                "GET",
+                "https://api.test/v2/products?page=3",
+                Some(200),
+                1,
+                Some(2),
+            );
+            request(
+                w,
+                run,
+                "POST",
+                "https://api.test/v2/cart",
+                Some(201),
+                3,
+                Some(4),
+            );
+        });
+        open_shell_snapshot(cx, snap)
+    }
+
+    #[gpui_kit::test]
+    fn typing_a_path_finds_the_request_and_enter_navigates_to_it(cx: &mut TestAppContext) {
+        let (shell, cx) = net_shell(cx);
+        open(cx);
+        cx.run_until_parked();
+        cx.simulate_input("products");
+        cx.run_until_parked();
+        let m = model(&shell, cx);
+        assert_eq!(
+            m.read_with(cx, |m, _| m.item(0).label.clone()),
+            "GET /v2/products?page=3"
+        );
+        press(cx, "enter", "enter");
+        let loc = shell.read_with(cx, |s, _| s.current().clone());
+        assert_eq!(loc.page, Page::Tool(Tool::Network));
+        assert!(matches!(loc.selection, Some(Selection::Request(_))));
+        assert!(!dialog_open(cx));
+    }
+
+    #[gpui_kit::test]
+    fn search_logs_item_appears_last_and_runs_a_log_search(cx: &mut TestAppContext) {
+        let snap = snapshot(|w, run| {
+            w.push_log(log_at(run, 1, fdt_store::logs::LogLevel::Info));
+        });
+        let (shell, cx) = open_shell_snapshot(cx, snap);
+        open(cx);
+        cx.run_until_parked();
+        cx.simulate_input("zzqq");
+        cx.run_until_parked();
+        let m = model(&shell, cx);
+        let (count, last) = m.read_with(cx, |m, _| {
+            (m.row_count(), m.item(m.row_count() - 1).label.clone())
+        });
+        assert_eq!(count, 1);
+        assert_eq!(last, "Search logs for \u{201c}zzqq\u{201d}");
+        press(cx, "enter", "enter");
+        assert_eq!(
+            shell.read_with(cx, |s, _| s.current().page),
+            Page::Tool(Tool::Logs)
+        );
+        let q = shell.read_with(cx, |s, cx| {
+            s.logs_view().read(cx).search_query().to_string()
+        });
+        assert_eq!(q, "zzqq");
     }
 }

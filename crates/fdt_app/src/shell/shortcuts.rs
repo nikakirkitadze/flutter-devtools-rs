@@ -21,6 +21,7 @@ fn group_name(group: Group) -> &'static str {
         Group::View => "View",
         Group::Window => "Window",
         Group::App => "App",
+        Group::Data => "Data",
     }
 }
 

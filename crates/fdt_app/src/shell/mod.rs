@@ -14,15 +14,16 @@ pub(crate) mod tool_page;
 use crate::actions::{
     About, ClearSelection, CloseWindow, Collapse, ConnectToApp, Disconnect, Expand, FocusSearch,
     FollowLatest, GoBack, GoForward, GoToFirst, LoadFullBody, Minimize, NewSession, OpenDetails,
-    OpenPalette, OpenSettings, SelectNext, SelectPrevious, ShowLogs, ShowMemory, ShowNetwork,
-    ShowPerformance, ShowShortcuts, ShowState, ShowTimeline, ShowWidgets, StopWaiting,
+    OpenPalette, OpenSettings, SearchEverywhere, SelectNext, SelectPrevious, ShowLogs, ShowMemory,
+    ShowNetwork, ShowPerformance, ShowShortcuts, ShowState, ShowTimeline, ShowWidgets, StopWaiting,
     ToggleExpand, ToggleFrameHud, ToggleFullScreen, ToggleRecording, UseDarkTheme, UseLightTheme,
     UseSystemTheme, Zoom,
 };
 use crate::capture_host::{CaptureControl, CaptureHost};
 use crate::keymap::SHELL_CONTEXT;
 use crate::nav::{Location, NavHistory, Page, Selection, Tool};
-use crate::palette::view::{PaletteModel, open_palette};
+use crate::palette::items::PaletteModel;
+use crate::palette::view::open_palette;
 use crate::session_model::{SessionEvent, SessionModel};
 use crate::settings::{settings, update_settings};
 use crate::tools::logs::{LogsEvent, LogsView};
@@ -220,7 +221,6 @@ impl MainWindow {
         &self.session
     }
 
-    #[cfg(test)]
     pub(crate) fn logs_view(&self) -> &Entity<LogsView> {
         &self.logs
     }
@@ -446,8 +446,19 @@ impl MainWindow {
         if window.has_active_dialog(cx) {
             window.close_dialog(cx);
         } else {
-            self.palette = Some(open_palette(self.focus_handle(), window, cx));
+            self.open_palette(window, cx);
         }
+    }
+
+    fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let snapshot = self.session.read(cx).snapshot().clone();
+        self.palette = Some(open_palette(
+            cx.weak_entity(),
+            self.focus_handle(),
+            snapshot,
+            window,
+            cx,
+        ));
     }
 
     pub fn hud(&self) -> &Entity<FrameHud> {
@@ -604,6 +615,11 @@ impl Render for MainWindow {
                 this.with_logs(cx, |v, cx| v.go_to_first(cx));
             }))
             .on_action(cx.listener(|this, _: &OpenPalette, w, cx| this.toggle_palette(w, cx)))
+            .on_action(cx.listener(|this, _: &SearchEverywhere, w, cx| {
+                if !w.has_active_dialog(cx) {
+                    this.open_palette(w, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &ShowShortcuts, w, cx| this.show_shortcuts(w, cx)))
             .on_action(cx.listener(|this, _: &About, w, cx| {
                 if w.has_active_dialog(cx) {

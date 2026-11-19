@@ -558,6 +558,11 @@ impl LogsView {
         self.apply_query(cx);
     }
 
+    #[cfg(test)]
+    pub(crate) fn search_query(&self) -> &str {
+        &self.query
+    }
+
     pub(super) fn toggle_regex(&mut self, cx: &mut Context<Self>) {
         self.regex = !self.regex;
         self.apply_query(cx);

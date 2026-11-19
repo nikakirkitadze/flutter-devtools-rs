@@ -3,8 +3,8 @@
 use crate::actions::{
     AppListConnect, AppListNext, AppListPrev, ClearSelection, CloseWindow, Collapse, Expand,
     FocusSearch, FollowLatest, GoBack, GoForward, GoToFirst, Hide, HideOthers, Minimize,
-    NewSession, NewWindow, OpenDetails, OpenPalette, OpenSettings, Quit, SelectNext,
-    SelectPrevious, ShowShortcuts, ToggleExpand, ToggleFullScreen, ToggleRecording,
+    NewSession, NewWindow, OpenDetails, OpenPalette, OpenSettings, Quit, SearchEverywhere,
+    SelectNext, SelectPrevious, ShowShortcuts, ToggleExpand, ToggleFullScreen, ToggleRecording,
 };
 use crate::nav::Tool;
 use gpui_kit::KeyBinding;
@@ -24,6 +24,9 @@ pub const APP_LIST_CONTEXT: &str = "AppList";
 /// Key context of the Logs list. The toolbar's search field is outside it, so these keys never
 /// fire while typing.
 pub const LOGS_LIST_CONTEXT: &str = "LogsList";
+
+/// Key context of the command palette.
+pub const PALETTE_CONTEXT: &str = "Palette";
 
 /// Key context of gpui-kit's data tables.
 pub const TABLE_CONTEXT: &str = "DataTable";
@@ -64,6 +67,11 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("escape", ClearSelection, not_input),
         KeyBinding::new("?", ShowShortcuts, not_input),
         KeyBinding::new(platform("cmd-f", "ctrl-f"), FocusSearch, shell),
+        KeyBinding::new(
+            platform("cmd-shift-f", "ctrl-shift-f"),
+            SearchEverywhere,
+            shell,
+        ),
         KeyBinding::new(platform("cmd-r", "ctrl-r"), ToggleRecording, shell),
         KeyBinding::new(platform("cmd-n", "ctrl-n"), NewSession, shell),
         KeyBinding::new(platform("cmd-shift-n", "ctrl-shift-n"), NewWindow, None),
@@ -100,6 +108,12 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("k", SelectUp, table),
         // Enter opens the selected request's details, as it does a log line's.
         KeyBinding::new("enter", OpenDetails, table),
+    ]);
+    // The palette's own movement; Enter and Escape reach it through the input's events.
+    let palette = Some(PALETTE_CONTEXT);
+    out.extend([
+        KeyBinding::new("up", SelectUp, palette),
+        KeyBinding::new("down", SelectDown, palette),
     ]);
     if cfg!(target_os = "macos") {
         out.extend([
