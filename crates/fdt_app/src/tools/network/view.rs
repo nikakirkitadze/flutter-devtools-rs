@@ -1753,6 +1753,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn load_full_body_is_unavailable_past_what_one_frame_carries() {
+        use super::super::details::{LOAD_FULL_MAX_BYTES, load_full_too_big_hint};
+        assert_eq!(LOAD_FULL_MAX_BYTES, 64 << 20);
+        assert_eq!(load_full_too_big_hint(None), None);
+        assert_eq!(load_full_too_big_hint(Some(LOAD_FULL_MAX_BYTES)), None);
+        assert!(load_full_too_big_hint(Some(LOAD_FULL_MAX_BYTES + 1)).is_some());
+    }
+
     #[gpui_kit::test]
     fn copy_buttons_write_the_clipboard(cx: &mut TestAppContext) {
         let snap = snapshot(|w, run| {

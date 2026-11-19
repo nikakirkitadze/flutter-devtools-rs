@@ -54,6 +54,22 @@ pub fn load_full_hint(connected: bool) -> Option<&'static str> {
     (!connected).then_some(LOAD_FULL_HINT)
 }
 
+/// The largest body one frame can carry: the frame limit over the four characters a byte takes
+/// in the VM's integer-array encoding (64 MiB at the default 256 MiB frame).
+pub const LOAD_FULL_MAX_BYTES: u64 =
+    fdt_vm::rpc::max_body_bytes(fdt_vm::rpc::DEFAULT_MAX_MESSAGE_BYTES) as u64;
+
+/// The tooltip of a disabled "Load full body" when the body is known to be too long to carry
+/// in one piece.
+pub fn load_full_too_big_hint(full_len: Option<u64>) -> Option<String> {
+    full_len.filter(|&n| n > LOAD_FULL_MAX_BYTES).map(|_| {
+        format!(
+            "Too large to copy ({} limit).",
+            format_bytes(LOAD_FULL_MAX_BYTES)
+        )
+    })
+}
+
 /// What a finished preview job produced.
 pub(super) struct Rendered {
     lines: Arc<Vec<String>>,
@@ -846,7 +862,7 @@ impl NetworkView {
                         format_bytes(*len)
                     ),
                 ))
-                .child(self.load_button(rec.id, kind, connected, cx))
+                .child(self.load_button(rec.id, kind, connected, Some(*len), cx))
                 .into_any_element(),
             BodyState::Evicted { .. } => {
                 let budget = settings(cx).body_budget_mib;
@@ -888,7 +904,7 @@ impl NetworkView {
                     .text_color(Hsla::from(t.text_muted))
                     .child(text),
             );
-            col = col.child(self.load_button(rec.id, kind, connected, cx));
+            col = col.child(self.load_button(rec.id, kind, connected, Some(body.full_len), cx));
         }
         let skeleton = match self.details.cache.get(&BodyKey {
             id: rec.id,
@@ -988,6 +1004,7 @@ impl NetworkView {
         id: EntryId,
         kind: BodyKind,
         connected: bool,
+        full_len: Option<u64>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = *cx.tokens();
@@ -1000,10 +1017,13 @@ impl NetworkView {
             .flex()
             .items_center()
             .gap(space::S4);
-        if let Some(hint) = load_full_hint(connected) {
+        let hint = load_full_hint(connected)
+            .map(str::to_string)
+            .or_else(|| load_full_too_big_hint(full_len));
+        if let Some(hint) = hint {
             button = button
                 .opacity(alpha::DISABLED)
-                .tooltip(move |window, cx| Tooltip::new(hint).build(window, cx));
+                .tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx));
         } else {
             button =
                 button.on_click(cx.listener(move |this, _, _, cx| this.load_full(id, kind, cx)));
