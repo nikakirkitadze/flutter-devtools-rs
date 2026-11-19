@@ -40,3 +40,17 @@ These are review findings that were deliberately not fixed in M1. They were tria
 - **Task 14b:** seeded-vs-plain theme test shares one TestAppContext (order-dependent diff not caught); defer_menus untested and waits for 3 frames (delayed if window occluded); watchdog not cancelled after success; window-open/update failure paths only log::error (no stderr); floor harness ≠ literal hello_world and floor median > app median (noise) — rerun on quiet machine in T16.
 - **Task 14b:** report line 214 A-variant medians should read 392.3/410.7 (not cited in body); after-phase table mixes per-column medians.
 - **Task 16:** unmeasured "10–20 % worse" estimate; fonts_loaded per-run wording; resize rows overlap (collapse to one Draw p99 row, R2/R3 budgets); idle run descriptions (run 3 looks cherry-picked); author checklist lacks per-OS steps / Ctrl variants / where to record; 3.41.9 re-resolve command not given.
+
+## Carried into M2 and fixed
+
+Checked against `git log --oneline 796c24a..HEAD` on `m2-connect-logs-network`.
+
+- logger uses `eprintln!` (panics on a broken stderr pipe) — **Fixed in `58c4cf0`:** the logger ignores write errors (`logger_ignores_write_errors`).
+- ⌘W (and Minimize/Zoom/FullScreen) do nothing while a dialog has focus — **Fixed in `58c4cf0`:** each window action closes the dialog, focuses the shell, then re-dispatches.
+- Carry into M2, a palette item model that carries parameters and a virtualised list — **Done in `b204dea`** (and the palette's data items run off the UI thread in `b204dea`, tidied in `b2877ee`).
+- Carry into M2, key-context rules so shell shortcuts do not steal keys from text fields (`Shell && !Input`) — **Done in `58c4cf0`** (`SHELL_NOT_INPUT`).
+- Carry into M2, pages own their scrolling — **Done in `58c4cf0`** (tool page).
+- Carry into M2, settings deserialisation that tolerates one bad field — **Done in `58c4cf0`.**
+- Carry into M2, run ids in `Location` and the time axis — **Done in `2ad179f`** (`EntryId { run, seq }`, `SessionTime`) and used by the capture from `28ad86f`.
+
+Not carried or fixed in M2: the other items above stay open.
