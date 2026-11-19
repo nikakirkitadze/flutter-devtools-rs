@@ -112,6 +112,13 @@ impl SessionModel {
             return;
         };
         self.attach(control, cx);
+        // `fdt --connect`: the first window to get a capture connects, once.
+        if cx.has_global::<crate::app::StartupConnect>() {
+            let crate::app::StartupConnect(uri) = cx.remove_global::<crate::app::StartupConnect>();
+            if let Some(control) = self.control.as_ref() {
+                control.connect(fdt_capture::Target::Uri(uri));
+            }
+        }
     }
 
     /// Starts following `control`, replacing any capture attached before.

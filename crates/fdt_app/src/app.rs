@@ -228,6 +228,26 @@ pub fn run() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// A VM service URL to connect to as soon as the first window has a capture (`fdt --connect`).
+pub(crate) struct StartupConnect(pub fdt_vm::uri::VmServiceUri);
+
+impl gpui_kit::Global for StartupConnect {}
+
+/// Like [`run`], but connects to `uri` once the first window's capture is attached, as if the
+/// URL had been pasted on the Start page.
+pub fn run_connected(uri: fdt_vm::uri::VmServiceUri) -> ExitCode {
+    let store = load_store();
+    gpui_kit::application()
+        .with_assets(FdtAssets)
+        .run(move |cx: &mut App| {
+            cx.set_global(StartupConnect(uri));
+            if let Err(err) = start(cx, store, None, DiscoveryChoice::System) {
+                fatal(&format!("could not open the main window: {err:#}"));
+            }
+        });
+    ExitCode::SUCCESS
+}
+
 /// Like [`run`], but measures cold start, prints one `StartupReport` JSON line and quits.
 ///
 /// Times are measured from `t0` (the start of `main()`); the report also carries the wall-clock
