@@ -68,7 +68,9 @@ impl SessionWriter {
         Self::with_log_chunk(origin_host_us, chunk)
     }
 
-    fn with_log_chunk(origin_host_us: i64, chunk: usize) -> Self {
+    /// A writer whose stores seal chunks of `chunk` records, so tests can reach many chunks
+    /// with few records.
+    pub fn with_log_chunk(origin_host_us: i64, chunk: usize) -> Self {
         let mut empty = Snapshot::empty();
         empty.origin_host_us = origin_host_us;
         Self {

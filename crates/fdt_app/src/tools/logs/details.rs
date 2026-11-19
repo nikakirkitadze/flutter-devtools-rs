@@ -70,12 +70,18 @@ pub(super) fn record_json(rec: &LogRow<'_>) -> String {
 
 impl LogsView {
     pub(super) fn copy_text(&self, seq: u32, cx: &mut Context<Self>) {
-        let text = self.snap.logs.row(seq as usize).text.to_string();
+        let Some(rec) = self.snap.logs.get_row(seq as usize) else {
+            return;
+        };
+        let text = rec.text.to_string();
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
     pub(super) fn copy_json(&self, seq: u32, cx: &mut Context<Self>) {
-        let json = record_json(&self.snap.logs.row(seq as usize));
+        let Some(rec) = self.snap.logs.get_row(seq as usize) else {
+            return;
+        };
+        let json = record_json(&rec);
         cx.write_to_clipboard(ClipboardItem::new_string(json));
     }
 
@@ -117,7 +123,10 @@ impl LogsView {
             .bg(Hsla::from(t.surface))
             .text_size(font::BODY)
             .text_color(Hsla::from(t.text));
-        let Some(seq) = self.selected else {
+        let rec = self
+            .selected
+            .and_then(|seq| self.snap.logs.get_row(seq as usize));
+        let (Some(seq), Some(rec)) = (self.selected, rec) else {
             return shell
                 .child(
                     div()
@@ -126,7 +135,6 @@ impl LogsView {
                 )
                 .into_any_element();
         };
-        let rec = self.snap.logs.row(seq as usize);
         if self.details.lines.as_ref().map(|l| l.0) != Some(seq) {
             self.details.lines = Some((seq, Arc::new(line_starts(rec.text))));
             self.details.message_scroll = UniformListScrollHandle::new();
@@ -338,7 +346,9 @@ impl LogsView {
         let (Some(seq), Some((_, starts))) = (self.selected, self.details.lines.clone()) else {
             return Vec::new();
         };
-        let rec = self.snap.logs.row(seq as usize);
+        let Some(rec) = self.snap.logs.get_row(seq as usize) else {
+            return Vec::new();
+        };
         let bg = t.accent.with_alpha(alpha::SELECTION);
         range
             .map(|i| {
@@ -373,7 +383,7 @@ impl LogsView {
         let Some(seq) = self.selected else {
             return Vec::new();
         };
-        let Some(err) = self.snap.logs.row(seq as usize).error else {
+        let Some(err) = self.snap.logs.get_row(seq as usize).and_then(|r| r.error) else {
             return Vec::new();
         };
         range

@@ -300,6 +300,11 @@ impl LogsSnapshot {
         self.chunks().map(|c| c.text.len()).sum()
     }
 
+    /// The record at `seq`, or `None` when out of range.
+    pub fn get_row(&self, seq: usize) -> Option<LogRow<'_>> {
+        (seq < self.len).then(|| self.row(seq))
+    }
+
     /// The record at `seq`. Panics when out of range.
     pub fn row(&self, seq: usize) -> LogRow<'_> {
         assert!(seq < self.len, "log row {seq} out of range ({})", self.len);

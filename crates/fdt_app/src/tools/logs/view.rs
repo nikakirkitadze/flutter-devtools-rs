@@ -109,14 +109,15 @@ fn fingerprint(snap: &Snapshot) -> Option<(SessionTime, SessionTime)> {
 /// A text search runs in two phases: `first` gets the newest rows as soon as they are known. When
 /// `cancel` is set the scan stops and the result is `None`.
 fn compute(
-    snap: &Snapshot,
+    snap: &Arc<Snapshot>,
     filter: &LogFilter,
     version: u64,
     prior: Option<(Applied, Arc<[u32]>)>,
     cancel: &AtomicBool,
-    first: oneshot::Sender<Vec<u32>>,
+    first: oneshot::Sender<(Vec<u32>, Arc<Snapshot>)>,
 ) -> Option<JobResult> {
     let counts = snap.logs.level_counts(filter.range);
+    let first_snap = snap.clone();
     let same_filter = prior
         .as_ref()
         .is_some_and(|(p, _)| p.key.version == version);
@@ -147,7 +148,7 @@ fn compute(
         let mut first = Some(first);
         filter_logs_two_phase(&snap.logs, filter, cancel, |rows| {
             if let Some(tx) = first.take() {
-                tx.send(rows).ok();
+                tx.send((rows, first_snap.clone())).ok();
             }
         })?
         .into()
@@ -325,8 +326,8 @@ impl LogsView {
                     // awaits, so the UI thread never blocks on the scan.
                     let (first_tx, first_rx) = oneshot::channel();
                     this.first_task = Some(cx.spawn(async move |this, cx| {
-                        if let Ok(rows) = first_rx.await {
-                            this.update(cx, |this, cx| this.apply_first(key, rows, cx))
+                        if let Ok((rows, snap)) = first_rx.await {
+                            this.update(cx, |this, cx| this.apply_first(key, rows, snap, cx))
                                 .ok();
                         }
                     }));
@@ -424,10 +425,18 @@ impl LogsView {
 
     /// Shows the newest matches of a text search before the full scan ends. Ignored when the
     /// full result of the same job has already arrived, or the filter has moved on.
-    fn apply_first(&mut self, key: Key, rows: Vec<u32>, cx: &mut Context<Self>) {
+    fn apply_first(
+        &mut self,
+        key: Key,
+        rows: Vec<u32>,
+        snap: Arc<Snapshot>,
+        cx: &mut Context<Self>,
+    ) {
         if self.version != key.version || self.applied.is_some_and(|a| a.key == key) {
             return;
         }
+        // The rows index the job's snapshot, so the two change together.
+        self.snap = snap;
         self.rows.set_filtered(rows.into());
         if self.follow.following {
             self.scroll.scroll_to_bottom();
@@ -634,14 +643,19 @@ impl LogsView {
 
     fn selected_id(&self) -> Option<EntryId> {
         let seq = self.selected? as usize;
-        (seq < self.snap.logs.len()).then(|| self.snap.logs.row(seq).id)
+        self.snap.logs.get_row(seq).map(|r| r.id)
     }
 
     /// Selects and reveals `id`; clears the selection, silently, if it is not in the list.
     fn select_from_location(&mut self, id: EntryId, cx: &mut Context<Self>) {
-        let seq = u32::try_from(id.seq)
-            .ok()
-            .filter(|&s| self.rows.row_of(s).is_some() && self.snap.logs.row(s as usize).id == id);
+        let seq = u32::try_from(id.seq).ok().filter(|&s| {
+            self.rows.row_of(s).is_some()
+                && self
+                    .snap
+                    .logs
+                    .get_row(s as usize)
+                    .is_some_and(|r| r.id == id)
+        });
         match seq {
             Some(seq) => {
                 self.selected = Some(seq);
@@ -666,10 +680,12 @@ impl LogsView {
     /// Selects `seq`. Keyboard movement (`replace`) rewrites the current history entry; a click
     /// pushes a new one.
     fn select_seq(&mut self, seq: u32, replace: bool, cx: &mut Context<Self>) {
+        let Some(id) = self.snap.logs.get_row(seq as usize).map(|r| r.id) else {
+            return;
+        };
         self.selected = Some(seq);
         self.follow.on_select();
         self.reveal(seq, ScrollStrategy::Nearest);
-        let id = self.snap.logs.row(seq as usize).id;
         cx.emit(if replace {
             LogsEvent::Moved(Some(id))
         } else {
@@ -718,12 +734,10 @@ impl LogsView {
         if only.is_some_and(|current| current != self.rows.is_expanded(seq)) {
             return;
         }
-        let extra = self
-            .snap
-            .logs
-            .row(seq as usize)
-            .line_count
-            .saturating_sub(1);
+        let Some(rec) = self.snap.logs.get_row(seq as usize) else {
+            return;
+        };
+        let extra = rec.line_count.saturating_sub(1);
         self.rows.toggle(seq, extra);
         cx.notify();
     }
@@ -745,7 +759,9 @@ impl LogsView {
         let Some(seq) = self.selected else { return };
         self.details_open = true;
         // Enter commits the selection as a history step (nothing new if it already is one).
-        let id = self.snap.logs.row(seq as usize).id;
+        let Some(id) = self.snap.logs.get_row(seq as usize).map(|r| r.id) else {
+            return;
+        };
         cx.emit(LogsEvent::Selected(Some(id)));
         cx.notify();
     }
@@ -884,7 +900,8 @@ impl LogsView {
             generation: self.snap.generation,
             version: self.version,
         };
-        self.apply_first(key, rows, cx);
+        let snap = self.snap.clone();
+        self.apply_first(key, rows, snap, cx);
     }
 }
 
@@ -927,7 +944,9 @@ impl LogsView {
         let rr = self.rows.resolve(row_ix);
         let (RowRef::Record { seq } | RowRef::Continuation { seq, .. } | RowRef::ShowAll { seq }) =
             rr;
-        let rec = self.snap.logs.row(seq as usize);
+        let Some(rec) = self.snap.logs.get_row(seq as usize) else {
+            return div().h(row::LOG).into_any_element();
+        };
         let selected = self.selected == Some(seq);
         let base = div()
             .id(SharedString::from(format!("log-row-{row_ix}")))
@@ -1184,6 +1203,22 @@ impl LogsView {
             .into_any_element()
     }
 
+    /// Shown instead of "no lines match" while the scan that would tell is still running.
+    fn searching_empty(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = cx.tokens();
+        div()
+            .id("logs-searching-empty")
+            .test_support()
+            .flex_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(font::BODY)
+            .text_color(Hsla::from(t.text_muted))
+            .child("Searching\u{2026}")
+            .into_any_element()
+    }
+
     fn no_match(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = cx.tokens();
         div()
@@ -1262,8 +1297,10 @@ impl Render for LogsView {
                 .into_any_element();
         }
         let empty = self.applied.is_some() && self.rows.filtered().is_empty();
-        let body = if empty {
+        let body = if empty && self.settled() {
             self.no_match(cx)
+        } else if empty {
+            self.searching_empty(cx)
         } else {
             self.rows_list(cx)
         };
@@ -1850,6 +1887,59 @@ mod tests {
         view.update(cx, |v, cx| v.apply_first_for_test(vec![1, 2], cx));
         assert_eq!(view.read_with(cx, |v, _| v.filtered_len()), 12);
         assert_eq!(view.read_with(cx, |v, _| v.first_phases()), before);
+    }
+
+    #[gpui_kit::test]
+    fn a_first_phase_beyond_the_shown_snapshot_does_not_panic(cx: &mut TestAppContext) {
+        let (_shell, view, cx) = open_search(cx, 40);
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| v.set_search("burst", false, window, cx));
+        });
+        view.update(cx, |v, cx| v.apply_first_for_test(vec![0, 45], cx));
+        frame(cx);
+        cx.run_until_parked();
+        frame(cx);
+    }
+
+    #[gpui_kit::test]
+    fn a_snapshot_published_during_a_two_phase_search_does_not_panic(cx: &mut TestAppContext) {
+        use crate::test_support::{connected, open_shell_fake, writer_with_chunk};
+        // Chunks of four records, so 400 records span 100 chunks: more than the first phase's 64.
+        let (mut w, run) = writer_with_chunk(4);
+        let push = |w: &mut fdt_store::SessionWriter, range: std::ops::Range<usize>| {
+            for i in range {
+                let mut input = log_at(run, i as u64, LogLevel::Info);
+                input.text = if i % 5 == 0 {
+                    format!("burst of events {i}")
+                } else {
+                    format!("plain line {i}")
+                };
+                w.push_log(input);
+            }
+        };
+        push(&mut w, 0..400);
+        let (shell, cx, handle) = open_shell_fake(cx);
+        handle.snaps.send(w.publish()).unwrap();
+        handle.status.send(connected("demo", false)).unwrap();
+        cx.run_until_parked();
+        press(cx, "cmd-5", "ctrl-5");
+        frame(cx);
+        let view = view_of(&shell, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| v.set_search("burst", false, window, cx));
+        });
+        // Publish while the scan is in flight and draw between the phases.
+        push(&mut w, 400..520);
+        handle.snaps.send(w.publish()).unwrap();
+        frame(cx);
+        cx.run_until_parked();
+        frame(cx);
+        push(&mut w, 520..640);
+        handle.snaps.send(w.publish()).unwrap();
+        cx.run_until_parked();
+        frame(cx);
+        // Every fifth of 640 lines.
+        assert_eq!(view.read_with(cx, |v, _| v.filtered_len()), 128);
     }
 
     #[gpui_kit::test]

@@ -251,9 +251,14 @@ pub fn snapshot(build: impl FnOnce(&mut fdt_store::SessionWriter, RunId)) -> Arc
 
 /// A fresh writer with one run (id 1, started at 0), for tests that publish several snapshots.
 pub fn writer() -> (fdt_store::SessionWriter, RunId) {
+    writer_with_chunk(fdt_store::logs::LOG_CHUNK)
+}
+
+/// Like [`writer`], with stores that seal a chunk every `chunk` records.
+pub fn writer_with_chunk(chunk: usize) -> (fdt_store::SessionWriter, RunId) {
     use fdt_store::clock::{Calibration, RunClock};
     use fdt_store::time::SessionTime;
-    let mut w = fdt_store::SessionWriter::new(0);
+    let mut w = fdt_store::SessionWriter::with_log_chunk(0, chunk);
     let clock = RunClock::new(
         0,
         Calibration {
