@@ -1,8 +1,13 @@
-//! VM service access for `fdt`: URL parsing, a JSON-RPC 2.0 client over WebSocket, and a
-//! transcript recorder. This crate has no UI dependencies.
+//! VM service access for `fdt`: URL parsing, a JSON-RPC 2.0 client over WebSocket, a transcript
+//! recorder, and the typed subset of the VM service and `dart:io` profiling protocols.
+//! This crate has no UI dependencies.
 
+pub mod dart_io;
+pub mod events;
 pub mod rpc;
+pub mod service;
 pub mod tap;
+pub mod types;
 pub mod uri;
 
 #[cfg(any(test, feature = "testing"))]

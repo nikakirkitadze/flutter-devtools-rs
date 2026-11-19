@@ -25,6 +25,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "
 futures-util = "0.3"
 url = "2"
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect"] }
+base64 = "0.22"
 
 [profile.release]
 debug = "line-tables-only"
