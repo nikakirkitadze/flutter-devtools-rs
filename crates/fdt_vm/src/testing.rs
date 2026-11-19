@@ -97,6 +97,7 @@ type Handler = dyn Fn(&str, &Value) -> Result<Value, (i64, String)> + Send + Syn
 
 #[derive(Default)]
 struct Shared {
+    open: std::sync::atomic::AtomicUsize,
     received: Mutex<Vec<(String, Value)>>,
     latency: Mutex<Duration>,
     /// While `Some((n, held))`, responses are collected and released in reverse once `n` arrive.
@@ -138,6 +139,11 @@ impl ScriptedServer {
         self.plumbing.broadcast(|| ConnCmd::Abort);
     }
 
+    /// Connections currently open on the server side.
+    pub fn open_connections(&self) -> usize {
+        self.shared.open.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn received(&self) -> Vec<(String, Value)> {
         self.shared.received.lock().unwrap().clone()
     }
@@ -160,6 +166,18 @@ async fn serve_scripted(
     handler: Arc<Handler>,
     shared: Arc<Shared>,
 ) {
+    struct Open(Arc<Shared>);
+    impl Drop for Open {
+        fn drop(&mut self) {
+            self.0
+                .open
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    shared
+        .open
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let _open = Open(shared.clone());
     loop {
         tokio::select! {
             incoming = ws.next() => {

@@ -127,6 +127,33 @@ struct Inner {
 #[derive(Clone)]
 pub struct RpcClient {
     inner: Arc<Inner>,
+    _last: Arc<CloseOnDrop>,
+}
+
+/// Shared by every clone of a client (but not by the reader task): when the last clone is
+/// dropped, the socket is closed and both tasks end.
+struct CloseOnDrop(mpsc::UnboundedSender<Outgoing>);
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.send(Outgoing::Close);
+    }
+}
+
+/// Removes a call's pending entry however the call ends, including being dropped mid-await.
+struct PendingGuard<'a> {
+    inner: &'a Inner,
+    id: String,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut p) = self.inner.pending.lock()
+            && let Some(p) = p.as_mut()
+        {
+            p.remove(&self.id);
+        }
+    }
 }
 
 fn host_port_of(url: &url::Url) -> String {
@@ -187,6 +214,8 @@ pub async fn connect(
                 msg = out_rx.recv() => match msg {
                     Some(Outgoing::Text(t)) => {
                         if sink.send(Message::text(t)).await.is_err() {
+                            // Wake the reader so pending calls fail now, not at their timeout.
+                            writer_shutdown.notify_one();
                             break;
                         }
                     }
@@ -247,7 +276,8 @@ pub async fn connect(
         let _ = closed_tx.send(Some(reason));
     });
 
-    Ok((RpcClient { inner }, note_rx))
+    let last = Arc::new(CloseOnDrop(inner.tx.clone()));
+    Ok((RpcClient { inner, _last: last }, note_rx))
 }
 
 impl std::fmt::Debug for RpcClient {
@@ -340,30 +370,32 @@ impl RpcClient {
                 .ok_or(RpcError::Closed)?
                 .insert(id.clone(), tx);
         }
+        let _guard = PendingGuard {
+            inner: &self.inner,
+            id: id.clone(),
+        };
         let text = req.to_string();
         if let Some(tap) = &self.inner.tap {
             tap.record("send", &text);
         }
         if self.inner.tx.send(Outgoing::Text(text)).is_err() {
-            self.forget(&id);
             return Err(RpcError::Closed);
         }
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => Err(RpcError::Closed),
-            Err(_) => {
-                self.forget(&id);
-                Err(RpcError::Timeout)
-            }
+            Err(_) => Err(RpcError::Timeout),
         }
     }
 
-    fn forget(&self, id: &str) {
-        if let Ok(mut p) = self.inner.pending.lock()
-            && let Some(p) = p.as_mut()
-        {
-            p.remove(id);
-        }
+    #[cfg(test)]
+    fn pending_count(&self) -> usize {
+        self.inner
+            .pending
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |p| p.len())
     }
 
     /// Resolves when the socket has closed.
@@ -495,6 +527,50 @@ mod tests {
             c.call("x", Value::Null).await,
             Err(RpcError::Closed)
         ));
+    }
+
+    #[tokio::test]
+    async fn dropping_the_last_client_closes_the_connection() {
+        let s = echo_server();
+        let (c, rx) = connect(&s.ws_uri(), ConnectOptions::default())
+            .await
+            .unwrap();
+        let c2 = c.clone();
+        c.call("x", Value::Null).await.unwrap();
+        assert_eq!(s.open_connections(), 1);
+        drop(c);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(s.open_connections(), 1, "a clone is still alive");
+        drop(c2);
+        drop(rx);
+        for _ in 0..100 {
+            if s.open_connections() == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("connection still open after the last client was dropped");
+    }
+
+    #[tokio::test]
+    async fn cancelled_calls_do_not_leak_pending_entries() {
+        let s = echo_server();
+        s.set_latency(Duration::from_secs(5));
+        let (c, _rx) = connect(&s.ws_uri(), ConnectOptions::default())
+            .await
+            .unwrap();
+        let c2 = c.clone();
+        let t = tokio::spawn(async move { c2.call("slow", Value::Null).await });
+        while c.pending_count() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        t.abort();
+        let _ = t.await;
+        assert_eq!(c.pending_count(), 0);
+        let _ = c
+            .call_with_timeout("slow", Value::Null, Duration::from_millis(30))
+            .await;
+        assert_eq!(c.pending_count(), 0);
     }
 
     #[tokio::test]
