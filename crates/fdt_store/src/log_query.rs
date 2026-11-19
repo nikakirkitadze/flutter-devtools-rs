@@ -446,11 +446,6 @@ mod tests {
 
     // ----- budgets (release only) -----
 
-    fn p90_worst(mut v: Vec<f64>) -> (f64, f64) {
-        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        (v[(v.len() * 9).div_ceil(10) - 1], *v.last().unwrap())
-    }
-
     fn big() -> &'static std::sync::Arc<crate::Snapshot> {
         static BIG: std::sync::OnceLock<std::sync::Arc<crate::Snapshot>> =
             std::sync::OnceLock::new();
@@ -475,11 +470,6 @@ mod tests {
                 compile_query(r"status=5\d\d", true).unwrap(),
             ),
         ]
-    }
-
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
-        static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        L.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     #[test]

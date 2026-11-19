@@ -1,14 +1,15 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use fdt_store::clock::{Calibration, RunClock};
 use fdt_store::log_query::{LogFilter, compile_query, filter_logs};
+use fdt_store::net::StatusClass;
+use fdt_store::net_query::{ClassSet, MethodSet, NetFilter, NetTab, filter_requests};
 use fdt_store::run::{AppInfo, Mode};
 use fdt_store::time::SessionTime;
 use fdt_store::{SessionWriter, Snapshot, synth};
 use std::hint::black_box;
 use std::sync::Arc;
 
-fn dataset(n: usize) -> Arc<Snapshot> {
-    let mut w = SessionWriter::new(0);
+fn start(w: &mut SessionWriter) -> fdt_store::time::RunId {
     let app = AppInfo {
         name: "bench".into(),
         device: None,
@@ -25,7 +26,12 @@ fn dataset(n: usize) -> Arc<Snapshot> {
             timeline_to_wall_us: 0,
         },
     );
-    let run = w.start_run(app, clock, SessionTime(0));
+    w.start_run(app, clock, SessionTime(0))
+}
+
+fn dataset(n: usize) -> Arc<Snapshot> {
+    let mut w = SessionWriter::new(0);
+    let run = start(&mut w);
     synth::logs(&mut w, run, n, 7);
     w.publish()
 }
@@ -58,5 +64,54 @@ fn log_search_1m(c: &mut Criterion) {
     log_search(c, "log_search_1m", 1_000_000);
 }
 
-criterion_group!(benches, log_search_100k, log_search_1m);
+fn net_filter_100k(c: &mut Criterion) {
+    let mut w = SessionWriter::new(0);
+    let run = start(&mut w);
+    synth::requests(&mut w, run, 100_000, 7);
+    let snap = w.publish();
+    let mut errors = ClassSet::NONE;
+    errors.toggle(StatusClass::ClientError);
+    errors.toggle(StatusClass::ServerError);
+    let host = snap.net.hosts()[3].clone();
+    let filters = [
+        (
+            "text_products",
+            NetFilter {
+                text: "products".into(),
+                ..NetFilter::default()
+            },
+        ),
+        (
+            "classes_4xx_5xx",
+            NetFilter {
+                classes: errors,
+                ..NetFilter::default()
+            },
+        ),
+        (
+            "host_and_post",
+            NetFilter {
+                host: Some(host),
+                methods: MethodSet::only(&["POST"]),
+                ..NetFilter::default()
+            },
+        ),
+        (
+            "errors_tab",
+            NetFilter {
+                tab: NetTab::Errors,
+                ..NetFilter::default()
+            },
+        ),
+    ];
+    let mut g = c.benchmark_group("net_filter_100k");
+    for (label, f) in &filters {
+        g.bench_function(*label, |b| {
+            b.iter(|| black_box(filter_requests(&snap.net, f)))
+        });
+    }
+    g.finish();
+}
+
+criterion_group!(benches, log_search_100k, log_search_1m, net_filter_100k);
 criterion_main!(benches);

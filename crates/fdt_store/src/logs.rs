@@ -378,6 +378,18 @@ pub(crate) mod testkit {
         (w, run)
     }
 
+    /// Budget tests run one at a time so they do not steal each other's cores.
+    pub fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        L.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The p90 and the worst of a set of millisecond timings.
+    pub fn p90_worst(mut v: Vec<f64>) -> (f64, f64) {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (v[(v.len() * 9).div_ceil(10) - 1], *v.last().unwrap())
+    }
+
     pub fn input(run: RunId, ms: u64, level: LogLevel, logger: &str, text: &str) -> LogInput {
         LogInput {
             run,

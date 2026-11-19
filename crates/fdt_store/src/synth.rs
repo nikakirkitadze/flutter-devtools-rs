@@ -1,6 +1,7 @@
 //! Deterministic synthetic datasets for tests and benches (no `rand`).
 
 use crate::logs::{LogInput, LogLevel, LogSource};
+use crate::net::HttpUpdate;
 use crate::session::SessionWriter;
 use crate::time::{RunId, SessionTime};
 
@@ -115,5 +116,142 @@ pub fn logs(w: &mut SessionWriter, run: RunId, n: usize, seed: u64) {
             text,
             error: None,
         });
+    }
+}
+
+const HOSTS: [&str; 12] = [
+    "api.example.com",
+    "cdn.example.com",
+    "auth.example.com",
+    "127.0.0.1:53452",
+    "img.example.net",
+    "search.example.com",
+    "pay.example.com",
+    "push.example.org",
+    "feed.example.com",
+    "maps.example.net",
+    "chat.example.io",
+    "files.example.org",
+];
+
+const PATHS: [&str; 10] = [
+    "/v2/products?page=3",
+    "/v2/products/42",
+    "/v2/orders",
+    "/v2/users/me",
+    "/login",
+    "/static/app.js",
+    "/images/hero.png",
+    "/search?q=widget",
+    "/feed",
+    "/health",
+];
+
+const TYPES: [&str; 4] = [
+    "application/json",
+    "text/html; charset=utf-8",
+    "image/png",
+    "text/plain",
+];
+
+/// Appends `n` HTTP requests, about 1 ms apart, without bodies.
+pub fn requests(w: &mut SessionWriter, run: RunId, n: usize, seed: u64) {
+    let mut r = Rng(seed.wrapping_mul(0xD6E8_FEB8_6659_FD93) | 1);
+    for i in 0..n {
+        let host = HOSTS[r.below(12) as usize];
+        let path = PATHS[r.below(10) as usize];
+        let method = match r.below(100) {
+            0..=69 => "GET",
+            70..=89 => "POST",
+            90..=93 => "PUT",
+            94..=96 => "PATCH",
+            _ => "DELETE",
+        };
+        let start = i as u64 * 1_000_000 + r.below(900_000);
+        // Skewed towards short requests: 5 ms to 3 s.
+        let u = r.below(1000);
+        let duration = (5 + u * u * 2995 / 1_000_000) * 1_000_000;
+        let roll = r.below(100);
+        let (status, error, pending) = match roll {
+            0..=79 => (
+                Some(200 + [0, 1, 4][r.below(3) as usize] as u16),
+                None,
+                false,
+            ),
+            80..=84 => (Some(301 + r.below(3) as u16 * 3), None, false),
+            85..=92 => (
+                Some([400, 401, 403, 404, 429][r.below(5) as usize]),
+                None,
+                false,
+            ),
+            93..=96 => (Some([500, 502, 503][r.below(3) as usize]), None, false),
+            97..=98 => (
+                None,
+                Some("SocketException: Connection refused".to_string()),
+                false,
+            ),
+            _ => (None, None, true),
+        };
+        let size = r.below(1000);
+        let size = (size * size * 2_000_000 / 1_000_000) as i64;
+        let ok = status.is_some();
+        w.upsert_request(HttpUpdate {
+            run,
+            isolate: "isolates/1".into(),
+            vm_id: i.to_string(),
+            method: method.into(),
+            url: format!("https://{host}{path}"),
+            start: SessionTime(start),
+            start_clamped: false,
+            request_sent: (!pending).then_some(SessionTime(start + 100_000)),
+            response_start: ok.then_some(SessionTime(start + duration / 2)),
+            end: (!pending).then_some(SessionTime(start + duration)),
+            status,
+            reason: None,
+            request_headers: Vec::new(),
+            response_headers: if ok {
+                vec![(
+                    "content-type".into(),
+                    vec![TYPES[r.below(4) as usize].into()],
+                )]
+            } else {
+                Vec::new()
+            },
+            request_content_length: None,
+            response_content_length: ok.then_some(size),
+            events: Vec::new(),
+            error,
+            websocket: false,
+            remote: Some(("127.0.0.1".into(), 53452)),
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::logs::testkit::writer;
+    use crate::net::StatusClass;
+
+    #[test]
+    fn synthetic_requests_follow_the_documented_mix() {
+        let (mut w, run) = writer(1024);
+        requests(&mut w, run, 20_000, 7);
+        let s = w.publish();
+        assert_eq!(s.net.len(), 20_000);
+        assert_eq!(s.net.hosts().len(), 12);
+        let n = |c: StatusClass| {
+            (0..s.net.len())
+                .filter(|&i| s.net.request(i).status_class() == c)
+                .count() as f64
+                / 200.0
+        };
+        assert!((75.0..85.0).contains(&n(StatusClass::Success)));
+        assert!((5.0..11.0).contains(&n(StatusClass::ClientError)));
+        assert!((0.3..2.0).contains(&n(StatusClass::Pending)));
+        let posts = (0..s.net.len())
+            .filter(|&i| s.net.request(i).method == "POST")
+            .count();
+        assert!((3_000..5_000).contains(&posts));
     }
 }

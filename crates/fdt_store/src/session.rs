@@ -2,6 +2,9 @@
 
 use crate::clock::RunClock;
 use crate::logs::{LOG_CHUNK, LogInput, LogStore, LogsSnapshot};
+use crate::net::{
+    BodyKind, BodyLimits, BodyState, HttpUpdate, NetSnapshot, NetStore, RequestUpsert, SocketUpdate,
+};
 use crate::run::{AppInfo, RunInfo};
 use crate::time::{EntryId, RunId, SessionTime};
 use std::sync::Arc;
@@ -13,6 +16,7 @@ pub struct Snapshot {
     pub origin_host_us: i64,
     pub runs: Arc<[RunInfo]>,
     pub logs: LogsSnapshot,
+    pub net: NetSnapshot,
     latest: SessionTime,
 }
 
@@ -24,6 +28,7 @@ impl Snapshot {
             origin_host_us: 0,
             runs: Arc::from(Vec::new()),
             logs: LogsSnapshot::default(),
+            net: NetSnapshot::default(),
             latest: SessionTime(0),
         }
     }
@@ -42,6 +47,7 @@ pub struct SessionWriter {
     origin_host_us: i64,
     runs: Vec<RunInfo>,
     logs: LogStore,
+    net: NetStore,
     latest: SessionTime,
     generation: u64,
     dirty: bool,
@@ -65,6 +71,7 @@ impl SessionWriter {
             origin_host_us,
             runs: Vec::new(),
             logs: LogStore::new(chunk),
+            net: NetStore::new(chunk),
             latest: SessionTime(0),
             generation: 0,
             dirty: false,
@@ -94,6 +101,45 @@ impl SessionWriter {
         let id = self.logs.push(input);
         self.touch(at);
         id
+    }
+
+    /// Inserts or updates a request, keyed by `(run, isolate, vm_id)`.
+    pub fn upsert_request(&mut self, u: HttpUpdate) -> RequestUpsert {
+        for t in [Some(u.start), u.request_sent, u.response_start, u.end]
+            .into_iter()
+            .flatten()
+            .chain(u.events.iter().map(|e| e.1))
+        {
+            self.touch(t);
+        }
+        self.net.upsert_request(u)
+    }
+
+    pub fn set_body_state(&mut self, id: EntryId, kind: BodyKind, state: BodyState) {
+        self.net.set_body_state(id, kind, state);
+        self.dirty = true;
+    }
+
+    /// Stores a body under the limits, evicting the oldest bodies first.
+    pub fn store_body(&mut self, id: EntryId, kind: BodyKind, bytes: Vec<u8>) {
+        self.net.store_body(id, kind, bytes);
+        self.dirty = true;
+    }
+
+    pub fn set_body_limits(&mut self, limits: BodyLimits) {
+        self.net.set_limits(limits);
+        self.dirty = true;
+    }
+
+    /// Inserts or updates a socket, keyed by `(run, isolate, vm_id)`.
+    pub fn upsert_socket(&mut self, u: SocketUpdate) -> EntryId {
+        for t in [Some(u.start), u.end, u.last_read, u.last_write]
+            .into_iter()
+            .flatten()
+        {
+            self.touch(t);
+        }
+        self.net.upsert_socket(u)
     }
 
     pub fn update_run_app(&mut self, run: RunId, f: impl FnOnce(&mut AppInfo)) {
@@ -130,6 +176,7 @@ impl SessionWriter {
                 origin_host_us: self.origin_host_us,
                 runs: self.runs.clone().into(),
                 logs: self.logs.snapshot(),
+                net: self.net.snapshot(self.latest),
                 latest: self.latest,
             });
         }
