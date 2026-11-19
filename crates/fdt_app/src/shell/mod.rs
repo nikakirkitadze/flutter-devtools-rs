@@ -12,10 +12,10 @@ mod title_bar;
 pub(crate) mod tool_page;
 
 use crate::actions::{
-    About, ClearSelection, CloseWindow, Collapse, ConnectToApp, Disconnect, Expand, FollowLatest,
-    GoBack, GoForward, GoToFirst, Minimize, NewSession, OpenDetails, OpenPalette, OpenSettings,
-    SelectNext, SelectPrevious, ShowLogs, ShowMemory, ShowNetwork, ShowPerformance, ShowShortcuts,
-    ShowState, ShowTimeline, ShowWidgets, StopWaiting, ToggleExpand, ToggleFrameHud,
+    About, ClearSelection, CloseWindow, Collapse, ConnectToApp, Disconnect, Expand, FocusSearch,
+    FollowLatest, GoBack, GoForward, GoToFirst, Minimize, NewSession, OpenDetails, OpenPalette,
+    OpenSettings, SelectNext, SelectPrevious, ShowLogs, ShowMemory, ShowNetwork, ShowPerformance,
+    ShowShortcuts, ShowState, ShowTimeline, ShowWidgets, StopWaiting, ToggleExpand, ToggleFrameHud,
     ToggleFullScreen, ToggleRecording, UseDarkTheme, UseLightTheme, UseSystemTheme, Zoom,
 };
 use crate::capture_host::{CaptureControl, CaptureHost};
@@ -117,10 +117,21 @@ impl MainWindow {
         });
         let logs = cx.new(|cx| LogsView::new(session.clone(), window, cx));
         let selected = cx.subscribe_in(&logs, window, |this, _, event, window, cx| {
-            let LogsEvent::Selected(id) = *event;
             let mut to = this.current().clone();
-            to.selection = id.map(Selection::Log);
-            this.navigate(to, window, cx);
+            match *event {
+                LogsEvent::Selected(id) => {
+                    to.selection = id.map(Selection::Log);
+                    this.navigate(to, window, cx);
+                }
+                LogsEvent::Moved(id) => {
+                    to.selection = id.map(Selection::Log);
+                    this.replace_location(to, cx);
+                }
+                LogsEvent::ClearRange => {
+                    to.range = None;
+                    this.navigate(to, window, cx);
+                }
+            }
         });
         let host_wait = (!cx.has_global::<CaptureHost>()).then(|| {
             cx.observe_global_in::<CaptureHost>(window, |this, window, cx| {
@@ -209,12 +220,36 @@ impl MainWindow {
             .update(cx, |logs, cx| logs.set_location(loc.range, selection, cx));
     }
 
-    /// Puts focus on the Logs list whenever it is the current page, so its keys work.
+    /// Puts focus on the Logs list when the user arrives on the Logs page, so its keys work. A
+    /// move within the page (a range drag, a selection) leaves focus where it is.
+    fn focus_logs_on_entry(&self, before: Page, window: &mut Window, cx: &mut Context<Self>) {
+        if before != Page::Tool(Tool::Logs) {
+            self.focus_logs_if_current(window, cx);
+        }
+    }
+
+    /// Asks the Logs list to take focus when it is the current page. The list declines while an
+    /// input (the search field, the palette) has focus.
     fn focus_logs_if_current(&self, window: &mut Window, cx: &mut Context<Self>) {
         if self.current().page == Page::Tool(Tool::Logs) && self.logs_routed(cx) {
             let _ = window;
             self.logs.update(cx, |logs, cx| logs.request_focus(cx));
         }
+    }
+
+    /// Focuses the current tool's search field. Only Logs has one so far.
+    fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.current().page == Page::Tool(Tool::Logs) && self.logs_routed(cx) {
+            self.logs
+                .update(cx, |logs, cx| logs.focus_search(window, cx));
+        }
+    }
+
+    /// Closes the Logs details pane if it is open; true when it was.
+    fn close_logs_details(&mut self, cx: &mut Context<Self>) -> bool {
+        self.current().page == Page::Tool(Tool::Logs)
+            && self.logs_routed(cx)
+            && self.logs.update(cx, |logs, cx| logs.close_details(cx))
     }
 
     /// Runs `f` on the Logs list when it is the current page (the palette reaches it this way).
@@ -264,10 +299,20 @@ impl MainWindow {
     }
 
     pub fn navigate(&mut self, to: Location, window: &mut Window, cx: &mut Context<Self>) {
+        let before = self.current().page;
         if self.history.navigate(to) {
             self.sync_logs(cx);
             self.focus_start_if_current(window, cx);
-            self.focus_logs_if_current(window, cx);
+            self.focus_logs_on_entry(before, window, cx);
+            self.refresh_counts(cx);
+            cx.notify();
+        }
+    }
+
+    /// Rewrites the current location without a Back step (keyboard movement through rows).
+    fn replace_location(&mut self, to: Location, cx: &mut Context<Self>) {
+        if self.history.replace(to) {
+            self.sync_logs(cx);
             self.refresh_counts(cx);
             cx.notify();
         }
@@ -356,20 +401,22 @@ impl MainWindow {
     }
 
     fn go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let before = self.current().page;
         if self.history.go_back().is_some() {
             self.sync_logs(cx);
             self.focus_start_if_current(window, cx);
-            self.focus_logs_if_current(window, cx);
+            self.focus_logs_on_entry(before, window, cx);
             self.refresh_counts(cx);
             cx.notify();
         }
     }
 
     fn go_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let before = self.current().page;
         if self.history.go_forward().is_some() {
             self.sync_logs(cx);
             self.focus_start_if_current(window, cx);
-            self.focus_logs_if_current(window, cx);
+            self.focus_logs_on_entry(before, window, cx);
             self.refresh_counts(cx);
             cx.notify();
         }
@@ -495,7 +542,11 @@ impl Render for MainWindow {
             }))
             .on_action(cx.listener(|this, _: &GoBack, w, cx| this.go_back(w, cx)))
             .on_action(cx.listener(|this, _: &GoForward, w, cx| this.go_forward(w, cx)))
+            .on_action(cx.listener(|this, _: &FocusSearch, w, cx| this.focus_search(w, cx)))
             .on_action(cx.listener(|this, _: &ClearSelection, w, cx| {
+                if this.close_logs_details(cx) {
+                    return;
+                }
                 if let Some(to) = this.current().cleared() {
                     this.navigate(to, w, cx);
                 }

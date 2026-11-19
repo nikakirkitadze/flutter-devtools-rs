@@ -155,6 +155,17 @@ impl NavHistory {
         true
     }
 
+    /// Replaces the current location without adding a Back step (keyboard row movement).
+    /// Clears Forward like a navigation does; false when nothing changed.
+    pub fn replace(&mut self, to: Location) -> bool {
+        if to == self.current {
+            return false;
+        }
+        self.current = to;
+        self.forward.clear();
+        true
+    }
+
     pub fn go_back(&mut self) -> Option<&Location> {
         let prev = self.back.pop_back()?;
         let cur = std::mem::replace(&mut self.current, prev);
@@ -248,6 +259,25 @@ mod tests {
         assert_eq!(h.go_back(), Some(&tl(Tool::Timeline)));
         assert!(h.can_go_forward());
         assert!(h.navigate(tl(Tool::Logs)));
+        assert!(!h.can_go_forward());
+    }
+
+    #[test]
+    fn replace_swaps_the_current_location_without_a_back_step() {
+        let mut h = NavHistory::new(tl(Tool::Logs));
+        let mut a = tl(Tool::Logs);
+        a.selection = Some(Selection::Log(eid(1)));
+        assert!(h.replace(a.clone()));
+        assert!(!h.can_go_back());
+        assert!(!h.replace(a));
+        h.navigate(tl(Tool::Memory));
+        let mut b = tl(Tool::Memory);
+        b.selection = Some(Selection::Log(eid(2)));
+        h.replace(b.clone());
+        assert_eq!(h.back_len(), 1);
+        assert_eq!(h.current(), &b);
+        h.go_back();
+        h.replace(tl(Tool::Network));
         assert!(!h.can_go_forward());
     }
 

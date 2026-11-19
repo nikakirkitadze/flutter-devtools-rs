@@ -1,7 +1,9 @@
 //! The pure part of the Logs list: which rows exist, and whether the list follows new lines.
 //! No GPUI.
 
+use fdt_store::log_query::Matcher;
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 /// A row shows at most this many characters of a record's first line.
@@ -16,6 +18,61 @@ pub fn display_line(text: &str) -> (&str, bool) {
         Some((at, _)) => (&line[..at], true),
         None => (line, false),
     }
+}
+
+/// Highlight ranges for the displayed part of `line`: the byte ranges of `matcher`'s matches that
+/// lie inside the first [`LOG_ROW_MAX_CHARS`] characters of its first line, as offsets into that
+/// displayed text. A match past the cut has no highlight; one that crosses it is clipped.
+pub fn shown_highlights(text: &str, matcher: &Matcher) -> Vec<Range<usize>> {
+    let (shown, _) = display_line(text);
+    matcher.ranges(shown)
+}
+
+/// The most characters of one line the details pane draws; copying still takes all of it.
+pub const DETAILS_LINE_MAX_CHARS: usize = 4_096;
+
+/// Byte offsets where each line of `text` starts. O(size of the record), done once per record
+/// shown in the details pane.
+pub fn line_starts(text: &str) -> Vec<u32> {
+    let mut starts = vec![0u32];
+    starts.extend(
+        text.match_indices('\n')
+            .map(|(at, _)| u32::try_from(at + 1).unwrap_or(u32::MAX)),
+    );
+    starts
+}
+
+/// Line `i` of `text` without its newline, cut to [`DETAILS_LINE_MAX_CHARS`], and whether it was
+/// cut. `starts` is [`line_starts`] of `text`.
+pub fn line_at<'a>(text: &'a str, starts: &[u32], i: usize) -> (&'a str, bool) {
+    let Some(&start) = starts.get(i) else {
+        return ("", false);
+    };
+    let end = starts
+        .get(i + 1)
+        .map_or(text.len(), |&next| next as usize - 1);
+    let line = &text[start as usize..end];
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    match line.char_indices().nth(DETAILS_LINE_MAX_CHARS) {
+        Some((at, _)) => (&line[..at], true),
+        None => (line, false),
+    }
+}
+
+/// The part of a regex error worth showing in a toolbar: the library's last `error:` line.
+pub fn short_query_error(message: &str) -> String {
+    let line = message
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("Invalid regular expression");
+    let line = line.strip_prefix("error: ").unwrap_or(line);
+    let mut out: String = line.chars().take(80).collect();
+    if let Some(first) = out.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    out
 }
 
 /// What one list row shows.
@@ -89,6 +146,12 @@ impl RowMap {
             added += e.extra();
             self.index.push(e);
         }
+    }
+
+    /// Collapses every record, for a store that was replaced under the list.
+    pub fn clear_expanded(&mut self) {
+        self.expanded.clear();
+        self.rebuild();
     }
 
     pub fn filtered(&self) -> &Arc<[u32]> {
@@ -176,8 +239,18 @@ impl Follow {
         if self.following && at_end != Some(false) {
             true
         } else {
+            // Following, but the list is not at its end: stop, so the unseen pill shows.
+            self.following = false;
             self.unseen += n;
             false
+        }
+    }
+
+    /// The user scrolled; `at_end` says whether the list is now at its end. Reaching the end
+    /// resumes following.
+    pub fn on_scrolled(&mut self, at_end: Option<bool>) {
+        if !self.following && at_end == Some(true) {
+            self.resume();
         }
     }
 
@@ -311,6 +384,68 @@ mod tests {
     }
 
     #[test]
+    fn highlights_cover_matches_in_cut_lines() {
+        use fdt_store::log_query::compile_query;
+        let q = compile_query("needle", false).unwrap().unwrap();
+        let m = q.matcher();
+        // Inside the displayed part.
+        let text = format!("{}needle tail", "a".repeat(10));
+        assert_eq!(shown_highlights(&text, &m), vec![10..16]);
+        // Past character 512: nothing to highlight, though the record matches.
+        let text = format!("{}needle", "a".repeat(LOG_ROW_MAX_CHARS + 5));
+        assert!(shown_highlights(&text, &m).is_empty());
+        // Multi-byte text: offsets are bytes of the displayed line.
+        let text = format!("{}needle", "é".repeat(100));
+        assert_eq!(shown_highlights(&text, &m), vec![200..206]);
+        // Only the first line is displayed.
+        assert!(shown_highlights("first\nneedle", &m).is_empty());
+        // A match straddling the cut is clipped away rather than split.
+        let text = format!("{}needle", "a".repeat(LOG_ROW_MAX_CHARS - 3));
+        assert!(shown_highlights(&text, &m).is_empty());
+        let re = compile_query("a+", true).unwrap().unwrap();
+        let text = "a".repeat(LOG_ROW_MAX_CHARS + 50);
+        assert_eq!(
+            shown_highlights(&text, &re.matcher()),
+            vec![0..LOG_ROW_MAX_CHARS]
+        );
+    }
+
+    #[test]
+    fn details_lines_are_indexed_once_and_cut() {
+        let text = "one\ntwo\r\n\nfour";
+        let starts = line_starts(text);
+        let lines: Vec<_> = (0..starts.len())
+            .map(|i| line_at(text, &starts, i).0)
+            .collect();
+        assert_eq!(lines, ["one", "two", "", "four"]);
+        assert_eq!(line_at(text, &starts, 9), ("", false));
+        let long = "é".repeat(DETAILS_LINE_MAX_CHARS + 10);
+        let starts = line_starts(&long);
+        let (shown, cut) = line_at(&long, &starts, 0);
+        assert!(cut);
+        assert_eq!(shown.chars().count(), DETAILS_LINE_MAX_CHARS);
+        assert_eq!(line_starts("").len(), 1);
+        assert_eq!(line_starts("a\n").len(), 2);
+    }
+
+    #[test]
+    fn query_errors_are_shortened() {
+        let msg = "regex parse error:\n    (\n    ^\nerror: unclosed group";
+        assert_eq!(short_query_error(msg), "Unclosed group");
+        assert_eq!(short_query_error(""), "Invalid regular expression");
+    }
+
+    #[test]
+    fn clearing_expansion_collapses_everything() {
+        let mut m = RowMap::new(ids(5));
+        m.toggle(1, 2);
+        m.toggle(3, 2);
+        m.clear_expanded();
+        assert_eq!(m.row_count(), 5);
+        assert!(!m.is_expanded(1));
+    }
+
+    #[test]
     fn follow_state_machine() {
         let mut f = Follow::default();
         assert!(f.following);
@@ -320,7 +455,11 @@ mod tests {
         // Following, but the list was scrolled away from the end.
         assert!(!f.on_new_rows(3, Some(false)));
         assert_eq!(f.unseen, 3);
-        f.resume();
+        assert!(!f.following, "paused so the unseen pill shows");
+        f.on_scrolled(Some(false));
+        assert!(!f.following);
+        f.on_scrolled(Some(true));
+        assert!(f.following && f.unseen == 0);
         assert!(f.following && f.unseen == 0);
         f.on_select();
         assert!(!f.following);

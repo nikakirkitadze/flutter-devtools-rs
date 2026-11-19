@@ -1,11 +1,12 @@
 //! The command registry the palette, menus and cheat sheet are built from.
 
 use crate::actions::{
-    About, ClearSelection, CloseWindow, Collapse, ConnectToApp, Disconnect, Expand, FollowLatest,
-    GoBack, GoForward, GoToFirst, Minimize, NewSession, NewWindow, OpenDetails, OpenSettings, Quit,
-    SelectNext, SelectPrevious, ShowLogs, ShowMemory, ShowNetwork, ShowPerformance, ShowShortcuts,
-    ShowState, ShowTimeline, ShowWidgets, StopWaiting, ToggleExpand, ToggleFrameHud,
-    ToggleFullScreen, ToggleRecording, UseDarkTheme, UseLightTheme, UseSystemTheme, Zoom,
+    About, ClearSelection, CloseWindow, Collapse, ConnectToApp, Disconnect, Expand, FocusSearch,
+    FollowLatest, GoBack, GoForward, GoToFirst, Minimize, NewSession, NewWindow, OpenDetails,
+    OpenSettings, Quit, SelectNext, SelectPrevious, ShowLogs, ShowMemory, ShowNetwork,
+    ShowPerformance, ShowShortcuts, ShowState, ShowTimeline, ShowWidgets, StopWaiting,
+    ToggleExpand, ToggleFrameHud, ToggleFullScreen, ToggleRecording, UseDarkTheme, UseLightTheme,
+    UseSystemTheme, Zoom,
 };
 #[cfg(target_os = "macos")]
 use crate::actions::{Hide, HideOthers, ShowAll};
@@ -100,6 +101,13 @@ pub fn commands() -> Vec<CommandSpec> {
             keywords: &["range", "escape"],
             group: Group::Navigation,
             action: || Box::new(ClearSelection),
+        },
+        CommandSpec {
+            id: "search.focus",
+            label: "Search in Current Tool",
+            keywords: &["find", "filter"],
+            group: Group::View,
+            action: || Box::new(FocusSearch),
         },
         CommandSpec {
             id: "connect.open",

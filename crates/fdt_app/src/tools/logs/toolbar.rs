@@ -6,8 +6,10 @@ use fdt_store::logs::LogLevel;
 use fdt_ui::theme::TokensExt as _;
 use fdt_ui::tokens::{alpha, font, layout, radius, space};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::Input;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::skeleton::Skeleton;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::{
     AnyElement, Context, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
     SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, div,
@@ -147,6 +149,70 @@ impl LogsView {
                 .child(label)
         });
 
+        let search = div()
+            .id("logs-search")
+            .test_support()
+            .flex_none()
+            .w(layout::SEARCH_WIDTH)
+            .min_w(layout::SEARCH_MIN)
+            .child(Input::new(&self.search).cleanable(true));
+        let regex = div()
+            .id("logs-regex")
+            .test_support()
+            .aria_label("Regular expression")
+            .flex_none()
+            .px(space::S6)
+            .py(space::S2)
+            .rounded(radius::CHIP)
+            .font_family(font::MONO)
+            .text_size(font::LABEL)
+            .cursor_pointer()
+            .when_on(self.regex, Hsla::from(t.accent), Hsla::from(t.text_muted))
+            .tooltip(|window, cx| Tooltip::new("Regular expression").build(window, cx))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_regex(cx)))
+            .child(".*");
+        let status = if let Some(error) = self.search_error.clone() {
+            Some(
+                div()
+                    .id("logs-search-error")
+                    .test_support()
+                    .aria_label(error.clone())
+                    .flex_none()
+                    .max_w(layout::SEARCH_WIDTH)
+                    .truncate()
+                    .text_size(font::LABEL)
+                    .text_color(Hsla::from(t.danger))
+                    .child(error),
+            )
+        } else if self.searching() {
+            Some(
+                div()
+                    .id("logs-searching")
+                    .test_support()
+                    .aria_label("Searching\u{2026}")
+                    .flex_none()
+                    .text_size(font::LABEL)
+                    .text_color(Hsla::from(t.text_muted))
+                    .child("Searching\u{2026}"),
+            )
+        } else {
+            self.match_count().map(|n| {
+                let label = if n == 1 {
+                    "1 match".to_string()
+                } else {
+                    format!("{} matches", format_count(n as u64))
+                };
+                div()
+                    .id("logs-match-count")
+                    .test_support()
+                    .aria_label(SharedString::from(label.clone()))
+                    .flex_none()
+                    .text_size(font::LABEL)
+                    .text_color(Hsla::from(t.text_muted))
+                    .child(label)
+            })
+        };
+
         div()
             .relative()
             .flex()
@@ -161,6 +227,9 @@ impl LogsView {
             .children(chips)
             .child(div().id("logs-source").test_support().child(sources))
             .child(div().id("logs-logger").test_support().child(loggers))
+            .child(search)
+            .child(regex)
+            .children(status)
             .child(div().flex_1())
             .children(unseen)
             .child(follow_toggle)

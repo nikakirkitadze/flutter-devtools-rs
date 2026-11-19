@@ -5,7 +5,7 @@
 //! visible rows. At most one job runs at a time; inputs that arrive meanwhile are picked up when
 //! it finishes.
 
-use super::model::{Follow, RowMap, RowRef, display_line};
+use super::model::{Follow, RowMap, RowRef, display_line, short_query_error};
 use crate::actions::{
     Collapse, Expand, FollowLatest, GoToFirst, OpenDetails, SelectNext, SelectPrevious,
     ToggleExpand,
@@ -15,20 +15,25 @@ use crate::nav::{EntryId, TimeRange};
 use crate::session_model::SessionModel;
 use crate::shell::strip::format_offset;
 use fdt_store::Snapshot;
-use fdt_store::log_query::{LogFilter, filter_logs};
+use fdt_store::log_query::{LogFilter, Matcher, compile_query, filter_logs, filter_logs_two_phase};
 use fdt_store::logs::{LogLevel, LogRow, LogSource};
 use fdt_store::time::SessionTime;
 use fdt_ui::theme::TokensExt as _;
 use fdt_ui::tokens::{alpha, font, motion, radius, row, space, table};
+use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::component::resizable::{ResizablePanelEvent, ResizableState};
 use gpui_kit::{
     AnyElement, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Hsla,
-    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _, Render,
-    ScrollEvent, ScrollStrategy, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Task, TestSupportExt as _, UniformListScrollHandle, Window, div, relative,
-    uniform_list,
+    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _, Pixels,
+    Render, ScrollEvent, ScrollStrategy, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Task, TestSupportExt as _, UniformListScrollHandle, Window, div,
+    relative, uniform_list,
 };
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::oneshot;
 
 #[cfg(test)]
 thread_local! {
@@ -39,8 +44,14 @@ thread_local! {
 /// What the Logs list tells the shell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogsEvent {
-    /// The selected record changed (`None`: cleared).
+    /// The selection changed by a click or Enter (`None`: cleared). The shell pushes a history
+    /// entry.
     Selected(Option<EntryId>),
+    /// The selection moved by keyboard (or was dropped by a filter). The shell replaces the
+    /// current history entry instead of pushing, so holding `j` does not fill Back.
+    Moved(Option<EntryId>),
+    /// "Clear filters" also asks for the shared time range to go.
+    ClearRange,
 }
 
 pub(super) const ALL_LEVELS: [LogLevel; 4] = [
@@ -78,6 +89,9 @@ struct JobResult {
     filtered: Arc<[u32]>,
     counts: [u64; 4],
     incremental: bool,
+    /// The store under the rows is not the one they were computed from: a new session or run
+    /// replaced it, so expansion and selection no longer mean anything.
+    replaced: bool,
 }
 
 /// First and last record times, to tell a grown store from a replaced one.
@@ -89,13 +103,21 @@ fn fingerprint(snap: &Snapshot) -> Option<(SessionTime, SessionTime)> {
 /// Filters `snap` and counts levels in the filter's range. O(records) in the worst case; runs
 /// off the UI thread. With a `prior` result of the same filter over a store this one extends,
 /// only the new records are scanned.
+///
+/// A text search runs in two phases: `first` gets the newest rows as soon as they are known. When
+/// `cancel` is set the scan stops and the result is `None`.
 fn compute(
     snap: &Snapshot,
     filter: &LogFilter,
     version: u64,
     prior: Option<(Applied, Arc<[u32]>)>,
-) -> JobResult {
+    cancel: &AtomicBool,
+    first: oneshot::Sender<Vec<u32>>,
+) -> Option<JobResult> {
     let counts = snap.logs.level_counts(filter.range);
+    let same_filter = prior
+        .as_ref()
+        .is_some_and(|(p, _)| p.key.version == version);
     if let Some((p, old)) = prior
         && p.key.version == version
         && p.len > 0
@@ -112,17 +134,30 @@ fn compute(
             all.extend_from_slice(&new);
             all.into()
         };
-        return JobResult {
+        return Some(JobResult {
             filtered,
             counts,
             incremental: true,
-        };
+            replaced: false,
+        });
     }
-    JobResult {
-        filtered: filter_logs(&snap.logs, filter, 0).into(),
+    let filtered: Arc<[u32]> = if filter.text.is_some() {
+        let mut first = Some(first);
+        filter_logs_two_phase(&snap.logs, filter, cancel, |rows| {
+            if let Some(tx) = first.take() {
+                tx.send(rows).ok();
+            }
+        })?
+        .into()
+    } else {
+        filter_logs(&snap.logs, filter, 0).into()
+    };
+    Some(JobResult {
+        filtered,
         counts,
         incremental: false,
-    }
+        replaced: same_filter,
+    })
 }
 
 pub struct LogsView {
@@ -136,7 +171,7 @@ pub struct LogsView {
     follow: Follow,
     scroll: UniformListScrollHandle,
     focus: FocusHandle,
-    selected: Option<u32>,
+    pub(super) selected: Option<u32>,
     /// A selection from the location, waiting for the filter result it depends on.
     pending: Option<EntryId>,
     applied: Option<Applied>,
@@ -149,18 +184,47 @@ pub struct LogsView {
     rendered: Range<usize>,
     /// Focus the list the next time it is drawn (its element may not exist yet).
     focus_wanted: bool,
+    /// The search field.
+    pub(super) search: Entity<InputState>,
+    /// The text of the field the filter was last started for (or tried to).
+    query: SharedString,
+    pub(super) regex: bool,
+    /// The query and mode the current text filter was compiled from.
+    applied_query: Option<(SharedString, bool)>,
+    /// Shown instead of the match count while the query does not compile; the rows stay.
+    pub(super) search_error: Option<SharedString>,
+    /// The text filter, prepared once for highlighting rendered rows.
+    pub(super) matcher: Option<Arc<Matcher>>,
+    /// Set when the filter changes so a running scan stops; replaced by a fresh flag.
+    cancel: Arc<AtomicBool>,
+    /// Waits for a job's first-phase rows.
+    first_task: Option<Task<()>>,
+    #[cfg(test)]
+    first_phases: usize,
+    pub(super) details_open: bool,
+    pub(super) details: super::details::DetailsState,
+    split: Option<Entity<ResizableState>>,
+    pub(super) details_width: Pixels,
+    _split_sub: Option<Subscription>,
+    _search_sub: Subscription,
     _session: Subscription,
 }
 
 impl EventEmitter<LogsEvent> for LogsView {}
 
 impl LogsView {
-    pub fn new(
-        session: Entity<SessionModel>,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(session: Entity<SessionModel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let observed = cx.observe(&session, |this, _, cx| this.request(cx));
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search logs"));
+        let search_sub = cx.subscribe_in(
+            &search,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => this.query_changed(cx),
+                InputEvent::PressEnter { .. } => window.focus(&this.focus, cx),
+                _ => {}
+            },
+        );
         let snap = session.read(cx).snapshot().clone();
         let mut this = Self {
             session,
@@ -181,6 +245,22 @@ impl LogsView {
             skeleton_task: None,
             rendered: 0..0,
             focus_wanted: false,
+            search,
+            query: SharedString::default(),
+            regex: false,
+            applied_query: None,
+            search_error: None,
+            matcher: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            first_task: None,
+            #[cfg(test)]
+            first_phases: 0,
+            details_open: false,
+            details: super::details::DetailsState::default(),
+            split: None,
+            details_width: fdt_ui::tokens::layout::DETAILS_WIDTH,
+            _split_sub: None,
+            _search_sub: search_sub,
             _session: observed,
         };
         this.request(cx);
@@ -232,22 +312,41 @@ impl LogsView {
                         return None;
                     }
                     let prior = this.applied.map(|a| (a, this.rows.filtered().clone()));
-                    Some((key, snap, this.filter.clone(), prior))
+                    // The first-phase rows of a text search arrive on a channel the view
+                    // awaits, so the UI thread never blocks on the scan.
+                    let (first_tx, first_rx) = oneshot::channel();
+                    this.first_task = Some(cx.spawn(async move |this, cx| {
+                        if let Ok(rows) = first_rx.await {
+                            this.update(cx, |this, cx| this.apply_first(key, rows, cx))
+                                .ok();
+                        }
+                    }));
+                    Some((
+                        key,
+                        snap,
+                        this.filter.clone(),
+                        prior,
+                        this.cancel.clone(),
+                        first_tx,
+                    ))
                 });
-                let Ok(Some((key, snap, filter, prior))) = next else {
+                let Ok(Some((key, snap, filter, prior, cancel, first_tx))) = next else {
                     break;
                 };
                 let job_snap = snap.clone();
                 let result = cx
-                    .background_spawn(
-                        async move { compute(&job_snap, &filter, key.version, prior) },
-                    )
+                    .background_spawn(async move {
+                        compute(&job_snap, &filter, key.version, prior, &cancel, first_tx)
+                    })
                     .await;
                 done = Some(key);
                 let applied = this.update(cx, |this, cx| {
-                    // A result for an older filter is dropped. An older snapshot is not: the
-                    // store only grows, and the next round picks up what was missed.
-                    if this.version == key.version {
+                    // A result for an older filter is dropped, and so is a cancelled scan. An
+                    // older snapshot is not: the store only grows, and the next round picks up
+                    // what was missed.
+                    if this.version == key.version
+                        && let Some(result) = result
+                    {
                         this.apply(key, snap, result, cx);
                     }
                 });
@@ -260,6 +359,7 @@ impl LogsView {
 
     fn finish_job(&mut self, cx: &mut Context<Self>) {
         self.running = false;
+        self.first_task = None;
         self.skeleton_task = None;
         if self.show_skeleton {
             self.show_skeleton = false;
@@ -272,6 +372,16 @@ impl LogsView {
         let at_end = self.scroll.is_scrolled_to_end();
         let first_load = self.applied.is_none();
         let old_rows = self.rows.row_count();
+        if result.replaced {
+            // A new session or run replaced the store: nothing expanded or selected before
+            // refers to these records.
+            self.rows.clear_expanded();
+            self.pending = None;
+            if self.selected.take().is_some() {
+                cx.emit(LogsEvent::Moved(None));
+            }
+            self.details.reset();
+        }
         self.rows.set_filtered(result.filtered);
         self.counts = result.counts;
         let (first, last) = fingerprint(&snap).unwrap_or((SessionTime(0), SessionTime(0)));
@@ -288,7 +398,7 @@ impl LogsView {
             && self.rows.row_of(sel).is_none()
         {
             self.selected = None;
-            cx.emit(LogsEvent::Selected(None));
+            cx.emit(LogsEvent::Moved(None));
         }
         if first_load || !result.incremental {
             if self.follow.following {
@@ -303,6 +413,23 @@ impl LogsView {
         cx.notify();
     }
 
+    /// Shows the newest matches of a text search before the full scan ends. Ignored when the
+    /// full result of the same job has already arrived, or the filter has moved on.
+    fn apply_first(&mut self, key: Key, rows: Vec<u32>, cx: &mut Context<Self>) {
+        if self.version != key.version || self.applied.is_some_and(|a| a.key == key) {
+            return;
+        }
+        self.rows.set_filtered(rows.into());
+        if self.follow.following {
+            self.scroll.scroll_to_bottom();
+        }
+        #[cfg(test)]
+        {
+            self.first_phases += 1;
+        }
+        cx.notify();
+    }
+
     /// Whether the rows on screen are for the current filter and nothing is being computed.
     fn settled(&self) -> bool {
         !self.running && self.applied.is_some_and(|a| a.key.version == self.version)
@@ -310,6 +437,9 @@ impl LogsView {
 
     fn bump(&mut self, cx: &mut Context<Self>) {
         self.version += 1;
+        // The running scan is for a filter nobody wants any more.
+        self.cancel.store(true, Ordering::Relaxed);
+        self.cancel = Arc::new(AtomicBool::new(false));
         self.request(cx);
         cx.notify();
     }
@@ -357,13 +487,103 @@ impl LogsView {
         self.bump(cx);
     }
 
-    /// Resets every filter of the list; the shared time range is left alone.
-    pub fn clear_filters(&mut self, cx: &mut Context<Self>) {
+    /// Resets every filter of the list, the search query and, when one is set, the shared time
+    /// range (the shell is asked to drop it).
+    pub fn clear_filters(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.filter = LogFilter {
             range: self.filter.range,
             ..LogFilter::default()
         };
+        self.search
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.query = SharedString::default();
+        self.applied_query = None;
+        self.search_error = None;
+        self.matcher = None;
+        if self.filter.range.is_some() {
+            cx.emit(LogsEvent::ClearRange);
+        }
         self.bump(cx);
+    }
+
+    // ---- search ----
+
+    fn query_changed(&mut self, cx: &mut Context<Self>) {
+        let value = self.search.read(cx).value();
+        // Enter repeats the last change; only a different value is a new query.
+        if value == self.query {
+            return;
+        }
+        self.query = value;
+        self.apply_query(cx);
+    }
+
+    /// Compiles the field's text and, if valid and new, starts a scan for it. An invalid query
+    /// shows its error and leaves the rows as they were.
+    fn apply_query(&mut self, cx: &mut Context<Self>) {
+        match compile_query(&self.query, self.regex) {
+            Err(e) => {
+                self.search_error = Some(short_query_error(&e.message).into());
+                cx.notify();
+            }
+            Ok(q) => {
+                self.search_error = None;
+                let key = (self.query.clone(), self.regex);
+                if self.applied_query.as_ref() == Some(&key) {
+                    cx.notify();
+                    return;
+                }
+                self.applied_query = Some(key);
+                self.matcher = q.as_ref().map(|q| Arc::new(q.matcher()));
+                self.filter.text = q;
+                self.bump(cx);
+            }
+        }
+    }
+
+    /// Sets the search field and regex mode and runs the search. The palette uses this.
+    pub fn set_search(
+        &mut self,
+        query: &str,
+        regex: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.regex = regex;
+        self.search.update(cx, |input, cx| {
+            input.set_value(query.to_string(), window, cx)
+        });
+        self.query = query.to_string().into();
+        self.apply_query(cx);
+    }
+
+    pub(super) fn toggle_regex(&mut self, cx: &mut Context<Self>) {
+        self.regex = !self.regex;
+        self.apply_query(cx);
+        cx.notify();
+    }
+
+    /// Whether the search field is on screen: the list view, not the empty state.
+    fn has_toolbar(&self, cx: &Context<Self>) -> bool {
+        !self.session.read(cx).snapshot().logs.is_empty()
+    }
+
+    /// Focuses the search field (⌘F).
+    pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_toolbar(cx) {
+            self.search.update(cx, |input, cx| input.focus(window, cx));
+        }
+    }
+
+    /// The matches of the current text filter, once its scan is the one on screen.
+    pub(super) fn match_count(&self) -> Option<usize> {
+        (self.filter.text.is_some() && self.settled() && self.search_error.is_none())
+            .then(|| self.rows.filtered().len())
+    }
+
+    /// Whether a text search is scanning and has been for longer than the loading delay.
+    pub(super) fn searching(&self) -> bool {
+        self.show_skeleton && self.filter.text.is_some()
     }
 
     // ---- location ----
@@ -431,12 +651,18 @@ impl LogsView {
 
     // ---- selection and keys ----
 
-    fn select_seq(&mut self, seq: u32, cx: &mut Context<Self>) {
+    /// Selects `seq`. Keyboard movement (`replace`) rewrites the current history entry; a click
+    /// pushes a new one.
+    fn select_seq(&mut self, seq: u32, replace: bool, cx: &mut Context<Self>) {
         self.selected = Some(seq);
         self.follow.on_select();
         self.reveal(seq, ScrollStrategy::Nearest);
         let id = self.snap.logs.row(seq as usize).id;
-        cx.emit(LogsEvent::Selected(Some(id)));
+        cx.emit(if replace {
+            LogsEvent::Moved(Some(id))
+        } else {
+            LogsEvent::Selected(Some(id))
+        });
         cx.notify();
     }
 
@@ -463,7 +689,7 @@ impl LogsView {
                 filtered.binary_search(&seq).unwrap_or(0)
             }
         };
-        self.select_seq(filtered[target], cx);
+        self.select_seq(filtered[target], true, cx);
     }
 
     pub fn select_next(&mut self, cx: &mut Context<Self>) {
@@ -503,7 +729,23 @@ impl LogsView {
     }
 
     /// Shows the details pane for the selected record.
-    pub fn open_details(&mut self, _cx: &mut Context<Self>) {}
+    pub fn open_details(&mut self, cx: &mut Context<Self>) {
+        let Some(seq) = self.selected else { return };
+        self.details_open = true;
+        // Enter commits the selection as a history step (nothing new if it already is one).
+        let id = self.snap.logs.row(seq as usize).id;
+        cx.emit(LogsEvent::Selected(Some(id)));
+        cx.notify();
+    }
+
+    /// Closes the details pane; true when it was open (Esc closes it before the selection).
+    pub fn close_details(&mut self, cx: &mut Context<Self>) -> bool {
+        let was = std::mem::take(&mut self.details_open);
+        if was {
+            cx.notify();
+        }
+        was
+    }
 
     pub fn follow_latest(&mut self, cx: &mut Context<Self>) {
         self.follow.resume();
@@ -522,7 +764,7 @@ impl LogsView {
 
     pub fn go_to_first(&mut self, cx: &mut Context<Self>) {
         if let Some(&first) = self.rows.filtered().first() {
-            self.select_seq(first, cx);
+            self.select_seq(first, true, cx);
             self.scroll.scroll_to_item(0, ScrollStrategy::Top);
         }
     }
@@ -560,6 +802,66 @@ impl LogsView {
     pub fn is_filtering(&self) -> bool {
         self.running
     }
+
+    #[cfg(test)]
+    pub fn last_cancel(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
+    }
+
+    #[cfg(test)]
+    pub fn search_value(&self, cx: &gpui_kit::App) -> SharedString {
+        self.search.read(cx).value()
+    }
+
+    #[cfg(test)]
+    pub fn search_focused(&self, window: &Window, cx: &gpui_kit::App) -> bool {
+        gpui_kit::Focusable::focus_handle(self.search.read(cx), cx).is_focused(window)
+    }
+
+    #[cfg(test)]
+    pub fn details_open(&self) -> bool {
+        self.details_open
+    }
+
+    #[cfg(test)]
+    pub fn is_expanded(&self, seq: u32) -> bool {
+        self.rows.is_expanded(seq)
+    }
+
+    #[cfg(test)]
+    pub fn show_skeleton_for_test(&mut self, cx: &mut Context<Self>) {
+        self.show_skeleton = true;
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub fn searching_for_test(&self) -> bool {
+        self.searching()
+    }
+
+    #[cfg(test)]
+    pub fn first_phases(&self) -> usize {
+        self.first_phases
+    }
+
+    #[cfg(test)]
+    pub fn scroll_to_top(&self) {
+        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+    }
+
+    #[cfg(test)]
+    pub fn details_lines(&self) -> usize {
+        self.details.line_count()
+    }
+
+    #[cfg(test)]
+    pub fn apply_first_for_test(&mut self, rows: Vec<u32>, cx: &mut Context<Self>) {
+        let key = Key {
+            generation: self.snap.generation,
+            version: self.version,
+        };
+        self.apply_first(key, rows, cx);
+    }
 }
 
 // ---- rendering ----
@@ -575,7 +877,7 @@ pub(super) fn level_color(level: LogLevel, t: &fdt_ui::tokens::Palette) -> Hsla 
 }
 
 /// `m:ss.mmm`.
-fn format_time(t: SessionTime) -> String {
+pub(super) fn format_time(t: SessionTime) -> String {
     format!("{}.{:03}", format_offset(t), (t.0 / 1_000_000) % 1_000)
 }
 
@@ -621,33 +923,63 @@ impl LogsView {
             .when_selected(selected, rr, t)
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
                     window.focus(&this.focus, cx);
-                    this.select_seq(seq, cx);
+                    this.select_seq(seq, false, cx);
+                    if ev.click_count >= 2 || matches!(rr, RowRef::ShowAll { .. }) {
+                        this.open_details(cx);
+                    }
                 }),
             );
+        let view = cx.weak_entity();
+        let menu =
+            move |menu: gpui_kit::component::menu::PopupMenu,
+                  _window: &mut Window,
+                  _cx: &mut Context<gpui_kit::component::menu::PopupMenu>| {
+                let copy = view.clone();
+                let json = view.clone();
+                menu.item(PopupMenuItem::new("Copy").on_click(move |_, _, cx| {
+                    copy.update(cx, |v, cx| v.copy_text(seq, cx)).ok();
+                }))
+                .item(
+                    PopupMenuItem::new("Copy as JSON").on_click(move |_, _, cx| {
+                        json.update(cx, |v, cx| v.copy_json(seq, cx)).ok();
+                    }),
+                )
+            };
         let indent = table::COL_TIME + table::COL_LEVEL + table::COL_LOGGER + space::S8 * 3.0;
         match rr {
             RowRef::Record { .. } => base
                 .child(self.record_cells(&rec, seq, t, cx))
+                .context_menu(menu)
                 .into_any_element(),
             RowRef::Continuation { line, .. } => {
                 let text = rec.text.split('\n').nth(line as usize).unwrap_or("");
                 let (shown, cut) = display_line(text);
+                let ranges = self.matcher_ranges(text);
                 let shown = if cut {
                     format!("{shown}\u{2026}")
                 } else {
                     shown.to_string()
                 };
+                let bg = t.accent.with_alpha(alpha::SELECTION);
                 base.text_color(Hsla::from(t.text_muted))
                     .child(div().flex_none().w(indent))
-                    .child(div().flex_1().min_w_0().truncate().child(shown))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(self.highlighted(shown, ranges, bg)),
+                    )
+                    .context_menu(menu)
                     .into_any_element()
             }
             RowRef::ShowAll { .. } => base
                 .text_color(Hsla::from(t.accent))
                 .child(div().flex_none().w(indent))
                 .child(format!("Show all {} lines in details", rec.line_count))
+                .context_menu(menu)
                 .into_any_element(),
         }
     }
@@ -660,6 +992,8 @@ impl LogsView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (shown, cut) = display_line(rec.text);
+        let ranges = self.matcher_ranges(rec.text);
+        let bg = t.accent.with_alpha(alpha::SELECTION);
         let message = if cut {
             format!("{shown}\u{2026}")
         } else {
@@ -722,7 +1056,13 @@ impl LogsView {
                     .text_color(Hsla::from(t.text_muted))
                     .child(source),
             )
-            .child(div().flex_1().min_w_0().truncate().child(message))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(self.highlighted(message, ranges, bg)),
+            )
             .children(more)
             .into_any_element()
     }
@@ -765,9 +1105,57 @@ impl LogsView {
                 if ev.delta.pixel_delta(row::LOG).y > gpui_kit::px(0.) {
                     this.follow.on_user_scrolled_up();
                     cx.notify();
+                } else {
+                    // Scrolling back down to the end resumes following. Checked once the list
+                    // has moved.
+                    let view = cx.entity();
+                    cx.defer(move |cx| {
+                        view.update(cx, |this, cx| {
+                            let at_end = this.scroll.is_scrolled_to_end();
+                            let before = this.follow;
+                            this.follow.on_scrolled(at_end);
+                            if this.follow != before {
+                                cx.notify();
+                            }
+                        });
+                    });
                 }
             }))
             .child(content)
+            .into_any_element()
+    }
+
+    /// The list beside the details pane, in a split the user can resize.
+    fn with_details(&mut self, list: AnyElement, cx: &mut Context<Self>) -> AnyElement {
+        use fdt_ui::tokens::layout;
+        use gpui_kit::component::resizable::{h_resizable, resizable_panel};
+        let state = match &self.split {
+            Some(state) => state.clone(),
+            None => {
+                let state = cx.new(|_| ResizableState::default());
+                self._split_sub = Some(cx.subscribe(
+                    &state,
+                    |this, state, _: &ResizablePanelEvent, cx| {
+                        if let Some(&w) = state.read(cx).sizes().last() {
+                            this.details_width = w;
+                        }
+                    },
+                ));
+                self.split = Some(state.clone());
+                state
+            }
+        };
+        let details = self.render_details(cx);
+        h_resizable("logs-split")
+            .with_state(&state)
+            .child(resizable_panel().child(list))
+            .child(
+                resizable_panel()
+                    .size(self.details_width)
+                    .size_range(layout::DETAILS_MIN..layout::DETAILS_MAX)
+                    .flex_none()
+                    .child(details),
+            )
             .into_any_element()
     }
 
@@ -798,7 +1186,7 @@ impl LogsView {
                     .text_size(font::BODY)
                     .text_color(Hsla::from(t.text))
                     .cursor_pointer()
-                    .on_click(cx.listener(|this, _, _, cx| this.clear_filters(cx)))
+                    .on_click(cx.listener(|this, _, window, cx| this.clear_filters(window, cx)))
                     .child("Clear filters"),
             )
             .into_any_element()
@@ -822,7 +1210,11 @@ impl<E: gpui_kit::Styled> RowTint for E {
 
 impl Render for LogsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if std::mem::take(&mut self.focus_wanted) {
+        if std::mem::take(&mut self.focus_wanted)
+            && !window.context_stack().iter().any(|c| c.contains("Input"))
+        {
+            // Not while the user is typing: a range drag or a status change must not pull
+            // focus out of the search field or the palette.
             window.focus(&self.focus, cx);
         }
         if self.session.read(cx).snapshot().logs.is_empty() {
@@ -849,12 +1241,26 @@ impl Render for LogsView {
         } else {
             self.rows_list(cx)
         };
+        let list = self.list_area(body, cx);
+        let content = if self.details_open {
+            self.with_details(list, cx)
+        } else {
+            list
+        };
         div()
             .size_full()
             .flex()
             .flex_col()
             .child(self.render_toolbar(cx))
-            .child(self.list_area(body, cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(content),
+            )
             .into_any_element()
     }
 }
@@ -1218,5 +1624,602 @@ mod tests {
         cx.simulate_keystrokes("j");
         cx.run_until_parked();
         assert_eq!(view.read_with(cx, |v, _| v.selected()), None);
+    }
+
+    // ---- search, details, history and focus (Task 17) ----
+
+    /// Records 0..n: every fifth says "burst of events", every seventh "Burst" with a capital;
+    /// the rest are plain.
+    fn search_snapshot(n: usize) -> Arc<Snapshot> {
+        snapshot(|w, run| {
+            for i in 0..n {
+                let mut input = log_at(run, i as u64, LogLevel::Info);
+                input.text = if i % 5 == 0 {
+                    format!("burst of events {i}")
+                } else if i % 7 == 0 {
+                    format!("Burst capital {i}")
+                } else {
+                    format!("plain line {i}")
+                };
+                w.push_log(input);
+            }
+        })
+    }
+
+    fn open_search(
+        cx: &mut TestAppContext,
+        n: usize,
+    ) -> (
+        gpui_kit::Entity<crate::shell::MainWindow>,
+        gpui_kit::Entity<LogsView>,
+        &mut VisualTestContext,
+    ) {
+        let (shell, cx) = open_shell_snapshot(cx, search_snapshot(n));
+        press(cx, "cmd-5", "ctrl-5");
+        cx.run_until_parked();
+        frame(cx);
+        let view = view_of(&shell, cx);
+        (shell, view, cx)
+    }
+
+    fn type_query(cx: &mut VisualTestContext, text: &str) {
+        press(cx, "cmd-f", "ctrl-f");
+        cx.simulate_input(text);
+        cx.run_until_parked();
+        frame(cx);
+    }
+
+    fn label_of(cx: &mut VisualTestContext, id: &str) -> Option<String> {
+        frame(cx);
+        let id = id.to_string();
+        cx.update(|window, _| {
+            window
+                .try_find(id)
+                .and_then(|e| e.label().map(str::to_string))
+        })
+    }
+
+    fn clipboard(cx: &mut VisualTestContext) -> Option<String> {
+        cx.update(|_, cx| cx.read_from_clipboard().and_then(|i| i.text()))
+    }
+
+    #[gpui_kit::test]
+    fn cmd_f_focuses_search(cx: &mut TestAppContext) {
+        let (_shell, view, cx) = open_search(cx, 20);
+        assert!(!cx.update(|window, cx| view.read(cx).search_focused(window, cx)));
+        press(cx, "cmd-f", "ctrl-f");
+        assert!(cx.update(|window, cx| view.read(cx).search_focused(window, cx)));
+        // Typing goes to the field, not to the list keys.
+        cx.simulate_input("j");
+        assert_eq!(view.read_with(cx, |v, cx| v.search_value(cx)).as_ref(), "j");
+        assert_eq!(view.read_with(cx, |v, _| v.selected()), None);
+        assert!(present(cx, "logs-search"));
+    }
+
+    #[gpui_kit::test]
+    fn typing_filters_rows_and_counts_matches(cx: &mut TestAppContext) {
+        let (_shell, view, cx) = open_search(cx, 40);
+        assert_eq!(view.read_with(cx, |v, _| v.filtered_len()), 40);
+        assert!(!present(cx, "logs-match-count"));
+        type_query(cx, "burst");
+        // Multiples of 5 say "burst"; "Burst" rows (multiples of 7 that are not of 5) match
+        // case-insensitively too: 8 + 4.
+        let n = view.read_with(cx, |v, _| v.filtered_len());
+        assert_eq!(n, 12);
+        assert_eq!(
+            label_of(cx, "logs-match-count").as_deref(),
+            Some("12 matches")
+        );
+        // Clearing the field brings every row back.
+        cx.simulate_keystrokes("cmd-a backspace");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |v, _| v.filtered_len()), 40);
+        assert!(!present(cx, "logs-match-count"));
+    }
+
+    #[gpui_kit::test]
+    fn uppercase_makes_search_case_sensitive(cx: &mut TestAppContext) {
+        let (_shell, view, cx) = open_search(cx, 40);
+        type_query(cx, "Burst");
+        // Only the capitalised rows: multiples of 7 that are not multiples of 5 (7, 14, 21,
+        // 28, 42 is out of range): 7, 14, 21, 28.
+        assert_eq!(view.read_with(cx, |v, _| v.filtered_len()), 4);
+        assert_eq!(
+            label_of(cx, "logs-match-count").as_deref(),
+            Some("4 matches")
+        );
+    }
+
+    #[gpui_kit::test]
+    fn regex_toggle_enables_patterns(cx: &mut TestAppContext) {
+        let (_shell, view, cx) = open_search(cx, 40);
+        type_query(cx, r"events (10|20)$");
+        // As plain text it matches nothing.
+        assert_eq!(view.read_with(cx, |v, _| v.filtered_len()), 0);
+        click(cx, "logs-regex");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |v, _| v.filtered_len()), 2);
+        assert_eq!(
+            label_of(cx, "logs-match-count").as_deref(),
+            Some("2 matches")
+        );
+        click(cx, "logs-regex");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |v, _| v.filtered_len()), 0);
+    }
+
+    #[gpui_kit::test]
+    fn invalid_regex_shows_error_and_keeps_rows(cx: &mut TestAppContext) {
+        let (_shell, view, cx) = open_search(cx, 40);
+        click(cx, "logs-regex");
+        type_query(cx, "burst");
+        assert_eq!(view.read_with(cx, |v, _| v.filtered_len()), 12);
+        cx.simulate_input("(");
+        cx.run_until_parked();
+        frame(cx);
+        assert!(present(cx, "logs-search-error"));
+        assert!(!present(cx, "logs-match-count"));
+        assert_eq!(
+            view.read_with(cx, |v, _| v.filtered_len()),
+            12,
+            "the previous rows stay"
+        );
+        let message = label_of(cx, "logs-search-error").unwrap();
+        assert!(
+            !message.is_empty() && !message.contains('\n'),
+            "{message:?}"
+        );
+        // Fixing the pattern clears the error.
+        cx.simulate_keystrokes("backspace");
+        cx.run_until_parked();
+        assert!(!present(cx, "logs-search-error"));
+        assert_eq!(view.read_with(cx, |v, _| v.filtered_len()), 12);
+        // A hostile pattern is still bounded.
+        cx.simulate_input("(a+)+$");
+        cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    fn typing_quickly_cancels_the_previous_scan(cx: &mut TestAppContext) {
+        let (_shell, view, cx) = open_search(cx, 40);
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| v.set_search("bur", false, window, cx));
+        });
+        let first = view.read_with(cx, |v, _| v.last_cancel());
+        assert!(!first.load(Ordering::Relaxed));
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| v.set_search("burst", false, window, cx));
+        });
+        assert!(
+            first.load(Ordering::Relaxed),
+            "the first scan was told to stop"
+        );
+        let second = view.read_with(cx, |v, _| v.last_cancel());
+        assert!(!second.load(Ordering::Relaxed));
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |v, _| v.filtered_len()), 12);
+        assert_eq!(
+            view.read_with(cx, |v, cx| v.search_value(cx)).as_ref(),
+            "burst"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn set_search_applies_text_and_mode(cx: &mut TestAppContext) {
+        let (_shell, view, cx) = open_search(cx, 40);
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| v.set_search(r"events 1\d", true, window, cx));
+        });
+        cx.run_until_parked();
+        // 10 and 15 are multiples of five with a two-digit number starting with 1.
+        assert_eq!(view.read_with(cx, |v, _| v.filtered_len()), 2);
+    }
+
+    #[gpui_kit::test]
+    fn a_late_first_phase_does_not_replace_the_full_result(cx: &mut TestAppContext) {
+        let (_shell, view, cx) = open_search(cx, 40);
+        type_query(cx, "burst");
+        assert_eq!(view.read_with(cx, |v, _| v.filtered_len()), 12);
+        let before = view.read_with(cx, |v, _| v.first_phases());
+        view.update(cx, |v, cx| v.apply_first_for_test(vec![1, 2], cx));
+        assert_eq!(view.read_with(cx, |v, _| v.filtered_len()), 12);
+        assert_eq!(view.read_with(cx, |v, _| v.first_phases()), before);
+    }
+
+    #[gpui_kit::test]
+    fn the_searching_label_waits_for_the_loading_delay(cx: &mut TestAppContext) {
+        let (_shell, view, cx) = open_search(cx, 40);
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| v.set_search("burst", false, window, cx));
+        });
+        // The scan has not run; the delay has not passed.
+        assert!(view.read_with(cx, |v, _| v.is_filtering()));
+        assert!(!present(cx, "logs-searching"));
+        // The delay timer is Task 16's (the scan finishes inside `run_until_parked`, so it
+        // cannot be held open); here the label's rendering is checked once it has fired.
+        view.update(cx, |v, cx| v.show_skeleton_for_test(cx));
+        assert!(view.read_with(cx, |v, _| v.searching_for_test()));
+        assert!(present(cx, "logs-searching"));
+        cx.run_until_parked();
+        assert!(!present(cx, "logs-searching"));
+        assert!(present(cx, "logs-match-count"));
+    }
+
+    #[gpui_kit::test]
+    fn matches_are_highlighted_in_rendered_rows(cx: &mut TestAppContext) {
+        let (_shell, view, cx) = open_search(cx, 40);
+        type_query(cx, "burst");
+        // Highlighting must not change what the rows say or how many there are.
+        assert_eq!(rows_on_screen(cx), 12);
+        let ranges = view.read_with(cx, |v, _| v.matcher_ranges("a burst b"));
+        assert_eq!((ranges.len(), ranges[0].clone()), (1, 2..7));
+    }
+
+    fn details_snapshot() -> Arc<Snapshot> {
+        snapshot(|w, run| {
+            let mut a = log_at(run, 12_345, LogLevel::Warning);
+            a.text = "alpha\nbeta\ngamma".to_string();
+            a.logger = "app.net".to_string();
+            a.source = fdt_store::logs::LogSource::Stdout;
+            w.push_log(a);
+            let mut b = log_at(run, 20_000, LogLevel::Info);
+            b.text = "second record".to_string();
+            b.clamped = true;
+            w.push_log(b);
+            let mut c = log_at(run, 21_000, LogLevel::Error);
+            c.source = fdt_store::logs::LogSource::FlutterError;
+            c.text = "The following assertion was thrown".to_string();
+            c.error = Some(fdt_store::logs::ErrorDetail {
+                description: "Exception caught by widgets library".to_string(),
+                summary: "A RenderFlex overflowed by 12 pixels".to_string(),
+                widget: Some("Row".to_string()),
+                location: Some("file:///app/lib/main.dart:10:5".to_string()),
+                stack: vec![
+                    "#0 build (package:app/main.dart:10)".to_string(),
+                    "#1 Element.rebuild (package:flutter/element.dart:1)".to_string(),
+                    "#2 runApp (package:flutter/binding.dart:5)".to_string(),
+                ],
+                rendered: String::new(),
+            });
+            w.push_log(c);
+            let mut d = log_at(run, 22_000, LogLevel::Info);
+            d.text = (0..10_000)
+                .map(|i| format!("row {i}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            w.push_log(d);
+        })
+    }
+
+    fn open_details_for(
+        cx: &mut TestAppContext,
+        row: usize,
+    ) -> (
+        gpui_kit::Entity<crate::shell::MainWindow>,
+        gpui_kit::Entity<LogsView>,
+        &mut VisualTestContext,
+    ) {
+        let (shell, cx) = open_shell_snapshot(cx, details_snapshot());
+        press(cx, "cmd-5", "ctrl-5");
+        cx.run_until_parked();
+        let view = view_of(&shell, cx);
+        click(cx, &format!("log-row-{row}"));
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        frame(cx);
+        (shell, view, cx)
+    }
+
+    #[gpui_kit::test]
+    fn details_show_full_text_and_metadata(cx: &mut TestAppContext) {
+        let (_shell, view, cx) = open_details_for(cx, 0);
+        assert!(present(cx, "logs-details"));
+        assert!(view.read_with(cx, |v, _| v.details_open()));
+        assert_eq!(label_of(cx, "details-time").as_deref(), Some("0:12.345"));
+        assert_eq!(label_of(cx, "details-level").as_deref(), Some("Warning"));
+        assert_eq!(label_of(cx, "details-source").as_deref(), Some("Stdout"));
+        assert_eq!(label_of(cx, "details-logger").as_deref(), Some("app.net"));
+        assert_eq!(label_of(cx, "details-run").as_deref(), Some("Run 1"));
+        assert!(!present(cx, "details-clamped"));
+        // All of the message, line by line, not the 512-character row cut.
+        for (i, line) in ["alpha", "beta", "gamma"].into_iter().enumerate() {
+            assert_eq!(
+                label_of(cx, &format!("details-line-{i}")).as_deref(),
+                Some(line)
+            );
+        }
+        assert!(!present(cx, "details-line-3"));
+        assert!(!present(cx, "details-section-summary"));
+        // The pane follows the selection once open, including the "before connect" note.
+        cx.simulate_keystrokes("j");
+        cx.run_until_parked();
+        frame(cx);
+        assert_eq!(label_of(cx, "details-level").as_deref(), Some("Info"));
+        assert_eq!(
+            label_of(cx, "details-clamped").as_deref(),
+            Some("Before fdt connected")
+        );
+        assert_eq!(
+            label_of(cx, "details-line-0").as_deref(),
+            Some("second record")
+        );
+    }
+
+    #[gpui_kit::test]
+    fn a_ten_thousand_line_record_stays_virtualised_in_details(cx: &mut TestAppContext) {
+        let (_shell, view, cx) = open_details_for(cx, 3);
+        assert_eq!(view.read_with(cx, |v, _| v.details_lines()), 10_000);
+        let built = cx.update(|window, _| {
+            (0..400)
+                .filter(|i| window.try_find(format!("details-line-{i}")).is_some())
+                .count()
+        });
+        assert!(built > 0 && built < 60, "{built} detail rows built");
+    }
+
+    #[gpui_kit::test]
+    fn details_show_flutter_error_sections(cx: &mut TestAppContext) {
+        let (_shell, _view, cx) = open_details_for(cx, 2);
+        assert_eq!(
+            label_of(cx, "details-section-summary").as_deref(),
+            Some("Summary")
+        );
+        assert_eq!(
+            label_of(cx, "details-summary").as_deref(),
+            Some("A RenderFlex overflowed by 12 pixels")
+        );
+        assert_eq!(
+            label_of(cx, "details-section-widget").as_deref(),
+            Some("Caused by widget")
+        );
+        assert_eq!(label_of(cx, "details-widget").as_deref(), Some("Row"));
+        assert_eq!(
+            label_of(cx, "details-location").as_deref(),
+            Some("file:///app/lib/main.dart:10:5")
+        );
+        assert_eq!(
+            label_of(cx, "details-section-stack").as_deref(),
+            Some("Stack trace")
+        );
+        // One row per frame.
+        for i in 0..3 {
+            assert!(present(cx, &format!("details-stack-{i}")), "frame {i}");
+        }
+        assert!(!present(cx, "details-stack-3"));
+        assert_eq!(
+            label_of(cx, "details-source").as_deref(),
+            Some("Flutter error")
+        );
+    }
+
+    #[gpui_kit::test]
+    fn double_click_opens_details(cx: &mut TestAppContext) {
+        let (shell, cx) = open_shell_snapshot(cx, details_snapshot());
+        press(cx, "cmd-5", "ctrl-5");
+        cx.run_until_parked();
+        let view = view_of(&shell, cx);
+        frame(cx);
+        cx.update(|window, cx| window.double_click("log-row-1", cx));
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |v, _| v.details_open()));
+        assert_eq!(view.read_with(cx, |v, _| v.selected()), Some(1));
+        // The open_details action (the palette's route) works the same.
+        view.update(cx, |v, cx| {
+            v.close_details(cx);
+        });
+        assert!(!view.read_with(cx, |v, _| v.details_open()));
+        view.update(cx, |v, cx| v.open_details(cx));
+        assert!(view.read_with(cx, |v, _| v.details_open()));
+    }
+
+    #[gpui_kit::test]
+    fn copy_and_copy_as_json_write_the_clipboard(cx: &mut TestAppContext) {
+        let (_shell, _view, cx) = open_details_for(cx, 0);
+        click(cx, "logs-copy-text");
+        assert_eq!(clipboard(cx).as_deref(), Some("alpha\nbeta\ngamma"));
+        click(cx, "logs-copy-json");
+        assert_eq!(
+            clipboard(cx).as_deref(),
+            Some(
+                r#"{"time":"0:12.345","level":"Warning","source":"Stdout","logger":"app.net","run":1,"message":"alpha\nbeta\ngamma"}"#
+            )
+        );
+    }
+
+    #[gpui_kit::test]
+    fn context_menu_copies(cx: &mut TestAppContext) {
+        let (shell, cx) = open_shell_snapshot(cx, details_snapshot());
+        press(cx, "cmd-5", "ctrl-5");
+        cx.run_until_parked();
+        let _ = view_of(&shell, cx);
+        frame(cx);
+        cx.update(|window, cx| window.right_click("log-row-1", cx));
+        cx.run_until_parked();
+        frame(cx);
+        cx.simulate_keystrokes("down enter");
+        cx.run_until_parked();
+        assert_eq!(clipboard(cx).as_deref(), Some("second record"));
+        cx.update(|window, cx| window.right_click("log-row-1", cx));
+        cx.run_until_parked();
+        frame(cx);
+        cx.simulate_keystrokes("down down enter");
+        cx.run_until_parked();
+        let json = clipboard(cx).unwrap();
+        assert!(
+            json.starts_with(r#"{"time":"0:20.000","level":"Info""#),
+            "{json}"
+        );
+        assert!(json.ends_with(r#""message":"second record"}"#), "{json}");
+    }
+
+    #[gpui_kit::test]
+    fn escape_closes_details_first(cx: &mut TestAppContext) {
+        let (_shell, view, cx) = open_details_for(cx, 1);
+        assert!(view.read_with(cx, |v, _| v.details_open()));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!view.read_with(cx, |v, _| v.details_open()));
+        assert_eq!(
+            view.read_with(cx, |v, _| v.selected()),
+            Some(1),
+            "still selected"
+        );
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |v, _| v.selected()), None);
+    }
+
+    #[gpui_kit::test]
+    fn keyboard_movement_replaces_the_history_entry(cx: &mut TestAppContext) {
+        let (shell, view, cx) = open_logs(cx, 30);
+        let before = shell.read_with(cx, |s, _| s.history().back_len());
+        click(cx, "log-row-3");
+        cx.run_until_parked();
+        let after_click = shell.read_with(cx, |s, _| s.history().back_len());
+        assert_eq!(after_click, before + 1, "a click pushes");
+        for _ in 0..10 {
+            cx.simulate_keystrokes("j");
+        }
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |v, _| v.selected()), Some(13));
+        let after_keys = shell.read_with(cx, |s, _| s.history().back_len());
+        assert!(
+            after_keys <= after_click + 1,
+            "{before} {after_click} {after_keys}"
+        );
+        assert_eq!(after_keys, after_click, "movement does not push");
+        // The location follows the selection.
+        match shell.read_with(cx, |s, _| s.current().selection) {
+            Some(crate::nav::Selection::Log(id)) => assert_eq!(id.seq, 13),
+            other => panic!("{other:?}"),
+        }
+        // Back goes to the clicked row's entry's predecessor, not through ten steps.
+        press(cx, "cmd-[", "ctrl-[");
+        assert_eq!(view.read_with(cx, |v, _| v.selected()), None);
+    }
+
+    #[gpui_kit::test]
+    fn status_changes_and_range_drags_keep_focus_in_the_search_field(cx: &mut TestAppContext) {
+        let (shell, cx, h) = open_shell_fake(cx);
+        let (mut w, run) = writer();
+        feed(&mut w, run, 0, 50);
+        h.status.send(connected("demo", true)).unwrap();
+        h.snaps.send(w.publish()).unwrap();
+        cx.run_until_parked();
+        frame(cx);
+        let view = view_of(&shell, cx);
+        press(cx, "cmd-f", "ctrl-f");
+        cx.simulate_input("rec");
+        cx.run_until_parked();
+        assert!(cx.update(|window, cx| view.read(cx).search_focused(window, cx)));
+        // The app stops recording: a status change.
+        h.status.send(connected("demo", false)).unwrap();
+        cx.run_until_parked();
+        frame(cx);
+        assert!(
+            cx.update(|window, cx| view.read(cx).search_focused(window, cx)),
+            "a status change keeps focus in the field"
+        );
+        // A range drag navigates within the page.
+        let mut loc = shell.read_with(cx, |s, _| s.current().clone());
+        loc.range = Some(crate::nav::TimeRange::new(
+            SessionTime(0),
+            SessionTime(10 * SEC),
+        ));
+        shell.update_in(cx, |s, w, cx| s.navigate(loc, w, cx));
+        cx.run_until_parked();
+        frame(cx);
+        assert!(cx.update(|window, cx| view.read(cx).search_focused(window, cx)));
+        cx.simulate_input("o");
+        assert_eq!(
+            view.read_with(cx, |v, cx| v.search_value(cx)).as_ref(),
+            "reco"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn a_replaced_store_resets_expansion_and_selection(cx: &mut TestAppContext) {
+        let (shell, cx, h) = open_shell_fake(cx);
+        let (mut w, run) = writer();
+        feed(&mut w, run, 0, 30);
+        h.status.send(connected("demo", true)).unwrap();
+        h.snaps.send(w.publish()).unwrap();
+        cx.run_until_parked();
+        frame(cx);
+        let view = view_of(&shell, cx);
+        click(cx, "log-row-5");
+        cx.simulate_keystrokes("space");
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |v, _| v.is_expanded(5)));
+        assert_eq!(view.read_with(cx, |v, _| v.selected()), Some(5));
+        // A new session: different records, a later generation.
+        let (mut w2, run2) = writer();
+        feed(&mut w2, run2, 1_000, 1_030);
+        let _ = w2.publish();
+        feed(&mut w2, run2, 1_030, 1_040);
+        h.snaps.send(w2.publish()).unwrap();
+        cx.run_until_parked();
+        assert!(!view.read_with(cx, |v, _| v.is_expanded(5)));
+        assert_eq!(view.read_with(cx, |v, _| v.selected()), None);
+        assert_eq!(view.read_with(cx, |v, _| v.filtered_len()), 40);
+    }
+
+    #[gpui_kit::test]
+    fn clear_filters_also_clears_search_and_range(cx: &mut TestAppContext) {
+        let (shell, view, cx) = open_search(cx, 40);
+        let mut loc = shell.read_with(cx, |s, _| s.current().clone());
+        loc.range = Some(crate::nav::TimeRange::new(
+            SessionTime(100 * SEC),
+            SessionTime(200 * SEC),
+        ));
+        shell.update_in(cx, |s, w, cx| s.navigate(loc, w, cx));
+        cx.run_until_parked();
+        type_query(cx, "burst");
+        assert_eq!(view.read_with(cx, |v, _| v.filtered_len()), 0);
+        click(cx, "logs-clear-filters");
+        cx.run_until_parked();
+        assert_eq!(shell.read_with(cx, |s, _| s.current().range), None);
+        assert_eq!(view.read_with(cx, |v, cx| v.search_value(cx)).as_ref(), "");
+        assert_eq!(view.read_with(cx, |v, _| v.filtered_len()), 40);
+        assert!(!present(cx, "logs-match-count"));
+    }
+
+    #[gpui_kit::test]
+    fn following_pauses_when_rows_arrive_away_from_the_end(cx: &mut TestAppContext) {
+        let (shell, cx, h) = open_shell_fake(cx);
+        let (mut w, run) = writer();
+        feed(&mut w, run, 0, 100);
+        h.status.send(connected("demo", true)).unwrap();
+        h.snaps.send(w.publish()).unwrap();
+        cx.run_until_parked();
+        frame(cx);
+        let view = view_of(&shell, cx);
+        assert!(view.read_with(cx, |v, _| v.follow().following));
+        // Scrolled away from the end by something other than the wheel.
+        view.read_with(cx, |v, _| v.scroll_to_top());
+        frame(cx);
+        feed(&mut w, run, 100, 104);
+        h.snaps.send(w.publish()).unwrap();
+        cx.run_until_parked();
+        let f = view.read_with(cx, |v, _| v.follow());
+        assert!(!f.following);
+        assert_eq!(f.unseen, 4);
+        assert!(present(cx, "logs-unseen"));
+        // Scrolling back down to the end resumes following.
+        cx.update(|window, cx| {
+            window.scroll(
+                "logs-list",
+                gpui_kit::ScrollDelta::Pixels(gpui_kit::point(
+                    gpui_kit::px(0.),
+                    gpui_kit::px(-100_000.),
+                )),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        frame(cx);
+        let f = view.read_with(cx, |v, _| v.follow());
+        assert!(f.following && f.unseen == 0, "{f:?}");
+        assert!(!present(cx, "logs-unseen"));
     }
 }

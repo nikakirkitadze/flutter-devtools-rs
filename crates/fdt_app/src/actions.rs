@@ -47,7 +47,8 @@ gpui_kit::actions!(
         Collapse,
         OpenDetails,
         FollowLatest,
-        GoToFirst
+        GoToFirst,
+        FocusSearch
     ]
 );
 

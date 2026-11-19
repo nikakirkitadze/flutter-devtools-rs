@@ -83,7 +83,11 @@ pub fn compile_query(input: &str, regex_mode: bool) -> Result<Option<TextQuery>,
     if input.trim().is_empty() {
         return Ok(None);
     }
-    let case_sensitive = input.chars().any(char::is_uppercase);
+    let case_sensitive = if regex_mode {
+        has_literal_uppercase(input)
+    } else {
+        input.chars().any(char::is_uppercase)
+    };
     if regex_mode {
         RegexBuilder::new(input)
             .case_insensitive(!case_sensitive)
@@ -100,8 +104,82 @@ pub fn compile_query(input: &str, regex_mode: bool) -> Result<Option<TextQuery>,
     }
 }
 
+/// Whether a regex pattern has an uppercase letter the user typed as a literal. Letters that are
+/// part of an escape (`\S`, `\D`, `\p{Lu}`, `\x4F`), a group name or an inline flag do not count.
+fn has_literal_uppercase(pattern: &str) -> bool {
+    let mut it = pattern.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '\\' => match it.next() {
+                Some('p' | 'P') => {
+                    if it.peek() == Some(&'{') {
+                        for c in it.by_ref() {
+                            if c == '}' {
+                                break;
+                            }
+                        }
+                    } else {
+                        it.next();
+                    }
+                }
+                Some('x') => {
+                    if it.peek() == Some(&'{') {
+                        for c in it.by_ref() {
+                            if c == '}' {
+                                break;
+                            }
+                        }
+                    } else {
+                        it.next();
+                        it.next();
+                    }
+                }
+                Some('u') => {
+                    for _ in 0..4 {
+                        it.next();
+                    }
+                }
+                Some('U') => {
+                    for _ in 0..8 {
+                        it.next();
+                    }
+                }
+                _ => {}
+            },
+            '(' if it.peek() == Some(&'?') => {
+                it.next();
+                // `(?P<Name>`, `(?<Name>` or flags such as `(?Ui)`.
+                if matches!(it.peek(), Some('P' | '<')) {
+                    for c in it.by_ref() {
+                        if c == '>' {
+                            break;
+                        }
+                    }
+                } else {
+                    while let Some(c) = it.peek() {
+                        if matches!(c, ')' | ':') {
+                            break;
+                        }
+                        it.next();
+                    }
+                }
+            }
+            c if c.is_uppercase() => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+impl TextQuery {
+    /// Builds the matcher once; use it for every row of a query.
+    pub fn matcher(&self) -> Matcher {
+        Matcher::new(self)
+    }
+}
+
 /// A query prepared for scanning.
-enum Matcher {
+pub enum Matcher {
     Finder(memchr::memmem::Finder<'static>),
     Re(Regex),
 }
@@ -126,27 +204,33 @@ impl Matcher {
         }
     }
 
-    fn is_match(&self, text: &str) -> bool {
+    pub fn is_match(&self, text: &str) -> bool {
         match self {
             Matcher::Finder(f) => f.find(text.as_bytes()).is_some(),
             Matcher::Re(r) => r.is_match(text),
         }
     }
+
+    /// Byte ranges of matches: sorted, non-overlapping, on char boundaries.
+    pub fn ranges(&self, text: &str) -> Vec<Range<usize>> {
+        match self {
+            Matcher::Finder(f) => {
+                let n = f.needle().len();
+                f.find_iter(text.as_bytes()).map(|i| i..i + n).collect()
+            }
+            Matcher::Re(r) => r
+                .find_iter(text)
+                .map(|m| m.range())
+                .filter(|r| !r.is_empty())
+                .collect(),
+        }
+    }
 }
 
-/// Byte ranges of matches: sorted, non-overlapping, on char boundaries.
+/// Byte ranges of matches: sorted, non-overlapping, on char boundaries. Builds the matcher on
+/// every call; to highlight many rows use [`TextQuery::matcher`].
 pub fn match_ranges(text: &str, q: &TextQuery) -> Vec<Range<usize>> {
-    match Matcher::new(q) {
-        Matcher::Finder(f) => {
-            let n = f.needle().len();
-            f.find_iter(text.as_bytes()).map(|i| i..i + n).collect()
-        }
-        Matcher::Re(r) => r
-            .find_iter(text)
-            .map(|m| m.range())
-            .filter(|r| !r.is_empty())
-            .collect(),
-    }
+    q.matcher().ranges(text)
 }
 
 struct Prepared {
@@ -442,6 +526,42 @@ mod tests {
         assert_eq!(match_ranges("a12b345", &q), vec![1..3, 4..7]);
         let q = plain("Zed").unwrap();
         assert!(match_ranges("zed", &q).is_empty());
+    }
+
+    #[test]
+    fn prepared_matcher_equals_match_ranges() {
+        let texts = ["Ünïcode zed ZED", "aaaaa", "a12b345", "", "no hits"];
+        let queries = [
+            plain("ünï"),
+            plain("aa"),
+            plain("Zed"),
+            plain("zed"),
+            compile_query(r"\d+", true).unwrap(),
+            compile_query("a*", true).unwrap(),
+        ];
+        for q in queries.iter().flatten() {
+            let m = q.matcher();
+            for t in texts {
+                assert_eq!(m.ranges(t), match_ranges(t, q), "{q:?} on {t:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn regex_escapes_do_not_make_the_query_case_sensitive() {
+        // `\S` matches "aX" as two characters whatever their case.
+        let q = compile_query(r"\Sx", true).unwrap().unwrap();
+        assert_eq!(match_ranges("aX", &q), vec![0..2]);
+        let q = compile_query(r"\D\W?abc", true).unwrap().unwrap();
+        assert_eq!(match_ranges("zABC", &q), vec![0..4]);
+        let q = compile_query(r"\p{Lu}x", true).unwrap().unwrap();
+        assert_eq!(match_ranges("AX", &q), vec![0..2]);
+        let q = compile_query(r"(?P<Name>x)", true).unwrap().unwrap();
+        assert_eq!(match_ranges("X", &q), vec![0..1]);
+        // A literal uppercase letter still makes the search case-sensitive.
+        let q = compile_query(r"\dFoo", true).unwrap().unwrap();
+        assert!(match_ranges("1foo", &q).is_empty());
+        assert_eq!(match_ranges("1Foo", &q), vec![0..4]);
     }
 
     // ----- budgets (release only) -----

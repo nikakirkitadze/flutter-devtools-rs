@@ -2,9 +2,9 @@
 
 use crate::actions::{
     AppListConnect, AppListNext, AppListPrev, ClearSelection, CloseWindow, Collapse, Expand,
-    FollowLatest, GoBack, GoForward, GoToFirst, Hide, HideOthers, Minimize, NewSession, NewWindow,
-    OpenDetails, OpenPalette, OpenSettings, Quit, SelectNext, SelectPrevious, ShowShortcuts,
-    ToggleExpand, ToggleFullScreen, ToggleRecording,
+    FocusSearch, FollowLatest, GoBack, GoForward, GoToFirst, Hide, HideOthers, Minimize,
+    NewSession, NewWindow, OpenDetails, OpenPalette, OpenSettings, Quit, SelectNext,
+    SelectPrevious, ShowShortcuts, ToggleExpand, ToggleFullScreen, ToggleRecording,
 };
 use crate::nav::Tool;
 use gpui_kit::KeyBinding;
@@ -59,6 +59,7 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new(platform("cmd-]", "ctrl-]"), GoForward, not_input),
         KeyBinding::new("escape", ClearSelection, not_input),
         KeyBinding::new("?", ShowShortcuts, not_input),
+        KeyBinding::new(platform("cmd-f", "ctrl-f"), FocusSearch, shell),
         KeyBinding::new(platform("cmd-r", "ctrl-r"), ToggleRecording, shell),
         KeyBinding::new(platform("cmd-n", "ctrl-n"), NewSession, shell),
         KeyBinding::new(platform("cmd-shift-n", "ctrl-shift-n"), NewWindow, None),

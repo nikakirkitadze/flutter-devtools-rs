@@ -240,6 +240,8 @@ pub mod layout {
     pub const STRIP_HEIGHT: Pixels = px(32.);
     pub const TOOLBAR_HEIGHT: Pixels = px(40.);
     pub const BANNER_HEIGHT: Pixels = px(32.);
+    pub const SEARCH_WIDTH: Pixels = px(220.);
+    pub const SEARCH_MIN: Pixels = px(120.);
     pub const DETAILS_WIDTH: Pixels = px(380.);
     pub const DETAILS_MIN: Pixels = px(280.);
     pub const DETAILS_MAX: Pixels = px(640.);
