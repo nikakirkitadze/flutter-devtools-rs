@@ -15,6 +15,9 @@ fn main() -> ExitCode {
     if args.len() == 1 && args[0] == "--startup-trace" {
         return fdt_app::app::run_with_startup_trace(t0, main_entry_unix_ms);
     }
-    eprintln!("usage: fdt [--version] [--startup-trace]");
+    if args[0] == "bench-ui" {
+        return fdt_app::bench_ui::main(&args[1..]);
+    }
+    eprintln!("usage: fdt [--version] [--startup-trace] [bench-ui <scenario>]");
     ExitCode::from(2)
 }

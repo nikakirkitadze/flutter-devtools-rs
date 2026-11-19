@@ -7,6 +7,8 @@ use crate::session_model::SessionModel;
 use crate::settings::{SettingsStore, flush_settings, init_settings, settings};
 use crate::shell::MainWindow;
 use crate::startup::{StartupPhases, StartupReport, WATCHDOG, emit, mark};
+use fdt_capture::ConnStatus;
+use fdt_store::Snapshot;
 use fdt_ui::assets::FdtAssets;
 use fdt_ui::theme;
 use fdt_ui::tokens::layout;
@@ -18,6 +20,7 @@ use gpui_kit::{
 use std::cell::Cell;
 use std::process::ExitCode;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Setup shared by the real app and the tests.
@@ -81,14 +84,8 @@ pub fn open_main_window(cx: &mut App) -> anyhow::Result<Entity<MainWindow>> {
     Ok(shell)
 }
 
-/// Common startup: global setup, settings, theme, fonts, menus and the main window.
-fn start(
-    cx: &mut App,
-    store: SettingsStore,
-    mut phases: Option<&mut StartupPhases>,
-    discovery: DiscoveryChoice,
-) -> anyhow::Result<Entity<MainWindow>> {
-    let phases = &mut phases;
+/// Global setup shared by every launch mode: gpui-kit, fonts, settings, theme and motion.
+fn setup(cx: &mut App, store: SettingsStore, phases: &mut Option<&mut StartupPhases>) {
     init_with(cx, phases);
     if let Err(err) = fdt_ui::fonts::load(cx) {
         log::warn!("loading bundled fonts failed, using system fonts: {err:#}");
@@ -105,9 +102,44 @@ fn start(
     mark(phases, "theme_applied");
     fdt_ui::os::sync_reduced_motion(cx);
     mark(phases, "motion_synced");
+}
+
+/// Common startup: global setup, settings, theme, fonts, menus and the main window.
+fn start(
+    cx: &mut App,
+    store: SettingsStore,
+    mut phases: Option<&mut StartupPhases>,
+    discovery: DiscoveryChoice,
+) -> anyhow::Result<Entity<MainWindow>> {
+    let phases = &mut phases;
+    setup(cx, store, phases);
     let shell = open_main_window(cx)?;
     mark(phases, "window_opened");
     defer_menus_and_host(cx, discovery);
+    cx.on_window_closed(|cx, _| {
+        if cx.windows().is_empty() {
+            cx.quit();
+        }
+    })
+    .detach();
+    cx.activate(true);
+    Ok(shell)
+}
+
+/// Startup for `fdt bench-ui`: global setup with in-memory settings, then the main window over a
+/// fixed session. No menus, no capture host and no discovery, so nothing else runs while a
+/// scenario is measured.
+pub(crate) fn start_fixed(
+    cx: &mut App,
+    snapshot: Arc<Snapshot>,
+    status: ConnStatus,
+) -> anyhow::Result<Entity<MainWindow>> {
+    setup(cx, SettingsStore::in_memory(), &mut None);
+    let options = main_window_options(cx);
+    let (_, shell) = gpui_kit::open_window(options, cx, |window, cx| {
+        let session = cx.new(|_| SessionModel::fixed(snapshot, status));
+        cx.new(|cx| MainWindow::new(window, cx, session))
+    })?;
     cx.on_window_closed(|cx, _| {
         if cx.windows().is_empty() {
             cx.quit();

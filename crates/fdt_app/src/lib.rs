@@ -1,6 +1,7 @@
 //! The fdt application: shell, navigation, palette and settings.
 pub mod actions;
 pub mod app;
+pub mod bench_ui;
 pub mod capture_host;
 pub mod keymap;
 pub mod logging;

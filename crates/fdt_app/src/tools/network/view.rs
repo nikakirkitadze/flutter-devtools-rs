@@ -615,6 +615,24 @@ impl NetworkView {
         self.move_selection(false, cx);
     }
 
+    /// Whether the rows shown are for the current filter and nothing is being computed.
+    pub fn is_settled(&self) -> bool {
+        !self.running && self.applied.is_some_and(|k| k.version == self.version)
+    }
+
+    /// Scrolls `row` into view (the benchmark's scripted scroll).
+    pub fn scroll_to_row(&self, row: usize, cx: &mut Context<Self>) {
+        self.table.update(cx, |t, cx| t.scroll_to_row(row, cx));
+    }
+
+    /// Sets the filter field and runs the filter, as typing would.
+    pub fn set_filter_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| {
+            input.set_value(text.to_string(), window, cx)
+        });
+        self.query_changed(cx);
+    }
+
     // ---- test access ----
 
     #[cfg(test)]
@@ -627,7 +645,6 @@ impl NetworkView {
         self.table.read(cx).visible_range().rows().len()
     }
 
-    #[cfg(test)]
     pub fn filtered_len(&self) -> usize {
         self.filtered.len()
     }

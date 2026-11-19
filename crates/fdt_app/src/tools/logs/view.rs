@@ -199,7 +199,6 @@ pub struct LogsView {
     cancel: Arc<AtomicBool>,
     /// Waits for a job's first-phase rows.
     first_task: Option<Task<()>>,
-    #[cfg(test)]
     first_phases: usize,
     pub(super) details_open: bool,
     pub(super) details: super::details::DetailsState,
@@ -253,7 +252,6 @@ impl LogsView {
             matcher: None,
             cancel: Arc::new(AtomicBool::new(false)),
             first_task: None,
-            #[cfg(test)]
             first_phases: 0,
             details_open: false,
             details: super::details::DetailsState::default(),
@@ -423,10 +421,7 @@ impl LogsView {
         if self.follow.following {
             self.scroll.scroll_to_bottom();
         }
-        #[cfg(test)]
-        {
-            self.first_phases += 1;
-        }
+        self.first_phases += 1;
         cx.notify();
     }
 
@@ -784,7 +779,6 @@ impl LogsView {
         self.rows.filtered().len()
     }
 
-    #[cfg(test)]
     pub fn row_count(&self) -> usize {
         self.rows.row_count()
     }
@@ -845,9 +839,19 @@ impl LogsView {
         self.searching()
     }
 
-    #[cfg(test)]
+    /// How many first-phase results have been shown (the benchmark and tests read it).
     pub fn first_phases(&self) -> usize {
         self.first_phases
+    }
+
+    /// Whether the rows on screen are for the current filter and nothing is being computed.
+    pub fn is_settled(&self) -> bool {
+        self.settled()
+    }
+
+    /// Scrolls `row` to the top of the list (the benchmark's scripted scroll).
+    pub fn scroll_to_row(&self, row: usize) {
+        self.scroll.scroll_to_item(row, ScrollStrategy::Top);
     }
 
     #[cfg(test)]

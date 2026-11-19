@@ -253,11 +253,58 @@ pub fn frames(w: &mut SessionWriter, run: RunId, n: usize, seed: u64, hz: u32) {
     }
 }
 
+/// One run of synthetic data: `logs` log records, `requests` requests and `frames` frames at
+/// 120 Hz, published as a single snapshot.
+pub fn session(
+    seed: u64,
+    logs_n: usize,
+    requests_n: usize,
+    frames_n: usize,
+) -> std::sync::Arc<crate::Snapshot> {
+    use crate::clock::{Calibration, RunClock};
+    use crate::run::{AppInfo, Mode};
+    let mut w = SessionWriter::new(0);
+    let app = AppInfo {
+        name: "stress".into(),
+        device: Some("macOS".into()),
+        mode: Mode::Debug,
+        flutter_version: None,
+        workspace: None,
+        vm_uri: "ws://127.0.0.1:1/ws".into(),
+        pid: None,
+    };
+    let clock = RunClock::new(
+        0,
+        Calibration {
+            skew_us: 0,
+            timeline_to_wall_us: 0,
+        },
+    );
+    let run = w.start_run(app, clock, SessionTime(0));
+    logs(&mut w, run, logs_n, seed);
+    requests(&mut w, run, requests_n, seed);
+    frames(&mut w, run, frames_n, seed, 120);
+    w.publish()
+}
+
+/// The `fdt bench-ui` dataset: 1,000,000 logs, 100,000 requests and 72,000 frames (10 minutes
+/// at 120 Hz) in one run.
+pub fn stress_session(seed: u64) -> std::sync::Arc<crate::Snapshot> {
+    session(seed, 1_000_000, 100_000, 72_000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::logs::testkit::writer;
     use crate::net::StatusClass;
+
+    #[test]
+    fn small_session_has_the_requested_sizes() {
+        let s = session(1, 100, 50, 20);
+        assert_eq!((s.logs.len(), s.net.len()), (100, 50));
+        assert_eq!(s.runs.len(), 1);
+    }
 
     #[test]
     fn synthetic_requests_follow_the_documented_mix() {

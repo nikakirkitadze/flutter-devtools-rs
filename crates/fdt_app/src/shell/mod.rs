@@ -251,7 +251,6 @@ impl MainWindow {
             || matches!(session.status(), ConnStatus::Connected { .. })
     }
 
-    #[cfg(test)]
     pub(crate) fn network_view(&self) -> &Entity<NetworkView> {
         &self.network
     }

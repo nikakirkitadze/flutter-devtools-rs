@@ -168,6 +168,11 @@ fn frac_of(x: Pixels, bounds: Bounds<Pixels>) -> f32 {
 }
 
 impl MainWindow {
+    /// Where the strip was last laid out; zero-sized before its first frame.
+    pub(crate) fn strip_bounds(&self) -> Bounds<Pixels> {
+        self.strip.state.borrow().bounds
+    }
+
     /// Moves to the current location with `range`.
     pub(super) fn set_range(
         &mut self,
