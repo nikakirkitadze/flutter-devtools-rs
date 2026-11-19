@@ -52,6 +52,7 @@ pub struct Bucket {
 /// The writer side of the pyramid.
 pub struct LodSeries {
     levels: Vec<Chunked<Bucket>>,
+    cap: usize,
 }
 
 impl Default for LodSeries {
@@ -62,10 +63,16 @@ impl Default for LodSeries {
 
 impl LodSeries {
     pub fn new() -> Self {
+        Self::with_cap(MAX_LEVEL_BUCKETS)
+    }
+
+    /// A series whose levels stop growing at `cap` buckets.
+    pub(crate) fn with_cap(cap: usize) -> Self {
         Self {
             levels: (0..LEVELS)
                 .map(|_| Chunked::with_chunk(LOD_CHUNK))
                 .collect(),
+            cap,
         }
     }
 
@@ -73,7 +80,7 @@ impl LodSeries {
     pub fn insert(&mut self, t: SessionTime, value_us: u32) {
         for (k, level) in self.levels.iter_mut().enumerate() {
             let idx = (t.0 >> (BASE_SHIFT + k as u32)) as usize;
-            if idx >= MAX_LEVEL_BUCKETS {
+            if idx >= self.cap {
                 continue;
             }
             while level.len() <= idx {
@@ -92,6 +99,7 @@ impl LodSeries {
     pub fn snapshot(&mut self) -> LodSnapshot {
         LodSnapshot {
             levels: self.levels.iter_mut().map(|l| l.snapshot()).collect(),
+            cap: self.cap,
         }
     }
 }
@@ -99,6 +107,7 @@ impl LodSeries {
 #[derive(Clone, Debug)]
 pub struct LodSnapshot {
     levels: Arc<[ChunkedSnapshot<Bucket>]>,
+    cap: usize,
 }
 
 impl Default for LodSnapshot {
@@ -196,6 +205,10 @@ pub struct StripBar {
 /// Bars for `range` at the smallest level whose bucket count over the range
 /// is at most `width_px`. Non-empty buckets only, in time order; reads at most
 /// `width_px` buckets (the bound is `2 * width_px + 2`).
+///
+/// Edge buckets may include frames just outside `range`, since a bucket is
+/// counted whole. A level that stopped growing at the bucket cap cannot hold
+/// the range's end, so the next coarser level that can is used instead.
 pub fn strip_bars(frames: &FramesSnapshot, range: TimeRange, width_px: usize) -> Vec<StripBar> {
     if width_px == 0 {
         return Vec::new();
@@ -207,7 +220,7 @@ pub fn strip_bars(frames: &FramesSnapshot, range: TimeRange, width_px: usize) ->
     let k = (0..LEVELS)
         .find(|&k| {
             let (lo, hi) = span(k);
-            hi - lo < width_px as u64
+            hi - lo < width_px as u64 && hi < frames.lod.cap as u64
         })
         .unwrap_or(LEVELS - 1);
     let Some(level) = frames.lod.level(k) else {
@@ -388,6 +401,25 @@ mod tests {
         );
         assert!(strip_bars(&s.frames, past, 100).is_empty());
         assert!(strip_bars(&crate::Snapshot::empty().frames, range, 100).is_empty());
+    }
+
+    #[test]
+    fn zooming_past_the_level_cap_still_shows_frames() {
+        let mut lod = LodSeries::with_cap(8);
+        let base = 100 * SPAN;
+        for i in 0..8 {
+            lod.insert(SessionTime(base + i * SPAN / 4), 1_000 + i as u32);
+        }
+        let frames = FramesSnapshot {
+            frames: ChunkedSnapshot::default(),
+            lod: lod.snapshot(),
+        };
+        assert!(frames.lod.level(0).unwrap().len() <= 8, "level 0 is capped");
+        let range = TimeRange::new(SessionTime(base), SessionTime(base + SPAN));
+        let bars = strip_bars(&frames, range, 4);
+        assert!(!bars.is_empty() && bars.len() <= 4);
+        assert_eq!(bars.iter().map(|b| b.frames).sum::<u32>(), 8);
+        assert_eq!(bars.iter().map(|b| b.max_elapsed_us).max(), Some(1_007));
     }
 
     #[test]
