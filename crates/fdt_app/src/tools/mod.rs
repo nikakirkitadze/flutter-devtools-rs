@@ -1,5 +1,7 @@
 //! Pieces shared by every tool page.
 
+pub mod logs;
+
 use fdt_ui::theme::TokensExt as _;
 use fdt_ui::tokens::{font, space};
 use gpui_kit::{

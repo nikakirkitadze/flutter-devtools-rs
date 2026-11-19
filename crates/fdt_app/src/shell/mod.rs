@@ -7,22 +7,24 @@ mod settings_page;
 mod shortcuts;
 mod sidebar;
 pub(crate) mod start_page;
-mod strip;
+pub(crate) mod strip;
 mod title_bar;
-mod tool_page;
+pub(crate) mod tool_page;
 
 use crate::actions::{
-    About, ClearSelection, CloseWindow, ConnectToApp, Disconnect, GoBack, GoForward, Minimize,
-    NewSession, OpenPalette, OpenSettings, ShowLogs, ShowMemory, ShowNetwork, ShowPerformance,
-    ShowShortcuts, ShowState, ShowTimeline, ShowWidgets, StopWaiting, ToggleFrameHud,
+    About, ClearSelection, CloseWindow, Collapse, ConnectToApp, Disconnect, Expand, FollowLatest,
+    GoBack, GoForward, GoToFirst, Minimize, NewSession, OpenDetails, OpenPalette, OpenSettings,
+    SelectNext, SelectPrevious, ShowLogs, ShowMemory, ShowNetwork, ShowPerformance, ShowShortcuts,
+    ShowState, ShowTimeline, ShowWidgets, StopWaiting, ToggleExpand, ToggleFrameHud,
     ToggleFullScreen, ToggleRecording, UseDarkTheme, UseLightTheme, UseSystemTheme, Zoom,
 };
 use crate::capture_host::{CaptureControl, CaptureHost};
 use crate::keymap::SHELL_CONTEXT;
-use crate::nav::{Location, NavHistory, Page, Tool};
+use crate::nav::{Location, NavHistory, Page, Selection, Tool};
 use crate::palette::view::{PaletteModel, open_palette};
 use crate::session_model::{SessionEvent, SessionModel};
 use crate::settings::{settings, update_settings};
+use crate::tools::logs::{LogsEvent, LogsView};
 use fdt_capture::ConnStatus;
 use fdt_ui::hud::FrameHud;
 use fdt_ui::theme::{self, ThemePreference, TokensExt as _};
@@ -79,11 +81,13 @@ pub struct MainWindow {
     session: Entity<SessionModel>,
     /// The start page, created once the app list is available.
     start: Option<Entity<StartPage>>,
+    /// The Logs list, kept for the life of the window.
+    logs: Entity<LogsView>,
     _host_wait: Option<gpui_kit::Subscription>,
     /// Whether the last status seen was `Connected`, so only a new connection leaves Start.
     was_connected: bool,
     _appearance: gpui_kit::Subscription,
-    _session_subs: [gpui_kit::Subscription; 2],
+    _session_subs: [gpui_kit::Subscription; 3],
 }
 
 impl MainWindow {
@@ -111,6 +115,13 @@ impl MainWindow {
                 this.status_changed(window, cx);
             }
         });
+        let logs = cx.new(|cx| LogsView::new(session.clone(), window, cx));
+        let selected = cx.subscribe_in(&logs, window, |this, _, event, window, cx| {
+            let LogsEvent::Selected(id) = *event;
+            let mut to = this.current().clone();
+            to.selection = id.map(Selection::Log);
+            this.navigate(to, window, cx);
+        });
         let host_wait = (!cx.has_global::<CaptureHost>()).then(|| {
             cx.observe_global_in::<CaptureHost>(window, |this, window, cx| {
                 this.apps_from_host(window, cx);
@@ -128,10 +139,11 @@ impl MainWindow {
             palette: None,
             session,
             start: None,
+            logs,
             _host_wait: host_wait,
             was_connected,
             _appearance: appearance,
-            _session_subs: [observed, connected],
+            _session_subs: [observed, connected, selected],
         };
         this.apps_from_host(window, cx);
         this.refresh_counts(cx);
@@ -174,6 +186,48 @@ impl MainWindow {
         &self.session
     }
 
+    #[cfg(test)]
+    pub(crate) fn logs_view(&self) -> &Entity<LogsView> {
+        &self.logs
+    }
+
+    /// Whether the Logs page shows the list: there are logs, or an app is connected.
+    fn logs_routed(&self, cx: &App) -> bool {
+        let session = self.session.read(cx);
+        !session.snapshot().logs.is_empty()
+            || matches!(session.status(), ConnStatus::Connected { .. })
+    }
+
+    /// Hands the location's range and selection to the Logs list.
+    fn sync_logs(&mut self, cx: &mut Context<Self>) {
+        let loc = self.current().clone();
+        let selection = match loc.selection {
+            Some(Selection::Log(id)) => Some(id),
+            _ => None,
+        };
+        self.logs
+            .update(cx, |logs, cx| logs.set_location(loc.range, selection, cx));
+    }
+
+    /// Puts focus on the Logs list whenever it is the current page, so its keys work.
+    fn focus_logs_if_current(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.current().page == Page::Tool(Tool::Logs) && self.logs_routed(cx) {
+            let _ = window;
+            self.logs.update(cx, |logs, cx| logs.request_focus(cx));
+        }
+    }
+
+    /// Runs `f` on the Logs list when it is the current page (the palette reaches it this way).
+    fn with_logs(
+        &mut self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut LogsView, &mut Context<LogsView>),
+    ) {
+        if self.current().page == Page::Tool(Tool::Logs) && self.logs_routed(cx) {
+            self.logs.update(cx, f);
+        }
+    }
+
     /// Leaves the start page for Logs once an app is connected.
     fn status_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let connected = matches!(self.session.read(cx).status(), ConnStatus::Connected { .. });
@@ -181,6 +235,8 @@ impl MainWindow {
         self.was_connected = connected;
         if started && self.current().page == Page::Start {
             self.show(Tool::Logs, window, cx);
+        } else {
+            self.focus_logs_if_current(window, cx);
         }
     }
 
@@ -209,7 +265,9 @@ impl MainWindow {
 
     pub fn navigate(&mut self, to: Location, window: &mut Window, cx: &mut Context<Self>) {
         if self.history.navigate(to) {
+            self.sync_logs(cx);
             self.focus_start_if_current(window, cx);
+            self.focus_logs_if_current(window, cx);
             self.refresh_counts(cx);
             cx.notify();
         }
@@ -299,7 +357,9 @@ impl MainWindow {
 
     fn go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.history.go_back().is_some() {
+            self.sync_logs(cx);
             self.focus_start_if_current(window, cx);
+            self.focus_logs_if_current(window, cx);
             self.refresh_counts(cx);
             cx.notify();
         }
@@ -307,7 +367,9 @@ impl MainWindow {
 
     fn go_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.history.go_forward().is_some() {
+            self.sync_logs(cx);
             self.focus_start_if_current(window, cx);
+            self.focus_logs_if_current(window, cx);
             self.refresh_counts(cx);
             cx.notify();
         }
@@ -338,6 +400,10 @@ impl Render for MainWindow {
                 Some(page) => page.clone().into_any_element(),
                 None => tool_page::render_start(cx).into_any_element(),
             },
+            Page::Tool(Tool::Logs) if self.logs_routed(cx) => {
+                let strip = self.render_strip(window, cx);
+                tool_page::render_with(Tool::Logs, strip, self.logs.clone()).into_any_element()
+            }
             Page::Tool(tool) => {
                 let strip = self.render_strip(window, cx);
                 tool_page::render(tool, strip, cx).into_any_element()
@@ -371,6 +437,30 @@ impl Render for MainWindow {
             .on_action(cx.listener(|this, _: &ShowLogs, w, cx| this.show(Tool::Logs, w, cx)))
             .on_action(cx.listener(|this, _: &ShowWidgets, w, cx| this.show(Tool::Widgets, w, cx)))
             .on_action(cx.listener(|this, _: &ShowState, w, cx| this.show(Tool::State, w, cx)))
+            .on_action(cx.listener(|this, _: &SelectNext, _, cx| {
+                this.with_logs(cx, |v, cx| v.select_next(cx));
+            }))
+            .on_action(cx.listener(|this, _: &SelectPrevious, _, cx| {
+                this.with_logs(cx, |v, cx| v.select_previous(cx));
+            }))
+            .on_action(cx.listener(|this, _: &ToggleExpand, _, cx| {
+                this.with_logs(cx, |v, cx| v.toggle_expand(cx));
+            }))
+            .on_action(cx.listener(|this, _: &Expand, _, cx| {
+                this.with_logs(cx, |v, cx| v.expand(cx));
+            }))
+            .on_action(cx.listener(|this, _: &Collapse, _, cx| {
+                this.with_logs(cx, |v, cx| v.collapse(cx));
+            }))
+            .on_action(cx.listener(|this, _: &OpenDetails, _, cx| {
+                this.with_logs(cx, |v, cx| v.open_details(cx));
+            }))
+            .on_action(cx.listener(|this, _: &FollowLatest, _, cx| {
+                this.with_logs(cx, |v, cx| v.follow_latest(cx));
+            }))
+            .on_action(cx.listener(|this, _: &GoToFirst, _, cx| {
+                this.with_logs(cx, |v, cx| v.go_to_first(cx));
+            }))
             .on_action(cx.listener(|this, _: &OpenPalette, w, cx| this.toggle_palette(w, cx)))
             .on_action(cx.listener(|this, _: &ShowShortcuts, w, cx| this.show_shortcuts(w, cx)))
             .on_action(cx.listener(|this, _: &About, w, cx| {

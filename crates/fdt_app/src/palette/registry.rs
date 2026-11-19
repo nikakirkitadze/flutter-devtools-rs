@@ -1,9 +1,10 @@
 //! The command registry the palette, menus and cheat sheet are built from.
 
 use crate::actions::{
-    About, ClearSelection, CloseWindow, ConnectToApp, Disconnect, GoBack, GoForward, Minimize,
-    NewSession, NewWindow, OpenSettings, Quit, ShowLogs, ShowMemory, ShowNetwork, ShowPerformance,
-    ShowShortcuts, ShowState, ShowTimeline, ShowWidgets, StopWaiting, ToggleFrameHud,
+    About, ClearSelection, CloseWindow, Collapse, ConnectToApp, Disconnect, Expand, FollowLatest,
+    GoBack, GoForward, GoToFirst, Minimize, NewSession, NewWindow, OpenDetails, OpenSettings, Quit,
+    SelectNext, SelectPrevious, ShowLogs, ShowMemory, ShowNetwork, ShowPerformance, ShowShortcuts,
+    ShowState, ShowTimeline, ShowWidgets, StopWaiting, ToggleExpand, ToggleFrameHud,
     ToggleFullScreen, ToggleRecording, UseDarkTheme, UseLightTheme, UseSystemTheme, Zoom,
 };
 #[cfg(target_os = "macos")]
@@ -195,6 +196,62 @@ pub fn commands() -> Vec<CommandSpec> {
             keywords: &["keys", "help", "cheat sheet"],
             group: Group::View,
             action: || Box::new(ShowShortcuts),
+        },
+        CommandSpec {
+            id: "logs.next",
+            label: "Next Row",
+            keywords: &["logs", "down", "select"],
+            group: Group::View,
+            action: || Box::new(SelectNext),
+        },
+        CommandSpec {
+            id: "logs.previous",
+            label: "Previous Row",
+            keywords: &["logs", "up", "select"],
+            group: Group::View,
+            action: || Box::new(SelectPrevious),
+        },
+        CommandSpec {
+            id: "logs.toggle_expand",
+            label: "Toggle Record Expansion",
+            keywords: &["logs", "lines", "multi-line"],
+            group: Group::View,
+            action: || Box::new(ToggleExpand),
+        },
+        CommandSpec {
+            id: "logs.expand",
+            label: "Expand Record",
+            keywords: &["logs", "lines", "multi-line"],
+            group: Group::View,
+            action: || Box::new(Expand),
+        },
+        CommandSpec {
+            id: "logs.collapse",
+            label: "Collapse Record",
+            keywords: &["logs", "lines"],
+            group: Group::View,
+            action: || Box::new(Collapse),
+        },
+        CommandSpec {
+            id: "logs.open_details",
+            label: "Open Details",
+            keywords: &["logs", "inspect"],
+            group: Group::View,
+            action: || Box::new(OpenDetails),
+        },
+        CommandSpec {
+            id: "logs.follow",
+            label: "Follow Latest Logs",
+            keywords: &["logs", "tail", "end", "bottom"],
+            group: Group::View,
+            action: || Box::new(FollowLatest),
+        },
+        CommandSpec {
+            id: "logs.first",
+            label: "Go to First Log",
+            keywords: &["logs", "top", "home"],
+            group: Group::View,
+            action: || Box::new(GoToFirst),
         },
         CommandSpec {
             id: "theme.system",

@@ -31,6 +31,13 @@ fn static_copy(tool: Tool, connected: bool) -> (&'static str, String) {
             ),
         );
     }
+    if connected && tool == Tool::Logs {
+        return (
+            "No logs yet",
+            "Logs, print output and Flutter errors appear here as your app writes them."
+                .to_string(),
+        );
+    }
     let (heading, body) = idle_copy(tool);
     (heading, body.to_string())
 }
@@ -68,6 +75,17 @@ fn idle_copy(tool: Tool) -> (&'static str, &'static str) {
     }
 }
 
+/// The empty state of `tool`, for pages that draw their own layout around it.
+pub fn empty_state(tool: Tool, connected: bool) -> EmptyState {
+    let (heading, body) = empty_copy(tool, connected);
+    EmptyState::new(
+        SharedString::from(format!("empty-state-{}", tool.slug())),
+        tool_icon(tool),
+        heading,
+        body,
+    )
+}
+
 /// The start page before the capture host exists: just its heading.
 pub fn render_start(cx: &App) -> impl IntoElement {
     div()
@@ -103,6 +121,22 @@ pub fn render(tool: Tool, strip: impl IntoElement, _cx: &App) -> impl IntoElemen
                     body,
                 )),
         )
+}
+
+/// The page for `tool` with its own `body` below the header.
+pub fn render_with(
+    tool: Tool,
+    strip: impl IntoElement,
+    body: impl IntoElement,
+) -> impl IntoElement {
+    div()
+        .id(SharedString::from(format!("tool-page-{}", tool.slug())))
+        .test_support()
+        .size_full()
+        .flex()
+        .flex_col()
+        .child(ToolHeader::new(tool.label(), strip))
+        .child(div().flex_1().min_h_0().child(body))
 }
 
 #[cfg(test)]

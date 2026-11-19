@@ -39,7 +39,15 @@ gpui_kit::actions!(
         StopWaiting,
         AppListPrev,
         AppListNext,
-        AppListConnect
+        AppListConnect,
+        SelectNext,
+        SelectPrevious,
+        ToggleExpand,
+        Expand,
+        Collapse,
+        OpenDetails,
+        FollowLatest,
+        GoToFirst
     ]
 );
 

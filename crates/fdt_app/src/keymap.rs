@@ -1,9 +1,10 @@
 //! Cross-platform key bindings.
 
 use crate::actions::{
-    AppListConnect, AppListNext, AppListPrev, ClearSelection, CloseWindow, GoBack, GoForward, Hide,
-    HideOthers, Minimize, NewSession, NewWindow, OpenPalette, OpenSettings, Quit, ShowShortcuts,
-    ToggleFullScreen, ToggleRecording,
+    AppListConnect, AppListNext, AppListPrev, ClearSelection, CloseWindow, Collapse, Expand,
+    FollowLatest, GoBack, GoForward, GoToFirst, Hide, HideOthers, Minimize, NewSession, NewWindow,
+    OpenDetails, OpenPalette, OpenSettings, Quit, SelectNext, SelectPrevious, ShowShortcuts,
+    ToggleExpand, ToggleFullScreen, ToggleRecording,
 };
 use crate::nav::Tool;
 use gpui_kit::KeyBinding;
@@ -18,6 +19,10 @@ pub const SHELL_NOT_INPUT: &str = "Shell && !Input";
 /// Key context of the start page's app list. The URL field is outside it, so these keys never
 /// fire while typing.
 pub const APP_LIST_CONTEXT: &str = "AppList";
+
+/// Key context of the Logs list. The toolbar's search field is outside it, so these keys never
+/// fire while typing.
+pub const LOGS_LIST_CONTEXT: &str = "LogsList";
 
 /// `mac` on macOS, `other` everywhere else.
 pub fn platform(mac: &'static str, other: &'static str) -> &'static str {
@@ -69,6 +74,19 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("down", AppListNext, list),
         KeyBinding::new("j", AppListNext, list),
         KeyBinding::new("enter", AppListConnect, list),
+    ]);
+    let logs = Some(LOGS_LIST_CONTEXT);
+    out.extend([
+        KeyBinding::new("j", SelectNext, logs),
+        KeyBinding::new("down", SelectNext, logs),
+        KeyBinding::new("k", SelectPrevious, logs),
+        KeyBinding::new("up", SelectPrevious, logs),
+        KeyBinding::new("space", ToggleExpand, logs),
+        KeyBinding::new("right", Expand, logs),
+        KeyBinding::new("left", Collapse, logs),
+        KeyBinding::new("enter", OpenDetails, logs),
+        KeyBinding::new("end", FollowLatest, logs),
+        KeyBinding::new("home", GoToFirst, logs),
     ]);
     if cfg!(target_os = "macos") {
         out.extend([

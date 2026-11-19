@@ -244,6 +244,13 @@ pub fn press(cx: &mut VisualTestContext, mac: &'static str, other: &'static str)
 
 /// A snapshot built by `build` on a fresh writer with one run (id 1, started at 0).
 pub fn snapshot(build: impl FnOnce(&mut fdt_store::SessionWriter, RunId)) -> Arc<Snapshot> {
+    let (mut w, run) = writer();
+    build(&mut w, run);
+    w.publish()
+}
+
+/// A fresh writer with one run (id 1, started at 0), for tests that publish several snapshots.
+pub fn writer() -> (fdt_store::SessionWriter, RunId) {
     use fdt_store::clock::{Calibration, RunClock};
     use fdt_store::time::SessionTime;
     let mut w = fdt_store::SessionWriter::new(0);
@@ -255,8 +262,7 @@ pub fn snapshot(build: impl FnOnce(&mut fdt_store::SessionWriter, RunId)) -> Arc
         },
     );
     let run = w.start_run(app_info("demo"), clock, SessionTime(0));
-    build(&mut w, run);
-    w.publish()
+    (w, run)
 }
 
 /// A log record at `ms` milliseconds.
