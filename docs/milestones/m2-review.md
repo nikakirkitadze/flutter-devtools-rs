@@ -53,7 +53,7 @@ Load: `uptime` before each batch is recorded. The machine was shared and busy (C
 | 2 | 10 | 122 | 106 |
 | 3 | 10 | 125 | 108 |
 
-`attach_ms` is connect until the status is Connected. `attach_to_data_ms` is connect until the first live log record is in a published snapshot. Budget: attach to first live data on screen <= 1 s. Snapshots publish at most every 16 ms and the UI draws on the next frame, so add about one frame (8.3 to 16.7 ms): about 140 ms. **Met**, with a wide margin. The UI part (a frame) was not timed in a window; it is an estimate. A profile-mode pass during Task 22 gave attach_ms 5, attach_to_data_ms 110, first_log_ms 103 (one run; not repeated here).
+`attach_ms` is connect until the status is Connected. `attach_to_data_ms` is connect until the first live log record is in a published snapshot. Budget: attach to first live data on screen <= 1 s. Snapshots publish at most every 16 ms and the UI draws on the next frame, so add about one frame (8.3 to 16.7 ms): about 140 ms. **Met**, with a wide margin. The UI part (a frame) was not timed in a window; it is an estimate. These runs had a healthy app. If the main isolate is paused, the clock calibration now waits at most 1.5 s before its fallback, and the whole connect sequence at most 5 s. A profile-mode pass during Task 22 gave attach_ms 5, attach_to_data_ms 110, first_log_ms 103 (one run; not repeated here).
 
 ### Idle memory and CPU, connected
 
@@ -100,7 +100,8 @@ The scroll interval budget is `max(plan budget, refresh period) + 0.5 ms` (rulin
 2. **Stress datasets generated in code** (`fdt_store::synth`, fixed seed). Kept. 1M log lines and 100k requests are produced in a few seconds; real `jank_lab` recordings are committed.
 3. **Session time axis is the host clock**, with a per-run calibration at connect. Kept; the calibration is unit-tested by hand-checked numbers, and a hot restart in the live test stays in one run.
 4. **Discovery polls the DTD registry folder once a second**, one DTD connection per entry. Kept. Found `jank_lab` within 5 s in the live test. Only read from source on Windows and Linux.
-5. **Bodies over 4 MiB are not copied automatically; "Load full body" fetches them.** Kept, with a change: bodies of unknown length are auto-fetched with a 10 s bound (R11).
+5. **Bodies over 4 MiB are not copied automatically; "Load full body" fetches them.** Kept, with changes: a request is not fetched when either side's known length is over 4 MiB (one fetch returns both bodies, so each over-limit side is marked too large, and a known in-limit side is offered through "Load full body"). Bodies of unknown length are still auto-fetched with a 10 s bound (R11), but the reply is decoded from text under a 4 MiB cap and anything longer is marked too large with its real length. "Load full body" is disabled for bodies known to be over 64 MiB, the most one 256 MiB frame can carry as the VM's integer array (four characters a byte).
+5a. **The connect sequence is bounded.** Everything up to the start of the run gives up after 5 s with a plain message, and the clock calibration's call into the app waits 1.5 s before the fallback, so a paused app or a server that is not a VM service no longer holds the window for the 30 s call default. Isolates already running at connect that expose the HTTP profile are polled, not only the main one.
 6. **Multi-line log records expand inline as 22 px rows.** Kept; the pathological record tests (one 200 KB line, 10,000 lines) pass.
 7. **The `flutter: ` print prefix is removed from Stdout lines.** Kept.
 8. **Connecting lands on Logs.** Kept; navigation happens on the transition to connected only, not on every status event (fixed in review).
@@ -135,7 +136,9 @@ The scroll interval budget is `max(plan budget, refresh period) + 0.5 ms` (rulin
 1. **Draw p99 for Logs search and tool switch is about 6.5 to 7 ms against 4 ms.** The cost is reshaping the full page of text each frame (CoreText and layout). Meeting it needs visible changes: fewer text runs per row, or no ligatures. The budget was not loosened. Decide whether to change the design or accept 8 ms for these two interactions.
 2. **The first CI run.** There is no GitHub remote yet, so the workflow (`ci.yml`, including the live `jank_lab` job) has never run.
 3. **Recent URLs keep the VM token in `settings.json`.** The token is needed to reconnect. Decide whether to store it, or only the host and port and ask again.
-4. **Bodies of unknown length are auto-fetched with a 10 s bound (R11).** An app that serves huge chunked bodies makes the VM send a JSON frame about 3.6 times the body size per request, up to the 1 MiB store cap, before the bound applies. Skipping them would leave most real responses empty.
+4. **Bodies of unknown length are auto-fetched with a 10 s bound (R11).** An app that serves huge chunked bodies makes the VM send a JSON frame about 3.6 times the body size per request before the bound applies. The reply is no longer built into a JSON tree, and a body over 4 MiB is dropped while it is decoded, but the frame still crosses the socket and is held as text (up to the 256 MiB frame limit). Skipping unknown-length bodies would leave most real responses empty.
+7. **New session (⌘N) discards the stored session with no confirmation or undo, and fires inside text inputs.** A product decision: ask first, offer undo, or only fire outside inputs. Navigation history, range and selection now reset with it.
+8. **`fdt bench-ui` uses a fixed snapshot.** It cannot see the cost of the capture publishing a new snapshot while the window draws (about 60 Hz while capturing), so its draw and scroll numbers are for a quiet session. Decide whether a live-publishing scenario is needed.
 5. **Windows and Linux discovery and paths** (registry directory, process-alive checks, ctrl shortcuts) are only read from source; none of it has been compiled or run there.
 6. **`fdt --connect` skips recent URLs.** Choose whether a command-line connect should be remembered like a pasted one (it would also write the token).
 
@@ -157,7 +160,7 @@ Save screenshots next to this file as `m2-<os>-<theme>-<view>.png`.
   `cargo build --release -p fdt_app` then `./target/release/fdt bench-ui <logs-scroll|logs-search|net-scroll|net-filter|tool-switch|strip-drag>`. Record medians and `uptime`.
 - **Idle memory and CPU of the connected window, on an unlocked R1:** start `jank_lab` (`flutter run -d macos`), run `./target/release/fdt --connect <vm uri>`, check the title bar says Connected, wait 30 s, then `ps -o rss=,%cpu= -p <pid>` every 2 s for 60 s. Budgets: RSS <= 150 MB, every CPU sample <= 1 %.
 - **The UI part of attach to data on screen** (one frame after the snapshot), timed in a window.
-- **The first CI run** on macOS, Windows and Linux, including the live job and the release budget step.
+- **The first CI run** on macOS, Windows and Linux, including the live job and the release budget step (report-only on hosted runners; `FDT_BUDGETS=strict` enforces it).
 - **Windows and Linux** code paths read only from source (discovery, process checks, shortcuts, client-side frame).
 - **Profile-mode attach** was measured once (Task 22), not three times.
 
@@ -167,9 +170,9 @@ Save screenshots next to this file as `m2-<os>-<theme>-<view>.png`.
 - **Cross-links from stored ids:** jump from a log or request to the frame or time it happened in, using `EntryId` rather than VM ids.
 - **Draw-time work** if the author decides to meet 4 ms for full-page text changes (open decision 1).
 - **Deferred minors from the review ledger, summarised:**
-  - Capture: isolates already running at connect are polled only if they are main or added later; the tail log chunk is copied per publish and bounded by count, not bytes; the writer waits 1 s after sending Close; `id: null` error replies are dropped.
+  - Capture: the tail log chunk is copied per publish and bounded by count, not bytes; the writer waits 1 s after sending Close; `id: null` error replies are dropped.
   - Discovery: the CLI fallback can block the scan loop up to 5 s; a missed Flutter version is cached for good; Windows treats access-denied as dead.
   - Logs: details lines are cut at 4,096 characters and not wrapped; search compiles its matcher per call.
-  - Network: the Errors count costs a second pass off-thread; request bodies are not fetched when the response is too large; the registry ids `logs.next` and `logs.previous` also serve Network.
+  - Network: the Errors count costs a second pass off-thread; the registry ids `logs.next` and `logs.previous` also serve Network.
   - App: the whole shell re-renders on every snapshot (about 60 Hz while capturing), `install()` checks `PATH` on the UI thread (a GUI-launched macOS app has a minimal `PATH`, so `dart` may not be found), recent URLs also remember failed URLs, and the start-connect error is not cleared by URL or recent connects.
   - Live test: the 10-minute wait for the VM URI is long for local runs; the discovery fallback can pick another `jank_lab`.
