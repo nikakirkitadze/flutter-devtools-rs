@@ -6,7 +6,7 @@ use fdt_store::logs::LogLevel;
 use fdt_ui::theme::TokensExt as _;
 use fdt_ui::tokens::{alpha, font, layout, radius, space};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::Input;
+use gpui_kit::component::input::{Escape, Input};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::skeleton::Skeleton;
 use gpui_kit::component::tooltip::Tooltip;
@@ -152,6 +152,11 @@ impl LogsView {
         let search = div()
             .id("logs-search")
             .test_support()
+            // Escape in the field hands focus to the list, keeping the query; the next
+            // Escape then clears details, selection and range in the usual order.
+            .on_action(cx.listener(|this, _: &Escape, window, cx| {
+                window.focus(&this.focus_handle(), cx);
+            }))
             .flex_none()
             .w(layout::SEARCH_WIDTH)
             .min_w(layout::SEARCH_MIN)

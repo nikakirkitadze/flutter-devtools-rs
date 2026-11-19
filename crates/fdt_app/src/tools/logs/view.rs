@@ -528,12 +528,13 @@ impl LogsView {
             }
             Ok(q) => {
                 self.search_error = None;
-                let key = (self.query.clone(), self.regex);
-                if self.applied_query.as_ref() == Some(&key) {
+                // An empty query is "no query", whatever the mode.
+                let key = q.is_some().then(|| (self.query.clone(), self.regex));
+                if self.applied_query == key {
                     cx.notify();
                     return;
                 }
-                self.applied_query = Some(key);
+                self.applied_query = key;
                 self.matcher = q.as_ref().map(|q| Arc::new(q.matcher()));
                 self.filter.text = q;
                 self.bump(cx);
@@ -2221,5 +2222,66 @@ mod tests {
         let f = view.read_with(cx, |v, _| v.follow());
         assert!(f.following && f.unseen == 0, "{f:?}");
         assert!(!present(cx, "logs-unseen"));
+    }
+
+    #[gpui_kit::test]
+    fn escape_in_the_search_field_moves_focus_to_the_list(cx: &mut TestAppContext) {
+        let (_shell, view, cx) = open_details_for(cx, 1);
+        press(cx, "cmd-f", "ctrl-f");
+        cx.simulate_input("rec");
+        assert!(cx.update(|window, cx| view.read(cx).search_focused(window, cx)));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        frame(cx);
+        assert!(!cx.update(|window, cx| view.read(cx).search_focused(window, cx)));
+        assert_eq!(
+            view.read_with(cx, |v, cx| v.search_value(cx)).as_ref(),
+            "rec"
+        );
+        assert!(
+            view.read_with(cx, |v, _| v.details_open()),
+            "details stay open"
+        );
+        // Now the usual order: details, then selection.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!view.read_with(cx, |v, _| v.details_open()));
+        assert_eq!(view.read_with(cx, |v, _| v.selected()), Some(1));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |v, _| v.selected()), None);
+    }
+
+    #[gpui_kit::test]
+    fn empty_queries_do_not_rescan(cx: &mut TestAppContext) {
+        let (_shell, view, cx) = open_search(cx, 40);
+        let flag = view.read_with(cx, |v, _| v.last_cancel());
+        click(cx, "logs-regex");
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| v.set_search("", true, window, cx));
+        });
+        assert!(!flag.load(Ordering::Relaxed), "nothing was cancelled");
+        assert!(Arc::ptr_eq(
+            &flag,
+            &view.read_with(cx, |v, _| v.last_cancel())
+        ));
+        // Going from a query back to empty is a change.
+        type_query(cx, "burst");
+        assert!(flag.load(Ordering::Relaxed));
+    }
+
+    #[gpui_kit::test]
+    fn over_long_queries_show_an_error_and_keep_rows(cx: &mut TestAppContext) {
+        let (_shell, view, cx) = open_search(cx, 40);
+        let long = "a".repeat(1_001);
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| v.set_search(&long, false, window, cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            label_of(cx, "logs-search-error").as_deref(),
+            Some("Search is limited to 1,000 characters.")
+        );
+        assert_eq!(view.read_with(cx, |v, _| v.filtered_len()), 40);
     }
 }

@@ -78,10 +78,20 @@ impl Default for LogFilter {
     }
 }
 
+/// The longest query accepted. Compilation runs on the UI thread on every keystroke.
+pub const MAX_QUERY_CHARS: usize = 1_000;
+/// Compiled-program and lazy-DFA size limits, so a hostile pattern fails fast.
+const REGEX_SIZE_LIMIT: usize = 1 << 20;
+
 /// Smart case: case-insensitive unless the input has an uppercase letter.
 pub fn compile_query(input: &str, regex_mode: bool) -> Result<Option<TextQuery>, QueryError> {
     if input.trim().is_empty() {
         return Ok(None);
+    }
+    if input.chars().nth(MAX_QUERY_CHARS).is_some() {
+        return Err(QueryError {
+            message: "Search is limited to 1,000 characters.".to_string(),
+        });
     }
     let case_sensitive = if regex_mode {
         has_literal_uppercase(input)
@@ -91,6 +101,8 @@ pub fn compile_query(input: &str, regex_mode: bool) -> Result<Option<TextQuery>,
     if regex_mode {
         RegexBuilder::new(input)
             .case_insensitive(!case_sensitive)
+            .size_limit(REGEX_SIZE_LIMIT)
+            .dfa_size_limit(REGEX_SIZE_LIMIT)
             .build()
             .map(|r| Some(TextQuery::Regex(r)))
             .map_err(|e| QueryError {
@@ -526,6 +538,34 @@ mod tests {
         assert_eq!(match_ranges("a12b345", &q), vec![1..3, 4..7]);
         let q = plain("Zed").unwrap();
         assert!(match_ranges("zed", &q).is_empty());
+    }
+
+    #[test]
+    fn hostile_queries_are_bounded() {
+        let t = Instant::now();
+        let r = compile_query(r"(\w{200}){50}", true);
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(100),
+            "{:?}",
+            t.elapsed()
+        );
+        assert!(r.is_err(), "the size limit rejects it");
+        let long = "a".repeat(MAX_QUERY_CHARS + 1);
+        for regex in [false, true] {
+            let e = compile_query(&long, regex).unwrap_err();
+            assert_eq!(e.message, "Search is limited to 1,000 characters.");
+        }
+        assert!(
+            compile_query(&"a".repeat(MAX_QUERY_CHARS), false)
+                .unwrap()
+                .is_some()
+        );
+        // `(a+)+$` compiles and scans in linear time.
+        let q = compile_query("(a+)+$", true).unwrap().unwrap();
+        let text = format!("{}b", "a".repeat(100_000));
+        let t = Instant::now();
+        assert!(match_ranges(&text, &q).is_empty());
+        assert!(t.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]
