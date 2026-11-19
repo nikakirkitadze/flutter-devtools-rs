@@ -4,16 +4,20 @@
 
 pub(crate) mod flutter_error;
 pub(crate) mod frames;
+pub(crate) mod http;
 pub(crate) mod logs;
+pub(crate) mod sockets;
 pub(crate) mod stdout;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use fdt_store::clock::{Calibration, RunClock};
 use fdt_store::frames::FrameInput;
 use fdt_store::logs::{LogInput, LogLevel, LogSource};
+use fdt_store::net::{HttpUpdate, SocketUpdate};
 use fdt_store::run::AppInfo;
-use fdt_store::time::RunId;
+use fdt_store::time::{EntryId, RunId};
 use fdt_vm::events::{StreamEvent, WriteStream};
 use fdt_vm::service::VmService;
 use serde_json::Value;
@@ -42,6 +46,19 @@ pub(crate) enum Ingest {
         run: RunId,
         version: String,
     },
+    /// The connection's body fetcher, for loading full bodies later.
+    NetReady(Arc<http::BodyFetcher>),
+    /// Entries from one HTTP profile poll; the reply says what to do next.
+    HttpPoll {
+        isolate: String,
+        updates: Vec<HttpUpdate>,
+        reply: oneshot::Sender<http::PollReply>,
+    },
+    Body {
+        id: EntryId,
+        result: http::Fetched,
+    },
+    Sockets(Vec<SocketUpdate>),
 }
 
 /// One run's channel to the session task, plus what is needed to map event times.
@@ -96,6 +113,7 @@ pub(crate) struct Router {
     stdout: QuietLines,
     stderr: QuietLines,
     last_ts: [i64; 2],
+    net: http::NetHub,
 }
 
 impl Router {
@@ -105,6 +123,7 @@ impl Router {
         main_isolate: String,
         stdout_flush: Duration,
         string_fetch_timeout: Duration,
+        net: http::NetHub,
     ) -> Router {
         let logging = logs::spawn_worker(sink.clone(), svc.clone(), string_fetch_timeout);
         Router {
@@ -115,6 +134,7 @@ impl Router {
             stdout: QuietLines::new(stdout_flush),
             stderr: QuietLines::new(stdout_flush),
             last_ts: [0; 2],
+            net,
         }
     }
 
@@ -179,6 +199,10 @@ impl Router {
                         Err(e) => log::debug!("flutterVersion failed: {e}"),
                     }
                 });
+            }
+            StreamEvent::IsolateExit { isolate } => self.net.stop(&isolate.id),
+            StreamEvent::ServiceExtensionAdded { isolate, rpc } if rpc == http::ENABLE_RPC => {
+                self.net.start(&isolate.id);
             }
             _ => {}
         }

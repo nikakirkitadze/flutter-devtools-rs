@@ -572,6 +572,16 @@ impl NetStore {
         self.set_body_state(id, kind, BodyState::Captured(body));
     }
 
+    /// Like `store_body`, but keeps every byte: `per_body` does not apply, `total` still does.
+    pub(crate) fn store_full_body(&mut self, id: EntryId, kind: BodyKind, bytes: Vec<u8>) {
+        let full_len = bytes.len() as u64;
+        let body = Body {
+            bytes: bytes.into(),
+            full_len,
+        };
+        self.set_body_state(id, kind, BodyState::Captured(body));
+    }
+
     /// Drops a stored body's share of the budget.
     fn forget(&mut self, id: EntryId, kind: BodyKind) {
         if let Some(p) = self.bodies.iter().position(|e| e.0 == id && e.1 == kind) {
@@ -875,6 +885,46 @@ mod tests {
             BodyState::Captured(b) => assert!(!b.truncated()),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn full_bodies_bypass_per_body_but_count_toward_total() {
+        let (mut w, run) = writer(4);
+        w.set_body_limits(BodyLimits {
+            per_body: 10,
+            total: 100,
+        });
+        let ids: Vec<_> = (0..3)
+            .map(|i| {
+                w.upsert_request(http(run, &i.to_string(), "http://h/x", 1))
+                    .id
+            })
+            .collect();
+        w.store_full_body(ids[0], BodyKind::Response, vec![1u8; 60]);
+        let s = w.publish();
+        match &s.net.request(0).response_body {
+            BodyState::Captured(b) => {
+                assert_eq!(b.bytes.len(), 60);
+                assert!(!b.truncated());
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(s.net.body_bytes(), 60);
+        // A second one pushes the total over; the oldest is evicted first.
+        w.store_full_body(ids[1], BodyKind::Response, vec![2u8; 60]);
+        let s = w.publish();
+        assert!(matches!(
+            s.net.request(0).response_body,
+            BodyState::Evicted { len: 60 }
+        ));
+        assert_eq!(s.net.body_bytes(), 60);
+        // One larger than the whole budget is too large, not stored.
+        w.store_full_body(ids[2], BodyKind::Response, vec![3u8; 101]);
+        let s = w.publish();
+        assert!(matches!(
+            s.net.request(2).response_body,
+            BodyState::TooLarge { len: 101 }
+        ));
     }
 
     #[test]

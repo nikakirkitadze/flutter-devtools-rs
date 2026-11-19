@@ -8,10 +8,14 @@ use fdt_vm::rpc::{ConnectOptions, connect};
 use fdt_vm::service::{Mode, VmService, detect_mode};
 use fdt_vm::types::{Isolate, IsolateRef, Vm};
 use fdt_vm::uri::VmServiceUri;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
 use tokio::sync::{mpsc, oneshot};
 
 use crate::capture::{SessionMsg, Target};
 use crate::config::CaptureConfig;
+use crate::ingest::http::{BodyFetcher, ENABLE_RPC, NetHub, PollerConfig};
 use crate::ingest::{Ingest, Router, Sink};
 
 const STREAMS: [&str; 6] = [
@@ -91,8 +95,9 @@ pub(crate) async fn run(
     cfg: CaptureConfig,
     conn: u64,
     tx: mpsc::UnboundedSender<SessionMsg>,
+    free_app_memory: Arc<AtomicBool>,
 ) {
-    match connect_and_ingest(target, &cfg, conn, &tx).await {
+    match connect_and_ingest(target, &cfg, conn, &tx, free_app_memory).await {
         Ok(reason) => log::info!("connection ended: {reason}"),
         Err(f) => {
             log::info!("connect failed: {}", f.message);
@@ -112,6 +117,7 @@ async fn connect_and_ingest(
     cfg: &CaptureConfig,
     conn: u64,
     tx: &mpsc::UnboundedSender<SessionMsg>,
+    free_app_memory: Arc<AtomicBool>,
 ) -> Result<String, Fail> {
     let (uri, preset) = match &target {
         Target::Uri(u) => (u.clone(), None),
@@ -191,7 +197,29 @@ async fn connect_and_ingest(
         details: String::new(),
     })?;
     let sink = Sink::new(run, clock, conn, tx.clone());
-    let mut router = Router::new(sink, svc, main, cfg.stdout_flush, cfg.string_fetch_timeout);
+    let fetcher = Arc::new(BodyFetcher::new(svc.clone(), sink.clone()));
+    sink.send(Ingest::NetReady(fetcher.clone()));
+    let mut hub = NetHub::new(
+        sink.clone(),
+        svc.clone(),
+        fetcher,
+        PollerConfig {
+            http_poll: cfg.http_poll,
+            socket_poll: cfg.socket_poll,
+            free_app_memory,
+        },
+    );
+    if isolate.extension_rpcs.iter().any(|r| r == ENABLE_RPC) {
+        hub.start(&main);
+    }
+    let mut router = Router::new(
+        sink,
+        svc,
+        main,
+        cfg.stdout_flush,
+        cfg.string_fetch_timeout,
+        hub,
+    );
     loop {
         let flush = router.next_flush();
         tokio::select! {

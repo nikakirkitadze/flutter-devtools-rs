@@ -4,7 +4,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use fdt_capture::{Capture, CaptureConfig, CaptureRuntime, ConnStatus, Target};
+use fdt_store::Snapshot;
 use fdt_store::logs::{LogLevel, LogSource};
+use fdt_store::net::{BodyLimits, BodyState, StatusClass};
 use fdt_store::run::Mode;
 use fdt_vm::testing::ReplayServer;
 use fdt_vm::uri::VmServiceUri;
@@ -87,5 +89,111 @@ fn replay_of_the_debug_recording_fills_the_session() {
                 ..
             }
         ));
+    });
+}
+
+fn recording() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/recordings/jank_lab-debug.jsonl")
+}
+
+/// Connects to the recording with fast polling and waits until its slow request has finished and
+/// every body has settled.
+async fn replay_network(rt: &CaptureRuntime, cfg: CaptureConfig) -> std::sync::Arc<Snapshot> {
+    let server = ReplayServer::start(&recording());
+    let uri = VmServiceUri::parse(server.ws_uri().as_str()).unwrap();
+    let cap = Capture::start(rt.handle(), cfg, None);
+    cap.connect(Target::Uri(uri));
+    let snap = common::wait_for(&cap, Duration::from_secs(10), "all requests", |s| {
+        s.net.len() == 7
+            && (0..7).all(|i| {
+                let r = s.net.request(i);
+                r.end.is_some()
+                    && !matches!(r.response_body, BodyState::Pending)
+                    && !matches!(r.request_body, BodyState::Pending)
+            })
+    })
+    .await;
+    drop(cap);
+    drop(server);
+    snap
+}
+
+fn fast() -> CaptureConfig {
+    CaptureConfig {
+        http_poll: Duration::from_millis(5),
+        socket_poll: Duration::from_millis(5),
+        ..CaptureConfig::default()
+    }
+}
+
+fn find<'a>(s: &'a Snapshot, tail: &str) -> &'a fdt_store::net::HttpRecord {
+    (0..s.net.len())
+        .map(|i| &**s.net.request(i))
+        .find(|r| r.url.ends_with(tail))
+        .unwrap_or_else(|| panic!("no request ending in {tail}"))
+}
+
+fn bytes(b: &BodyState) -> &[u8] {
+    match b {
+        BodyState::Captured(b) => &b.bytes,
+        other => panic!("not captured: {other:?}"),
+    }
+}
+
+#[test]
+fn replay_records_requests_and_bodies() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let snap = replay_network(&rt, fast()).await;
+        let products = find(&snap, "/v2/products?page=3");
+        assert_eq!(products.status, Some(200));
+        assert!(matches!(products.response_body, BodyState::Captured(_)));
+        assert_eq!(products.size(), Some(1039));
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(bytes(&products.response_body)).is_ok()
+        );
+        let orders = find(&snap, "/v2/orders");
+        assert_eq!(orders.status, Some(500));
+        assert_eq!(bytes(&orders.request_body), br#"{"cart":1}"#);
+        let refused = find(&snap, "http://127.0.0.1:1/");
+        assert_eq!(refused.status_class(), StatusClass::Failed);
+        assert!(refused.is_error());
+        let ws = find(&snap, "/ws");
+        assert!(ws.websocket && !ws.is_error());
+        assert!(matches!(ws.request_body, BodyState::NotCaptured));
+        assert!(matches!(ws.response_body, BodyState::NotCaptured));
+        let blob = find(&snap, "/files/blob.bin");
+        match &blob.response_body {
+            BodyState::Captured(b) => {
+                assert_eq!(b.bytes.len(), 262_144);
+                assert!(!b.truncated());
+            }
+            other => panic!("{other:?}"),
+        }
+        let slow = find(&snap, "/slow");
+        assert_eq!(slow.status, Some(200));
+        assert!(slow.end.is_some());
+    });
+}
+
+#[test]
+fn replay_truncates_bodies_over_the_limit() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let cfg = CaptureConfig {
+            body_limits: BodyLimits {
+                per_body: 100 << 10,
+                ..BodyLimits::default()
+            },
+            ..fast()
+        };
+        let snap = replay_network(&rt, cfg).await;
+        match &find(&snap, "/files/blob.bin").response_body {
+            BodyState::Captured(b) => {
+                assert_eq!(b.bytes.len(), 102_400);
+                assert_eq!(b.full_len, 262_144);
+            }
+            other => panic!("{other:?}"),
+        }
     });
 }

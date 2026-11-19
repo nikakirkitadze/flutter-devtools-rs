@@ -1,6 +1,7 @@
 //! The `Capture` handle and the session task that owns the store.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use fdt_store::clock::{RunClock, host_now_us};
 use fdt_store::net::{BodyKind, BodyLimits};
@@ -16,6 +17,7 @@ use tokio::time::{Instant, sleep_until};
 use crate::config::CaptureConfig;
 use crate::connect;
 use crate::ingest::Ingest;
+use crate::ingest::http::NetState;
 use crate::status::ConnStatus;
 
 /// What to connect to.
@@ -61,6 +63,7 @@ impl Capture {
         let (tx, rx) = mpsc::unbounded_channel();
         let (status_tx, status) = watch::channel(ConnStatus::Idle);
         let (snap_tx, snaps) = watch::channel(Arc::new(Snapshot::empty()));
+        let free_app_memory = Arc::new(AtomicBool::new(config.free_app_http_memory));
         let session = Session {
             cfg: config,
             _discovery: discovery,
@@ -72,6 +75,8 @@ impl Capture {
             conn: None,
             current_run: None,
             last_publish: None,
+            net: NetState::default(),
+            free_app_memory,
         };
         handle.spawn(session.run(rx));
         Capture { tx, status, snaps }
@@ -144,6 +149,9 @@ struct Session {
     conn: Option<JoinHandle<()>>,
     current_run: Option<RunId>,
     last_publish: Option<Instant>,
+    net: NetState,
+    /// Read live by the pollers.
+    free_app_memory: Arc<AtomicBool>,
 }
 
 impl Session {
@@ -207,11 +215,13 @@ impl Session {
             Command::SetRecording(on) => log::debug!("command: set_recording({on})"),
             Command::NewSession => log::debug!("command: new_session"),
             Command::LoadFullBody(id, kind) => {
-                log::debug!("command: load_full_body({id:?}, {kind:?})")
+                if let Some(w) = &mut self.writer {
+                    self.net.load_full(w, id, kind, self.current_run);
+                }
             }
             Command::SetFreeAppHttpMemory(on) => {
                 self.cfg.free_app_http_memory = on;
-                log::debug!("command: set_free_app_http_memory({on})")
+                self.free_app_memory.store(on, Ordering::Relaxed);
             }
         }
     }
@@ -224,6 +234,7 @@ impl Session {
             return;
         };
         self.conn_gen += 1;
+        self.net.set_fetcher(None);
         self.status.send_replace(ConnStatus::Connecting {
             label: connect::label_of(&target),
         });
@@ -232,6 +243,7 @@ impl Session {
             self.cfg.clone(),
             self.conn_gen,
             tx,
+            self.free_app_memory.clone(),
         )));
     }
 
@@ -252,6 +264,7 @@ impl Session {
             let us = (host_now_us() - clock.origin_host_us).max(0) as u64;
             let id = w.start_run((*app).clone(), clock, SessionTime(us.saturating_mul(1000)));
             self.current_run = Some(id);
+            self.net.new_run();
             self.status.send_replace(ConnStatus::Connected {
                 run: id,
                 app: *app,
@@ -275,6 +288,23 @@ impl Session {
             }
             Ingest::Frame(f) => {
                 w.push_frame(f);
+            }
+            Ingest::NetReady(f) => self.net.set_fetcher(Some(f)),
+            Ingest::HttpPoll {
+                isolate,
+                updates,
+                reply,
+            } => {
+                let r = self
+                    .net
+                    .poll(w, self.cfg.auto_fetch_limit, &isolate, updates);
+                let _ = reply.send(r);
+            }
+            Ingest::Body { id, result } => self.net.body(w, id, result),
+            Ingest::Sockets(updates) => {
+                for u in updates {
+                    w.upsert_socket(u);
+                }
             }
             Ingest::FlutterVersion { run, version } => {
                 w.update_run_app(run, |a| a.flutter_version = Some(version.clone()));
@@ -310,6 +340,8 @@ mod tests {
             conn: None,
             current_run: None,
             last_publish: None,
+            net: NetState::default(),
+            free_app_memory: Arc::new(AtomicBool::new(false)),
         };
         (s, tx)
     }

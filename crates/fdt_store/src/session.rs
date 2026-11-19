@@ -141,6 +141,12 @@ impl SessionWriter {
         self.dirty = true;
     }
 
+    /// Stores a whole body, ignoring `per_body`; it still counts toward `total`.
+    pub fn store_full_body(&mut self, id: EntryId, kind: BodyKind, bytes: Vec<u8>) {
+        self.net.store_full_body(id, kind, bytes);
+        self.dirty = true;
+    }
+
     pub fn set_body_limits(&mut self, limits: BodyLimits) {
         self.net.set_limits(limits);
         self.dirty = true;
