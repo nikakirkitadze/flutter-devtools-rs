@@ -197,7 +197,11 @@ async fn connect_and_ingest(
         details: String::new(),
     })?;
     let sink = Sink::new(run, clock, conn, tx.clone());
-    let fetcher = Arc::new(BodyFetcher::new(svc.clone(), sink.clone()));
+    let fetcher = Arc::new(BodyFetcher::new(
+        svc.clone(),
+        sink.clone(),
+        cfg.body_fetch_timeout,
+    ));
     sink.send(Ingest::NetReady(fetcher.clone()));
     let mut hub = NetHub::new(
         sink.clone(),

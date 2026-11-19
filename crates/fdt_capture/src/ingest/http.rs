@@ -9,9 +9,10 @@ use fdt_store::SessionWriter;
 use fdt_store::clock::RunClock;
 use fdt_store::net::{BodyKind, BodyState, HttpUpdate};
 use fdt_store::time::{EntryId, RunId};
-use fdt_vm::dart_io::HttpProfileEntry;
+use fdt_vm::dart_io::{HttpProfileEntry, HttpProfileRequestFull};
 use fdt_vm::rpc::RpcError;
 use fdt_vm::service::VmService;
+use serde_json::json;
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
@@ -20,6 +21,7 @@ use super::{Ingest, Sink, sockets};
 
 pub(crate) const ENABLE_RPC: &str = "ext.dart.io.httpEnableTimelineLogging";
 const MAX_FETCHES_PER_RUN: usize = 4;
+pub(crate) const TIMEOUT_REASON: &str = "The body took too long to copy.";
 pub(crate) const RECONNECT_REASON: &str = "Reconnect to the app to load the rest.";
 
 /// Maps one profile entry onto the store's update. HTTP profile times are epoch microseconds.
@@ -109,6 +111,8 @@ pub(crate) enum Fetched {
         kinds: Vec<BodyKind>,
         reason: String,
     },
+    /// A reload of a whole body failed; what is stored stays.
+    FullFailed { kind: BodyKind, reason: String },
 }
 
 #[derive(Clone, Copy)]
@@ -123,6 +127,7 @@ pub(crate) struct BodyFetcher {
     svc: VmService,
     sink: Sink,
     permits: Semaphore,
+    timeout: Duration,
     in_flight: Mutex<HashMap<String, usize>>,
 }
 
@@ -138,10 +143,11 @@ impl Drop for Counted<'_> {
 }
 
 impl BodyFetcher {
-    pub(crate) fn new(svc: VmService, sink: Sink) -> BodyFetcher {
+    pub(crate) fn new(svc: VmService, sink: Sink, timeout: Duration) -> BodyFetcher {
         BodyFetcher {
             svc,
             sink,
+            timeout,
             permits: Semaphore::new(MAX_FETCHES_PER_RUN),
             in_flight: Mutex::default(),
         }
@@ -181,19 +187,35 @@ impl BodyFetcher {
     }
 
     async fn fetch(&self, isolate: &str, vm_id: &str, mode: FetchMode) -> Fetched {
-        let kinds = match mode {
+        let kinds: Vec<BodyKind> = match mode {
             FetchMode::Auto => vec![BodyKind::Request, BodyKind::Response],
             FetchMode::Full(k) => vec![k],
         };
-        let failed = |e: RpcError| Fetched::Failed {
-            kinds: kinds.clone(),
-            reason: e.to_string(),
+        let failed = |e: RpcError| {
+            let reason = match e {
+                RpcError::Timeout => TIMEOUT_REASON.to_string(),
+                e => e.to_string(),
+            };
+            match mode {
+                FetchMode::Auto => Fetched::Failed { kinds, reason },
+                FetchMode::Full(kind) => Fetched::FullFailed { kind, reason },
+            }
         };
         let _permit = match self.permits.acquire().await {
             Ok(p) => p,
             Err(_) => return failed(RpcError::Closed),
         };
-        match self.svc.get_http_profile_request(isolate, vm_id).await {
+        let reply = self
+            .svc
+            .client()
+            .call_with_timeout(
+                "ext.dart.io.getHttpProfileRequest",
+                json!({"isolateId": isolate, "id": vm_id}),
+                self.timeout,
+            )
+            .await
+            .and_then(HttpProfileRequestFull::from_value);
+        match reply {
             Err(e) => failed(e),
             Ok(full) => match mode {
                 FetchMode::Auto => Fetched::Auto {
@@ -356,6 +378,8 @@ pub(crate) struct NetState {
     keys: HashMap<EntryId, (String, String)>,
     incomplete: HashMap<String, HashSet<String>>,
     websocket_isolates: HashSet<String>,
+    /// Full-body reloads in flight.
+    loading: HashSet<(EntryId, BodyKind)>,
 }
 
 impl NetState {
@@ -419,17 +443,26 @@ impl NetState {
     }
 
     pub(crate) fn body(&mut self, w: &mut SessionWriter, id: EntryId, result: Fetched) {
-        let store = |w: &mut SessionWriter, kind, bytes: Option<Vec<u8>>, full: bool| match bytes {
-            Some(b) if !b.is_empty() && full => w.store_full_body(id, kind, b),
+        let store = |w: &mut SessionWriter, kind, bytes: Option<Vec<u8>>| match bytes {
             Some(b) if !b.is_empty() => w.store_body(id, kind, b),
             _ => w.set_body_state(id, kind, BodyState::NotCaptured),
         };
         match result {
             Fetched::Auto { request, response } => {
-                store(w, BodyKind::Request, request, false);
-                store(w, BodyKind::Response, response, false);
+                store(w, BodyKind::Request, request);
+                store(w, BodyKind::Response, response);
             }
-            Fetched::Full { kind, bytes } => store(w, kind, bytes, true),
+            Fetched::Full { kind, bytes } => {
+                self.loading.remove(&(id, kind));
+                // An empty reload keeps what is already stored.
+                if let Some(b) = bytes.filter(|b| !b.is_empty()) {
+                    w.store_full_body(id, kind, b);
+                }
+            }
+            Fetched::FullFailed { kind, reason } => {
+                self.loading.remove(&(id, kind));
+                log::debug!("loading the full body failed: {reason}");
+            }
             Fetched::Failed { kinds, reason } => {
                 for kind in kinds {
                     w.set_body_state(
@@ -457,7 +490,9 @@ impl NetState {
         };
         match &self.fetcher {
             Some(f) if connected_run == Some(id.run) => {
-                w.set_body_state(id, kind, BodyState::Pending);
+                if !self.loading.insert((id, kind)) {
+                    return;
+                }
                 f.spawn(isolate, id, vm_id, FetchMode::Full(kind));
             }
             _ => w.set_body_state(

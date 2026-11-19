@@ -419,3 +419,88 @@ fn load_full_body_keeps_what_per_body_cut_off() {
         .await;
     });
 }
+
+#[test]
+fn slow_body_fetch_times_out_as_unavailable() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let slot: Arc<OnceLock<Arc<ScriptedServer>>> = Arc::default();
+        let s2 = slot.clone();
+        let server = Arc::new(ScriptedServer::start(move |m, p| {
+            base(m, p).unwrap_or_else(|| match m {
+                // Unknown length, as for a chunked response.
+                "ext.dart.io.getHttpProfile" => profile(vec![done("7", -1)]),
+                "ext.dart.io.getHttpProfileRequest" => {
+                    s2.get().unwrap().set_latency(Duration::from_secs(60));
+                    Ok(json!({"id": "7", "method": "GET", "uri": "http://h:1/x",
+                        "startTime": T, "responseBody": body(3)}))
+                }
+                _ => Err((-32601, "Method not found".into())),
+            })
+        }));
+        slot.set(server.clone()).ok();
+        let cfg = CaptureConfig {
+            body_fetch_timeout: Duration::from_millis(100),
+            ..config()
+        };
+        let cap = start(&server, cfg, &rt);
+        let snap = common::wait_for(&cap, Duration::from_secs(5), "a timeout", |s| {
+            s.net.len() == 1
+                && matches!(
+                    &s.net.request(0).response_body,
+                    BodyState::Unavailable { .. }
+                )
+        })
+        .await;
+        assert!(matches!(&snap.net.request(0).response_body,
+            BodyState::Unavailable { reason } if reason == "The body took too long to copy."));
+    });
+}
+
+#[test]
+fn failed_full_body_load_keeps_the_truncated_body() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let fail = Arc::new(AtomicBool::new(false));
+        let f = fail.clone();
+        let server = ScriptedServer::start(move |m, p| {
+            base(m, p).unwrap_or_else(|| match m {
+                "ext.dart.io.getHttpProfile" => profile(vec![done("7", 50)]),
+                "ext.dart.io.getHttpProfileRequest" if f.load(Ordering::SeqCst) => {
+                    Err((-32000, "gone".into()))
+                }
+                "ext.dart.io.getHttpProfileRequest" => Ok(json!({"id": "7", "method": "GET",
+                    "uri": "http://h:1/x", "startTime": T, "responseBody": body(50)})),
+                _ => Err((-32601, "Method not found".into())),
+            })
+        });
+        let cfg = CaptureConfig {
+            body_limits: fdt_store::net::BodyLimits {
+                per_body: 10,
+                total: 1 << 20,
+            },
+            ..config()
+        };
+        let cap = start(&server, cfg, &rt);
+        let snap = common::wait_for(&cap, Duration::from_secs(5), "a truncated body", |s| {
+            s.net.len() == 1 && matches!(&s.net.request(0).response_body, BodyState::Captured(_))
+        })
+        .await;
+        let id = snap.net.request(0).id;
+        fail.store(true, Ordering::SeqCst);
+        // Two loads at once: the second is ignored while the first is in flight.
+        cap.load_full_body(id, fdt_store::net::BodyKind::Response);
+        cap.load_full_body(id, fdt_store::net::BodyKind::Response);
+        common::eventually(Duration::from_secs(5), "the reload", || {
+            count(&server, "ext.dart.io.getHttpProfileRequest") >= 2
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(count(&server, "ext.dart.io.getHttpProfileRequest"), 2);
+        let snap = cap.snapshots().borrow().clone();
+        match &snap.net.request(0).response_body {
+            BodyState::Captured(b) => assert_eq!(b.bytes.len(), 10),
+            other => panic!("{other:?}"),
+        }
+    });
+}
