@@ -228,8 +228,10 @@ impl MainWindow {
     }
 
     pub fn set_counts(&mut self, counts: [Option<ToolCount>; 7], cx: &mut Context<Self>) {
-        self.counts = counts;
-        cx.notify();
+        if self.counts != counts {
+            self.counts = counts;
+            cx.notify();
+        }
     }
 
     #[cfg(test)]

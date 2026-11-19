@@ -4,8 +4,12 @@ use crate::nav::{TimeRange, Tool};
 use crate::shell::{MainWindow, ToolCount};
 use fdt_store::Snapshot;
 use fdt_store::logs::LogLevel;
-use fdt_store::net_query::{NetFilter, NetTab, filter_requests};
+use fdt_store::net_query::{NetFilter, NetTab, count_requests};
 use gpui_kit::{AppContext as _, Context};
+use std::time::Duration;
+
+/// The shortest time between the starts of two count jobs.
+pub(super) const MIN_INTERVAL: Duration = Duration::from_millis(250); // token-check: allow: throttle, not a visual duration
 
 /// What a count job was started for: the snapshot generation and the range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,8 +39,8 @@ pub fn range_counts(
         ..all.clone()
     };
     let net = shown(
-        filter_requests(&snap.net, &all).len() as u64,
-        !filter_requests(&snap.net, &errors).is_empty(),
+        count_requests(&snap.net, &all) as u64,
+        count_requests(&snap.net, &errors) > 0,
     );
     (logs, net)
 }
@@ -59,7 +63,16 @@ impl MainWindow {
         self.counts_running = true;
         self.counts_task = Some(cx.spawn(async move |this, cx| {
             let mut done: Option<CountsKey> = None;
+            let mut started: Option<std::time::Instant> = None;
             loop {
+                // Wait out the interval first, so inputs that arrive meanwhile are coalesced.
+                if let Some(at) = started {
+                    let now = cx.background_executor().now();
+                    let since = now.saturating_duration_since(at);
+                    if since < MIN_INTERVAL {
+                        cx.background_executor().timer(MIN_INTERVAL - since).await;
+                    }
+                }
                 let next = this.update(cx, |this, cx| match this.counts_wanted {
                     Some(wanted) if Some(wanted) != done => {
                         Some((wanted, this.session.read(cx).snapshot().clone()))
@@ -70,6 +83,7 @@ impl MainWindow {
                     }
                 });
                 let Ok(Some((key, snap))) = next else { break };
+                started = Some(cx.background_executor().now());
                 let counts = cx
                     .background_spawn(async move { range_counts(&snap, key.range) })
                     .await;
@@ -124,6 +138,11 @@ mod tests {
         loc.range = Some(TimeRange::new(SessionTime(4 * SEC), SessionTime(6 * SEC)));
         shell.update_in(cx, |s, w, cx| s.navigate(loc.clone(), w, cx));
         cx.run_until_parked();
+        // Throttled: the old counts stay until the interval passes.
+        let early = shell.read_with(cx, |s, _| s.counts()[Tool::Logs.index()]);
+        assert_eq!(early.map(|c| c.value), Some(10));
+        cx.executor().advance_clock(MIN_INTERVAL);
+        cx.run_until_parked();
         let logs = shell.read_with(cx, |s, _| s.counts()[Tool::Logs.index()]);
         assert_eq!(
             logs,
@@ -136,6 +155,8 @@ mod tests {
         loc.range = Some(TimeRange::new(SessionTime(0), SessionTime(2 * SEC)));
         shell.update_in(cx, |s, w, cx| s.navigate(loc, w, cx));
         cx.run_until_parked();
+        cx.executor().advance_clock(MIN_INTERVAL);
+        cx.run_until_parked();
         let logs = shell.read_with(cx, |s, _| s.counts()[Tool::Logs.index()]);
         assert_eq!(
             logs,
@@ -145,6 +166,71 @@ mod tests {
             })
         );
         assert!(crate::test_support::exists(cx, "sidebar-count-logs"));
+    }
+
+    fn request(
+        w: &mut fdt_store::SessionWriter,
+        run: fdt_store::time::RunId,
+        secs: u64,
+        status: u16,
+    ) {
+        w.upsert_request(fdt_store::net::HttpUpdate {
+            run,
+            isolate: "i".into(),
+            vm_id: secs.to_string(),
+            method: "GET".into(),
+            url: format!("https://example.com/{secs}"),
+            start: SessionTime(secs * SEC),
+            start_clamped: false,
+            request_sent: None,
+            response_start: None,
+            end: Some(SessionTime(secs * SEC + 1_000_000)),
+            status: Some(status),
+            reason: None,
+            request_headers: vec![],
+            response_headers: vec![],
+            request_content_length: None,
+            response_content_length: None,
+            events: vec![],
+            error: None,
+            websocket: false,
+            remote: None,
+        });
+    }
+
+    #[test]
+    fn network_count_is_range_aware_with_attention() {
+        let snap = snapshot(|w, run| {
+            request(w, run, 2, 200);
+            request(w, run, 5, 500);
+            request(w, run, 9, 404);
+        });
+        let range = Some(TimeRange::new(SessionTime(4 * SEC), SessionTime(6 * SEC)));
+        let (_, net) = range_counts(&snap, range);
+        assert_eq!(
+            net,
+            Some(ToolCount {
+                value: 1,
+                attention: true
+            })
+        );
+        let (_, net) = range_counts(&snap, None);
+        assert_eq!(
+            net,
+            Some(ToolCount {
+                value: 3,
+                attention: true
+            })
+        );
+        let ok_only = Some(TimeRange::new(SessionTime(SEC), SessionTime(3 * SEC)));
+        let (_, net) = range_counts(&snap, ok_only);
+        assert_eq!(
+            net,
+            Some(ToolCount {
+                value: 1,
+                attention: false
+            })
+        );
     }
 
     #[test]

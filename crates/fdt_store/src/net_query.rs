@@ -141,6 +141,17 @@ pub fn filter_requests(snap: &NetSnapshot, f: &NetFilter) -> Vec<u32> {
     parts.concat()
 }
 
+/// How many requests match, without building the list.
+pub fn count_requests(snap: &NetSnapshot, f: &NetFilter) -> usize {
+    let chunks: Vec<&[Arc<HttpRecord>]> = snap.chunks().collect();
+    let latest = snap.latest();
+    let needle = Needle::new(&f.text);
+    chunks
+        .par_iter()
+        .map(|chunk| chunk.iter().filter(|r| keep(r, f, &needle, latest)).count())
+        .sum()
+}
+
 fn keep(r: &HttpRecord, f: &NetFilter, needle: &Needle, latest: crate::time::SessionTime) -> bool {
     match f.tab {
         NetTab::Requests => {}

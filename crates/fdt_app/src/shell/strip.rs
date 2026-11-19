@@ -474,6 +474,23 @@ mod tests {
     }
 
     #[test]
+    fn bar_kind_boundaries() {
+        let snap = snapshot(|w, run| {
+            for (i, us) in [16_700u32, 16_701, 33_400, 33_401].into_iter().enumerate() {
+                w.push_frame(frame(run, i as u64, 1_000 + i as u64 * 2_000, us));
+            }
+        });
+        let span = session_span(&snap, None);
+        let layout = strip_layout(&snap, span, 400);
+        let kinds: Vec<BarKind> = layout.bars.iter().map(|b| b.3).collect();
+        assert_eq!(
+            kinds,
+            [BarKind::Ok, BarKind::Slow, BarKind::Slow, BarKind::Janky]
+        );
+        assert_eq!(layout.bars[2].2, 1.0);
+    }
+
+    #[test]
     fn x_to_time_maps_edges() {
         let span = TimeRange::new(SessionTime(0), SessionTime(10 * SEC));
         assert_eq!(x_to_time(0.0, span), SessionTime(0));
