@@ -567,3 +567,67 @@ fn failed_full_body_load_keeps_the_truncated_body() {
         }
     });
 }
+
+#[test]
+fn every_running_isolate_with_the_profile_is_polled_at_connect() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let server = ScriptedServer::start(|m, p| {
+            let iso = p["isolateId"].as_str().unwrap_or("isolates/1").to_string();
+            match m {
+                "getVM" => Ok(json!({"type": "VM", "pid": 1, "operatingSystem": "macos",
+                    "isolates": [
+                        {"id": "isolates/1", "name": "main", "isSystemIsolate": false},
+                        {"id": "isolates/2", "name": "worker", "isSystemIsolate": false},
+                        {"id": "isolates/3", "name": "vm-service", "isSystemIsolate": true}]})),
+                // Isolates 1 and 2 expose the profile; 3 is a system isolate.
+                "getIsolate" => Ok(json!({"type": "Isolate", "id": iso, "name": "x",
+                    "extensionRPCs": ["ext.dart.io.getHttpProfile", ENABLE],
+                    "rootLib": {"uri": "package:demo/main.dart"}})),
+                "ext.dart.io.getHttpProfile" => profile(vec![]),
+                _ => base(m, p).unwrap_or_else(|| Err((-32601, "Method not found".into()))),
+            }
+        });
+        let cap = start(&server, config(), &rt);
+        common::settle(&cap, Duration::from_millis(100), Duration::from_secs(5)).await;
+        let polls = |iso: &'static str| {
+            let server = &server;
+            move || {
+                server
+                    .received()
+                    .iter()
+                    .filter(|(m, p)| {
+                        m == "ext.dart.io.getHttpProfile"
+                            && p["isolateId"] == iso
+                            && p["updatedSince"].as_i64() != Some(9_000_000_000_000_000)
+                    })
+                    .count()
+                    >= 2
+            }
+        };
+        common::eventually(
+            Duration::from_secs(5),
+            "isolate 2 polled",
+            polls("isolates/2"),
+        )
+        .await;
+        common::eventually(
+            Duration::from_secs(5),
+            "isolate 1 polled",
+            polls("isolates/1"),
+        )
+        .await;
+        assert!(
+            server.received().iter().any(|(m, p)| m == ENABLE
+                && p["isolateId"] == "isolates/2"
+                && p["enabled"] == true)
+        );
+        assert!(
+            !server
+                .received()
+                .iter()
+                .any(|(_, p)| p["isolateId"] == "isolates/3"),
+            "system isolates are left alone"
+        );
+    });
+}

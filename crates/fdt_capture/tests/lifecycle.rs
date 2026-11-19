@@ -880,3 +880,60 @@ fn dropped_link_with_the_app_still_listed_reconnects() {
         ));
     });
 }
+
+#[test]
+fn connect_waits_at_most_five_seconds_by_default() {
+    let c = CaptureConfig::default();
+    assert_eq!(c.connect_deadline, Duration::from_secs(5));
+    assert_eq!(c.calibration_timeout, Duration::from_millis(1500));
+}
+
+#[test]
+fn a_server_that_never_answers_get_vm_fails_within_the_deadline() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let server = server();
+        server.silence("getVM");
+        // The real default is 5 s; the test shortens it.
+        let cfg = CaptureConfig {
+            connect_deadline: Duration::from_millis(300),
+            ..cfg()
+        };
+        let cap = Capture::start(rt.handle(), cfg, None);
+        let started = std::time::Instant::now();
+        cap.connect(Target::Uri(
+            VmServiceUri::parse(server.ws_uri().as_str()).unwrap(),
+        ));
+        match wait_status(&cap, "failed", |s| matches!(s, ConnStatus::Failed { .. })).await {
+            ConnStatus::Failed { message, .. } => {
+                assert!(message.contains("didn't answer"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(3));
+    });
+}
+
+#[test]
+fn a_calibration_call_that_never_answers_falls_back_and_connects() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let server = server();
+        // The main isolate is paused: its extension call is never answered.
+        server.silence("ext.dart.io.getHttpProfile");
+        let cfg = CaptureConfig {
+            calibration_timeout: Duration::from_millis(200),
+            ..cfg()
+        };
+        let cap = Capture::start(rt.handle(), cfg, None);
+        let started = std::time::Instant::now();
+        cap.connect(Target::Uri(
+            VmServiceUri::parse(server.ws_uri().as_str()).unwrap(),
+        ));
+        wait_status(&cap, "connected", |s| {
+            matches!(s, ConnStatus::Connected { .. })
+        })
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(2));
+    });
+}

@@ -102,6 +102,8 @@ struct Shared {
     open: std::sync::atomic::AtomicUsize,
     received: Mutex<Vec<(String, Value)>>,
     latency: Mutex<Duration>,
+    /// Methods that are recorded but never answered.
+    silenced: Mutex<std::collections::HashSet<String>>,
     /// While `Some((n, held))`, responses are collected and released in reverse once `n` arrive.
     reverse: Mutex<Option<Held>>,
 }
@@ -150,6 +152,15 @@ impl ScriptedServer {
         self.shared.received.lock().unwrap().clone()
     }
 
+    /// Never answers `method` (the request is still recorded by [`received`](Self::received)).
+    pub fn silence(&self, method: &str) {
+        self.shared
+            .silenced
+            .lock()
+            .unwrap()
+            .insert(method.to_string());
+    }
+
     /// Delays every response.
     pub fn set_latency(&self, latency: Duration) {
         *self.shared.latency.lock().unwrap() = latency;
@@ -190,6 +201,9 @@ async fn serve_scripted(
                 let params = req.get("params").cloned().unwrap_or(Value::Null);
                 shared.received.lock().unwrap().push((method.clone(), params.clone()));
                 let Some(id) = req.get("id").cloned() else { continue };
+                if shared.silenced.lock().unwrap().contains(&method) {
+                    continue;
+                }
                 let reply = match handler(&method, &params) {
                     Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
                     Err((code, message)) => {

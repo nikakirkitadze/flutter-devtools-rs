@@ -341,12 +341,29 @@ impl VmService {
         isolate: &str,
         updated_since: Option<i64>,
     ) -> Result<HttpProfile, RpcError> {
+        self.get_http_profile_with_timeout(isolate, updated_since, self.client().call_timeout())
+            .await
+    }
+
+    /// Like [`get_http_profile`](Self::get_http_profile), giving up after `timeout`.
+    pub async fn get_http_profile_with_timeout(
+        &self,
+        isolate: &str,
+        updated_since: Option<i64>,
+        timeout: std::time::Duration,
+    ) -> Result<HttpProfile, RpcError> {
         let params = match updated_since {
             Some(t) => json!({"updatedSince": t}),
             None => json!({}),
         };
+        let mut params = match params {
+            Value::Object(m) => m,
+            _ => Default::default(),
+        };
+        params.insert("isolateId".into(), json!(isolate));
         decode(
-            self.call_extension("ext.dart.io.getHttpProfile", isolate, params)
+            self.client()
+                .call_with_timeout("ext.dart.io.getHttpProfile", Value::Object(params), timeout)
                 .await?,
         )
     }

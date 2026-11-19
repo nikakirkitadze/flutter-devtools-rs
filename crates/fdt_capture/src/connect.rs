@@ -10,6 +10,7 @@ use fdt_vm::types::{Isolate, IsolateRef, Vm};
 use fdt_vm::uri::VmServiceUri;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -71,11 +72,13 @@ fn store_mode(m: Mode) -> StoreMode {
     }
 }
 
-async fn calibrate_clock(svc: &VmService, main: &str) -> Calibration {
+/// Pairs the device and host clocks. The extension call waits on the app's main isolate, which
+/// can be paused or busy, so it gets `timeout` and then the fallback below.
+async fn calibrate_clock(svc: &VmService, main: &str, timeout: Duration) -> Calibration {
     let before = host_now_us();
     let timeline = svc.get_vm_timeline_micros().await;
     let profile = svc
-        .get_http_profile(main, Some(HTTP_CALIBRATION_SINCE))
+        .get_http_profile_with_timeout(main, Some(HTTP_CALIBRATION_SINCE), timeout)
         .await;
     let after = host_now_us();
     match (timeline, profile) {
@@ -133,39 +136,76 @@ async fn connect_and_ingest(
         }
     };
     log::info!("connecting to {}", uri.redacted());
-    let (client, mut notes) = connect(uri.ws_url(), ConnectOptions::default())
-        .await
-        .map_err(|e| Fail {
-            message: e.message(),
-            details: format!("{e:?}"),
-        })?;
-    let svc = VmService::new(client.clone());
+    // Everything up to the start of the run is bounded: a server that is not a VM service, or an
+    // isolate that is paused, must not leave the window waiting on the 30 s call default.
+    let first = tokio::time::timeout(cfg.connect_deadline, async {
+        let (client, notes) = connect(uri.ws_url(), ConnectOptions::default())
+            .await
+            .map_err(|e| Fail {
+                message: e.message(),
+                details: format!("{e:?}"),
+            })?;
+        let svc = VmService::new(client.clone());
 
-    let vm = svc.get_vm().await.map_err(Fail::rpc)?;
-    let main = main_isolate(&vm)
-        .ok_or_else(|| Fail {
-            message: "The app has no running isolate yet.".into(),
-            details: format!("{vm:?}"),
-        })?
-        .id
-        .clone();
+        let vm = svc.get_vm().await.map_err(Fail::rpc)?;
+        let main = main_isolate(&vm)
+            .ok_or_else(|| Fail {
+                message: "The app has no running isolate yet.".into(),
+                details: format!("{vm:?}"),
+            })?
+            .id
+            .clone();
 
-    // Notifications that arrive while these run wait in the client's channel, in order.
-    let listen = async {
-        for s in STREAMS {
-            if let Err(e) = svc.stream_listen(s).await {
-                if e == fdt_vm::rpc::RpcError::Closed {
-                    return Err(e);
+        // Notifications that arrive while these run wait in the client's channel, in order.
+        let listen = async {
+            for s in STREAMS {
+                if let Err(e) = svc.stream_listen(s).await {
+                    if e == fdt_vm::rpc::RpcError::Closed {
+                        return Err(e);
+                    }
+                    log::warn!("streamListen {s} failed: {e}");
                 }
-                log::warn!("streamListen {s} failed: {e}");
+            }
+            Ok(())
+        };
+        let (isolate, listened, calibration) = tokio::join!(
+            svc.get_isolate(&main),
+            listen,
+            calibrate_clock(&svc, &main, cfg.calibration_timeout)
+        );
+        let isolate = isolate.map_err(Fail::rpc)?;
+        listened.map_err(Fail::rpc)?;
+        // Other isolates already running (not only `main`) that expose the HTTP profile.
+        let mut profiled = Vec::new();
+        for other in vm
+            .isolates
+            .iter()
+            .filter(|i| !i.is_system_isolate && i.id != main)
+        {
+            match svc.get_isolate(&other.id).await {
+                Ok(i) if i.extension_rpcs.iter().any(|r| r == ENABLE_RPC) => {
+                    profiled.push(other.id.clone());
+                }
+                Ok(_) => {}
+                Err(fdt_vm::rpc::RpcError::Closed) => break,
+                Err(e) => log::debug!("getIsolate {} failed: {e}", other.id),
             }
         }
-        Ok(())
+        Ok::<_, Fail>((client, notes, svc, vm, main, isolate, calibration, profiled))
+    })
+    .await;
+    let (client, mut notes, svc, vm, main, isolate, calibration, profiled) = match first {
+        Ok(r) => r?,
+        Err(_) => {
+            return Err(Fail {
+                message: format!(
+                    "The app didn't answer within {} seconds. Is it paused in the debugger?",
+                    cfg.connect_deadline.as_secs()
+                ),
+                details: "The connect sequence timed out.".into(),
+            });
+        }
     };
-    let (isolate, listened, calibration) =
-        tokio::join!(svc.get_isolate(&main), listen, calibrate_clock(&svc, &main));
-    let isolate = isolate.map_err(Fail::rpc)?;
-    listened.map_err(Fail::rpc)?;
 
     let mode = store_mode(detect_mode(&isolate));
     let (name, device, workspace) = match preset {
@@ -219,6 +259,9 @@ async fn connect_and_ingest(
     );
     if isolate.extension_rpcs.iter().any(|r| r == ENABLE_RPC) {
         hub.start(&main);
+    }
+    for id in &profiled {
+        hub.start(id);
     }
     let mut router = Router::new(
         sink,
