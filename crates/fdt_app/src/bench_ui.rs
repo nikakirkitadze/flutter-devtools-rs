@@ -2,9 +2,21 @@
 //!
 //! The harness opens the main window over a fixed session (1M logs, 100k requests, 72k frames),
 //! steps a script once per frame and prints one JSON line with frame statistics and budget
-//! verdicts. A scenario step runs in `Window::on_next_frame`, which GPUI calls right after a
-//! frame is drawn, so the clock read at the start of a step is the end of the frame that drew
-//! the previous step's changes. That is how latencies are measured.
+//! verdicts.
+//!
+//! # What "drawn" means
+//!
+//! A step runs in `Window::on_next_frame`. Despite the GPUI doc comment ("directly after the
+//! current frame is rendered"), those callbacks run at the START of the next frame request,
+//! before that frame draws (gpui-pre `window.rs`, the request-frame closure: callbacks run at
+//! about line 2008, `should_draw` and the draw follow at about line 2027). So everything a step
+//! observes or changes is drawn by the frame that starts right after it.
+//!
+//! "Drawn" is therefore detected from view model state (first-phase rows or the full result
+//! applied; the new page current and its rows ready) observed in a step. The frame that drew it
+//! is the first frame whose `draw_start` is at or after the step's clock, and the latency ends
+//! at that frame's `draw_end` (from `FrameTimingCollector`). The latency in frames counts the
+//! frames from the keystroke's own frame to that frame.
 //!
 //! Keystrokes go through the views' public APIs (`LogsView::set_search`,
 //! `NetworkView::set_filter_text`), the same entry points the palette and the field use, rather
@@ -22,7 +34,7 @@ use fdt_ui::assets::FdtAssets;
 use gpui_kit::profiler::{FrameEvent, FrameTimingCollector, set_trace_enabled};
 use gpui_kit::{
     App, Entity, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PlatformInput, Window, WindowId, point, px,
+    PlatformInput, Window, WindowId, point,
 };
 use std::cell::RefCell;
 use std::process::ExitCode;
@@ -35,12 +47,11 @@ const SEED: u64 = 42;
 const TIMEOUT: Duration = Duration::from_secs(120); // token-check: allow: watchdog timeout
 /// Frames the script waits, at least, before it starts measuring.
 const WARMUP_FRAMES: usize = 30;
-/// A pending latency sample that is still unresolved after this is recorded as this long.
+/// A pending sample still unresolved after this is recorded as seen now, so it counts as a
+/// (very) late result instead of being dropped.
 const LATENCY_CAP: Duration = Duration::from_secs(1); // token-check: allow: sample cap, not motion
-/// Frames between keystrokes of the search scenarios.
+/// Frames between keystrokes of the search scenarios (the next one also waits for the full result).
 const KEY_EVERY: usize = 5;
-/// Frames a search scenario waits after its last keystroke for the result.
-const TAIL_FRAMES: usize = 600;
 
 const LOG_QUERY: &str = "connection timeout";
 const NET_QUERY: &str = "products";
@@ -147,10 +158,24 @@ pub fn intervals_ms(starts: &[Instant]) -> Vec<f64> {
         .collect()
 }
 
-/// The frame-interval p99 budget: 8.3 ms on a display that refreshes at 120 Hz or faster,
-/// otherwise 16.7 ms.
-pub fn interval_budget_ms(refresh_ms: f64) -> f64 {
+/// The plan's frame-interval p99 budget: 8.3 ms on a display that refreshes at 120 Hz or
+/// faster, otherwise 16.7 ms.
+pub fn interval_plan_budget_ms(refresh_ms: f64) -> f64 {
     if refresh_ms <= 8.4 { 8.3 } else { 16.7 }
+}
+
+/// The interval p99 budget actually applied. The plan's 8.3 ms is below the 8.333 ms period of a
+/// 120 Hz display, so no run could meet it; the effective budget is the larger of the plan and
+/// one refresh period, plus half a millisecond for timestamp jitter.
+pub fn interval_effective_budget_ms(refresh_ms: f64) -> f64 {
+    r3(interval_plan_budget_ms(refresh_ms).max(refresh_ms) + INTERVAL_JITTER_MS)
+}
+
+/// Frames a result may take after the keystroke's own frame for a `budget_ms` budget:
+/// `ceil(budget / refresh)`. A frame period is the finest a draw can be observed at.
+pub fn budget_frames(budget_ms: f64, refresh_ms: f64) -> f64 {
+    // The small offset keeps 50 ms at 8.333 ms (6.0002 frames) at 6 frames.
+    (budget_ms / refresh_ms.max(0.1) - 0.01).ceil()
 }
 
 fn ms(d: Duration) -> f64 {
@@ -166,13 +191,17 @@ fn median(samples: &[f64]) -> Option<f64> {
 pub struct Measured {
     pub draw_ms: Vec<f64>,
     pub interval_ms: Vec<f64>,
-    /// Keystroke-to-drawn (first results for `logs-search`), or switch-to-drawn.
+    /// Keystroke to drawn (first results for `logs-search`), or switch to drawn.
     pub latency_ms: Option<Vec<f64>>,
+    /// The same in frames after the keystroke's frame.
+    pub latency_frames: Option<Vec<f64>>,
     /// Keystroke to the full result drawn (`logs-search` only).
     pub full_ms: Option<Vec<f64>>,
+    pub full_frames: Option<Vec<f64>>,
     pub refresh_ms: f64,
     /// `"display"` when GPUI reported the refresh interval, `"inferred"` otherwise.
     pub refresh_source: &'static str,
+    /// Script steps run.
     pub frames: usize,
 }
 
@@ -209,8 +238,7 @@ const FULL_SCAN_BUDGET_MS: f64 = 100.0;
 const DRAW_BUDGET_MS: f64 = 4.0;
 /// No frame may take longer than this on a 120 Hz display.
 const MAX_FRAME_MS: f64 = 16.7;
-/// Frame timestamps jitter by a fraction of a millisecond around the display period, so the
-/// interval p99 may exceed its budget by this much (8.3 ms is below a 120 Hz period).
+/// Frame timestamps jitter by a fraction of a millisecond around the display period.
 const INTERVAL_JITTER_MS: f64 = 0.5;
 
 impl Measured {
@@ -218,48 +246,65 @@ impl Measured {
         let draw = percentiles(&self.draw_ms);
         let interval = percentiles(&self.interval_ms);
         let latency = self.latency_ms.as_deref().and_then(percentiles);
+        let latency_f = self.latency_frames.as_deref().and_then(percentiles);
         let full = self.full_ms.as_deref().and_then(percentiles);
-        let interval_budget = interval_budget_ms(self.refresh_ms);
-        let strict = interval_budget < 10.0;
+        let full_f = self.full_frames.as_deref().and_then(percentiles);
+        let plan = interval_plan_budget_ms(self.refresh_ms);
+        let effective = interval_effective_budget_ms(self.refresh_ms);
+        let strict = plan < 10.0;
         let mut pass = draw.is_some_and(|p| p.p99 <= DRAW_BUDGET_MS)
-            && interval.is_some_and(|p| {
-                p.p99 <= interval_budget + INTERVAL_JITTER_MS && (!strict || p.max <= MAX_FRAME_MS)
-            });
+            && interval.is_some_and(|p| p.p99 <= effective && (!strict || p.max <= MAX_FRAME_MS));
         let latency_budget = scenario.latency_budget_ms();
-        if let Some(budget) = latency_budget {
-            pass &= latency.is_some_and(|p| p.p99 <= budget);
+        let latency_frames_budget = latency_budget.map(|b| budget_frames(b, self.refresh_ms));
+        let full_frames_budget = budget_frames(FULL_SCAN_BUDGET_MS, self.refresh_ms);
+        if let Some(b) = latency_frames_budget {
+            pass &= latency_f.is_some_and(|p| p.p99 <= b);
         }
         if self.full_ms.is_some() {
-            pass &= full.is_some_and(|p| p.p99 <= FULL_SCAN_BUDGET_MS);
+            pass &= full_f.is_some_and(|p| p.p99 <= full_frames_budget);
         }
-        let mut budget = format!(
-            "\"draw_p99_ms\":{:?},\"interval_p99_ms\":{:?},\"interval_jitter_ms\":{:?}",
-            DRAW_BUDGET_MS, interval_budget, INTERVAL_JITTER_MS
-        );
+        let mut budget =
+            format!("\"draw_p99_ms\":{DRAW_BUDGET_MS:?},\"interval_p99_ms\":{effective:?}");
         if strict {
             budget.push_str(&format!(",\"interval_max_ms\":{MAX_FRAME_MS:?}"));
         }
-        if let Some(b) = latency_budget {
-            budget.push_str(&format!(",\"latency_p99_ms\":{b:?}"));
+        if let (Some(b), Some(f)) = (latency_budget, latency_frames_budget) {
+            budget.push_str(&format!(
+                ",\"latency_p99_ms\":{b:?},\"latency_budget_frames\":{f:?}"
+            ));
         }
         if self.full_ms.is_some() {
-            budget.push_str(&format!(",\"full_p99_ms\":{FULL_SCAN_BUDGET_MS:?}"));
+            budget.push_str(&format!(
+                ",\"full_p99_ms\":{FULL_SCAN_BUDGET_MS:?},\"full_budget_frames\":{full_frames_budget:?}"
+            ));
         }
         let mut json = format!(
-            "{{\"scenario\":\"{}\",\"frames\":{},\"draw_ms\":{},\"interval_ms\":{}",
+            "{{\"scenario\":\"{}\",\"frames\":{},\"draws\":{},\"draw_ms\":{},\"interval_ms\":{}",
             scenario.name(),
             self.frames,
+            self.draw_ms.len(),
             pct_json(draw),
             pct_json(interval)
         );
-        if self.latency_ms.is_some() {
-            json.push_str(&format!(",\"latency_ms\":{}", pct_json(latency)));
-        }
-        if self.full_ms.is_some() {
-            json.push_str(&format!(",\"full_ms\":{}", pct_json(full)));
+        if let Some(l) = &self.latency_ms {
+            json.push_str(&format!(
+                ",\"latency_ms\":{},\"latency_frames\":{}",
+                pct_json(latency),
+                pct_json(latency_f)
+            ));
+            let n_full = self.full_ms.as_ref().map(Vec::len);
+            match n_full {
+                Some(n) => json.push_str(&format!(
+                    ",\"full_ms\":{},\"full_frames\":{},\"samples\":{{\"first\":{},\"full\":{n}}}",
+                    pct_json(full),
+                    pct_json(full_f),
+                    l.len()
+                )),
+                None => json.push_str(&format!(",\"samples\":{{\"latency\":{}}}", l.len())),
+            }
         }
         json.push_str(&format!(
-            ",\"budget\":{{{budget}}},\"interval_budget_ms\":{interval_budget:?},\"refresh_ms\":{:?},\"refresh_source\":\"{}\",\"pass\":{pass}}}",
+            ",\"budget\":{{{budget}}},\"interval_budget_ms\":{effective:?},\"interval_plan_budget_ms\":{plan:?},\"refresh_ms\":{:?},\"refresh_source\":\"{}\",\"pass\":{pass}}}",
             r3(self.refresh_ms),
             self.refresh_source
         ));
@@ -269,6 +314,16 @@ impl Measured {
 
 // ---- scripts ----
 
+/// One keystroke or switch: when it happened and when its result was seen in a step.
+#[derive(Clone, Copy, Debug)]
+pub struct Sample {
+    pub key_at: Instant,
+    /// A step observed the first results (the new page, for a switch).
+    pub first_seen: Instant,
+    /// A step observed the full result (`logs-search` only).
+    pub full_seen: Option<Instant>,
+}
+
 /// What a script has done so far; the headless test reads it.
 #[derive(Clone, Debug, Default)]
 pub struct Outcome {
@@ -277,10 +332,9 @@ pub struct Outcome {
     /// The last row index a scroll scenario asked for.
     pub last_position: Option<usize>,
     pub keystrokes: usize,
-    /// Latency of each keystroke or switch (first results for `logs-search`).
-    pub first: Vec<Duration>,
-    /// Latency to the full result, for `logs-search`.
-    pub full: Vec<Duration>,
+    pub samples: Vec<Sample>,
+    /// Set when the script could not do what it claims (the run then fails).
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -293,7 +347,7 @@ enum Phase {
 struct Pending {
     at: Instant,
     first_base: usize,
-    first: Option<Duration>,
+    first_seen: Option<Instant>,
     target: Option<Tool>,
 }
 
@@ -304,10 +358,11 @@ pub struct Script {
     warm: usize,
     prepared: bool,
     frame: usize,
+    /// Frames since the last keystroke.
+    since_key: usize,
     started: Option<Instant>,
     pending: Option<Pending>,
     switches: usize,
-    tail: usize,
     outcome: Outcome,
 }
 
@@ -326,10 +381,10 @@ impl Script {
             warm: 0,
             prepared: false,
             frame: 0,
+            since_key: KEY_EVERY,
             started: None,
             pending: None,
             switches: 0,
-            tail: 0,
             outcome: Outcome::default(),
         }
     }
@@ -347,7 +402,12 @@ impl Script {
         self.started
     }
 
-    /// Runs one scripted step. Call it once per frame, right after the frame was drawn.
+    fn fail(&mut self, message: &str) {
+        self.outcome.error = Some(message.to_string());
+        self.phase = Phase::Done;
+    }
+
+    /// Runs one scripted step. Call it once per frame, from the next-frame callback.
     pub fn step(&mut self, shell: &Entity<MainWindow>, window: &mut Window, cx: &mut App) {
         match self.phase {
             Phase::Warmup => self.warm_up(shell, window, cx),
@@ -355,8 +415,9 @@ impl Script {
                 match self.scenario {
                     Scenario::LogsScroll => self.scroll_step(shell, cx, 3),
                     Scenario::NetScroll => self.scroll_step(shell, cx, 2),
-                    Scenario::LogsSearch => self.search_step(shell, window, cx),
-                    Scenario::NetFilter => self.search_step(shell, window, cx),
+                    Scenario::LogsSearch | Scenario::NetFilter => {
+                        self.search_step(shell, window, cx)
+                    }
                     Scenario::ToolSwitch => self.switch_step(shell, window, cx),
                     Scenario::StripDrag => self.drag_step(shell, window, cx),
                 }
@@ -399,8 +460,7 @@ impl Script {
         }
     }
 
-    /// Whether the pending keystroke's first results and full result are on screen:
-    /// `(first-phase count, settled)`.
+    /// The pending keystroke's state: `(first-phase count, settled)`.
     fn probe(&self, shell: &Entity<MainWindow>, cx: &App) -> (usize, bool) {
         if self.scenario == Scenario::LogsSearch {
             let logs = shell.read(cx).logs_view().read(cx);
@@ -410,31 +470,33 @@ impl Script {
         }
     }
 
+    /// Types the query one character at a time. The next character goes in once
+    /// [`KEY_EVERY`] frames have passed AND the previous one's full result has been seen, so
+    /// every keystroke yields both a first-results and a full-result sample.
     fn search_step(&mut self, shell: &Entity<MainWindow>, window: &mut Window, cx: &mut App) {
         let now = Instant::now();
         let logs = self.scenario == Scenario::LogsSearch;
         let text = if logs { LOG_QUERY } else { NET_QUERY };
         let (first_phases, settled) = self.probe(shell, cx);
         if let Some(p) = &mut self.pending {
-            let age = now.saturating_duration_since(p.at);
-            if p.first.is_none() && (first_phases > p.first_base || settled) {
-                p.first = Some(age);
+            if p.first_seen.is_none() && (first_phases > p.first_base || settled) {
+                p.first_seen = Some(now);
             }
-            if settled || age > LATENCY_CAP {
-                self.outcome.first.push(p.first.unwrap_or(age));
-                if logs {
-                    self.outcome.full.push(age);
-                }
+            if settled || now.saturating_duration_since(p.at) > LATENCY_CAP {
+                self.outcome.samples.push(Sample {
+                    key_at: p.at,
+                    first_seen: p.first_seen.unwrap_or(now),
+                    full_seen: logs.then_some(now),
+                });
                 self.pending = None;
             }
         }
-        if self.frame.is_multiple_of(KEY_EVERY) && self.frame / KEY_EVERY < text.len() {
-            if let Some(p) = self.pending.take() {
-                // Superseded before its full result: the first results still count.
-                let age = now.saturating_duration_since(p.at);
-                self.outcome.first.push(p.first.unwrap_or(age));
-            }
-            let prefix = &text[..=self.frame / KEY_EVERY];
+        self.since_key += 1;
+        if self.pending.is_none()
+            && self.since_key >= KEY_EVERY
+            && self.outcome.keystrokes < text.len()
+        {
+            let prefix = &text[..=self.outcome.keystrokes];
             let first_base = first_phases;
             let at = Instant::now();
             if logs {
@@ -451,27 +513,15 @@ impl Script {
             self.pending = Some(Pending {
                 at,
                 first_base,
-                first: None,
+                first_seen: None,
                 target: None,
             });
             self.outcome.keystrokes += 1;
+            self.since_key = 0;
         }
         self.frame += 1;
-        let typed_all = self.outcome.keystrokes == text.len();
-        if typed_all && self.pending.is_none() {
+        if self.outcome.keystrokes == text.len() && self.pending.is_none() {
             self.phase = Phase::Done;
-        } else if typed_all {
-            self.tail += 1;
-            if self.tail > TAIL_FRAMES
-                && let Some(p) = self.pending.take()
-            {
-                let age = now.saturating_duration_since(p.at);
-                self.outcome.first.push(p.first.unwrap_or(age));
-                if logs {
-                    self.outcome.full.push(age);
-                }
-                self.phase = Phase::Done;
-            }
         }
     }
 
@@ -479,11 +529,14 @@ impl Script {
         let now = Instant::now();
         if let Some(p) = &self.pending {
             let target = p.target.unwrap_or(Tool::Logs);
-            let age = now.saturating_duration_since(p.at);
             let shown =
                 shell.read(cx).current().page == Page::Tool(target) && ready(shell, target, cx);
-            if shown || age > LATENCY_CAP {
-                self.outcome.first.push(age);
+            if shown || now.saturating_duration_since(p.at) > LATENCY_CAP {
+                self.outcome.samples.push(Sample {
+                    key_at: p.at,
+                    first_seen: now,
+                    full_seen: None,
+                });
                 self.pending = None;
             }
         }
@@ -503,7 +556,7 @@ impl Script {
             self.pending = Some(Pending {
                 at,
                 first_base: 0,
-                first: None,
+                first_seen: None,
                 target: Some(target),
             });
             self.switches += 1;
@@ -518,19 +571,13 @@ impl Script {
     fn drag_step(&mut self, shell: &Entity<MainWindow>, window: &mut Window, cx: &mut App) {
         let total = self.len.max(2);
         let bounds = shell.read(cx).strip_bounds();
-        let viewport = window.viewport_size();
-        let (left, width) = if f32::from(bounds.size.width) > 0.0 {
-            (bounds.origin.x, bounds.size.width)
-        } else {
-            (px(0.0), viewport.width)
-        };
-        let y = if f32::from(bounds.size.height) > 0.0 {
-            bounds.origin.y + bounds.size.height / 2.0
-        } else {
-            px(100.0) // token-check: allow: simulated pointer position, not a layout size
-        };
+        if f32::from(bounds.size.width) <= 0.0 || f32::from(bounds.size.height) <= 0.0 {
+            self.fail("the session strip has not been laid out, so there is nothing to drag");
+            return;
+        }
+        let y = bounds.origin.y + bounds.size.height / 2.0;
         let frac = 0.1 + 0.8 * self.frame as f32 / (total - 1) as f32;
-        let position = point(left + width * frac, y);
+        let position = point(bounds.origin.x + bounds.size.width * frac, y);
         let modifiers = Modifiers::default();
         let event = if self.frame == 0 {
             window.dispatch_event(
@@ -566,6 +613,9 @@ impl Script {
         self.frame += 1;
         if self.frame >= total {
             self.phase = Phase::Done;
+            if shell.read(cx).current().range.is_none() {
+                self.fail("the drag did not select a time range on the strip");
+            }
         }
     }
 }
@@ -592,6 +642,8 @@ struct Driver {
     /// `(draw_start, draw_end)` of each frame drawn while measuring.
     draws: Vec<(Instant, Instant)>,
     reported_refresh: Option<Duration>,
+    /// The script is done; one more frame runs so the last result's draw is recorded.
+    finishing: bool,
 }
 
 impl Driver {
@@ -611,6 +663,23 @@ impl Driver {
         }
     }
 
+    /// Index of the first drawn frame that started at or after `at`.
+    fn frame_at(&self, at: Instant) -> Option<usize> {
+        let i = self.draws.partition_point(|d| d.0 < at);
+        (i < self.draws.len()).then_some(i)
+    }
+
+    /// `(ms, frames)` from a keystroke to the end of the frame that drew `seen`.
+    fn latency(&self, key_at: Instant, seen: Instant) -> Option<(f64, f64)> {
+        let key_frame = self.frame_at(key_at)?;
+        let drawn = self.frame_at(seen)?;
+        let end = self.draws[drawn].1;
+        Some((
+            end.saturating_duration_since(key_at).as_nanos() as f64 / 1e6,
+            drawn.saturating_sub(key_frame) as f64,
+        ))
+    }
+
     fn measured(&self, window_refresh: Option<Duration>) -> Measured {
         let starts: Vec<Instant> = self.draws.iter().map(|d| d.0).collect();
         let interval_ms = intervals_ms(&starts);
@@ -619,8 +688,22 @@ impl Driver {
             None => (median(&interval_ms).unwrap_or(16.7), "inferred"),
         };
         let o = self.script.outcome();
-        let latency = |v: &[Duration]| v.iter().map(|d| ms(*d)).collect::<Vec<f64>>();
+        let (mut first_ms, mut first_frames) = (Vec::new(), Vec::new());
+        let (mut full_ms, mut full_frames) = (Vec::new(), Vec::new());
+        for s in &o.samples {
+            if let Some((m, f)) = self.latency(s.key_at, s.first_seen) {
+                first_ms.push(m);
+                first_frames.push(f);
+            }
+            if let Some(seen) = s.full_seen
+                && let Some((m, f)) = self.latency(s.key_at, seen)
+            {
+                full_ms.push(m);
+                full_frames.push(f);
+            }
+        }
         let has_latency = self.scenario.latency_budget_ms().is_some();
+        let has_full = self.scenario == Scenario::LogsSearch;
         Measured {
             draw_ms: self
                 .draws
@@ -628,8 +711,10 @@ impl Driver {
                 .map(|(a, b)| ms(b.saturating_duration_since(*a)))
                 .collect(),
             interval_ms,
-            latency_ms: has_latency.then(|| latency(&o.first)),
-            full_ms: (self.scenario == Scenario::LogsSearch).then(|| latency(&o.full)),
+            latency_ms: has_latency.then_some(first_ms),
+            latency_frames: has_latency.then_some(first_frames),
+            full_ms: has_full.then_some(full_ms),
+            full_frames: has_full.then_some(full_frames),
             refresh_ms,
             refresh_source,
             frames: o.steps,
@@ -638,21 +723,32 @@ impl Driver {
 }
 
 fn tick(driver: Rc<RefCell<Driver>>, window: &mut Window, cx: &mut App) {
-    let done = {
+    {
         let mut d = driver.borrow_mut();
-        let shell = d.shell.clone();
-        d.script.step(&shell, window, cx);
+        if !d.finishing {
+            let shell = d.shell.clone();
+            d.script.step(&shell, window, cx);
+        }
         d.collect();
-        d.script.is_done()
-    };
-    if done {
-        let d = driver.borrow();
-        let report = d.measured(window.refresh_interval(cx)).report(d.scenario);
-        println!("{}", report.to_json());
-        use std::io::Write as _;
-        let _ = std::io::stdout().flush();
-        // `cx.quit()` ends in `exit(0)` on macOS, so the verdict has to exit directly.
-        std::process::exit(if report.pass { 0 } else { 1 });
+        if let Some(error) = d.script.outcome().error.clone() {
+            fail(d.scenario, &error);
+        }
+        if d.finishing {
+            let measured = d.measured(window.refresh_interval(cx));
+            let report = measured.report(d.scenario);
+            if measured.refresh_source == "inferred" {
+                eprintln!(
+                    "bench-ui: the display refresh interval was not reported; inferred {:.3} ms from the median frame interval",
+                    measured.refresh_ms
+                );
+            }
+            println!("{}", report.to_json());
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            // `cx.quit()` ends in `exit(0)` on macOS, so the verdict has to exit directly.
+            std::process::exit(if report.pass { 0 } else { 1 });
+        }
+        d.finishing = d.script.is_done();
     }
     window.refresh();
     window.on_next_frame(move |window, cx| tick(driver, window, cx));
@@ -744,6 +840,7 @@ pub fn run(scenario: Scenario, frames: Option<usize>) -> ExitCode {
                 window_id: handle.window_id(),
                 draws: Vec::new(),
                 reported_refresh: None,
+                finishing: false,
             }));
             let result = handle.update(cx, move |_, window, _| {
                 window.refresh();
@@ -762,6 +859,7 @@ mod tests {
     use crate::session_model::SessionModel;
     use crate::test_support::{connected, open_shell_with};
     use gpui_kit::TestAppContext;
+    use gpui_kit::test::TestWindowExt as _;
 
     #[test]
     fn percentiles_use_nearest_rank() {
@@ -788,10 +886,24 @@ mod tests {
     }
 
     #[test]
-    fn interval_budget_follows_the_display_refresh() {
-        assert_eq!(interval_budget_ms(8.333), 8.3);
-        assert_eq!(interval_budget_ms(8.4), 8.3);
-        assert_eq!(interval_budget_ms(16.667), 16.7);
+    fn plan_budget_follows_the_display_refresh() {
+        assert_eq!(interval_plan_budget_ms(8.333), 8.3);
+        assert_eq!(interval_plan_budget_ms(8.4), 8.3);
+        assert_eq!(interval_plan_budget_ms(16.667), 16.7);
+    }
+
+    #[test]
+    fn effective_budget_is_never_below_one_refresh_period() {
+        assert_eq!(interval_effective_budget_ms(8.333), 8.833);
+        assert_eq!(interval_effective_budget_ms(16.667), 17.2);
+        assert_eq!(interval_effective_budget_ms(13.333), 17.2);
+    }
+
+    #[test]
+    fn frame_budget_rounds_up() {
+        assert_eq!(budget_frames(16.0, 8.333), 2.0);
+        assert_eq!(budget_frames(16.0, 16.667), 1.0);
+        assert_eq!(budget_frames(50.0, 8.333), 6.0);
     }
 
     #[test]
@@ -802,23 +914,24 @@ mod tests {
         assert_eq!(Scenario::parse("nope"), None);
     }
 
-    #[test]
-    fn report_passes_only_when_every_budget_holds() {
-        let ok = Measured {
+    fn base() -> Measured {
+        Measured {
             draw_ms: vec![1.0; 100],
             interval_ms: vec![8.3; 100],
             latency_ms: None,
+            latency_frames: None,
             full_ms: None,
+            full_frames: None,
             refresh_ms: 8.333,
             refresh_source: "display",
             frames: 100,
-        };
+        }
+    }
+
+    #[test]
+    fn report_passes_only_when_every_budget_holds() {
+        let ok = base();
         assert!(ok.report(Scenario::LogsScroll).pass);
-        let jittery = Measured {
-            interval_ms: vec![8.6; 100],
-            ..ok.clone()
-        };
-        assert!(jittery.report(Scenario::LogsScroll).pass);
         let slow_draw = Measured {
             draw_ms: vec![5.0; 100],
             ..ok.clone()
@@ -829,27 +942,63 @@ mod tests {
             ..ok.clone()
         };
         assert!(!long_frame.report(Scenario::LogsScroll).pass);
-        let slow_search = Measured {
-            latency_ms: Some(vec![30.0; 18]),
-            ..ok.clone()
-        };
-        assert!(!slow_search.report(Scenario::LogsSearch).pass);
         let json = ok.report(Scenario::LogsScroll).to_json().to_string();
         assert!(json.contains("\"scenario\":\"logs-scroll\""));
-        assert!(json.contains("\"interval_budget_ms\":8.3"));
-        assert!(!json.contains("latency_ms\":{"));
+        assert!(json.contains("\"frames\":100,\"draws\":100"));
+        assert!(json.contains("\"interval_budget_ms\":8.833"));
+        assert!(json.contains("\"interval_plan_budget_ms\":8.3"));
+        assert!(!json.contains("latency_ms"));
+    }
+
+    #[test]
+    fn interval_p99_above_the_effective_budget_fails() {
+        let m = Measured {
+            interval_ms: vec![9.0; 100],
+            ..base()
+        };
+        assert!(!m.report(Scenario::LogsScroll).pass);
+    }
+
+    #[test]
+    fn search_latency_is_judged_in_frames() {
+        let search = |ms: f64, frames: f64| Measured {
+            latency_ms: Some(vec![ms; 18]),
+            latency_frames: Some(vec![frames; 18]),
+            full_ms: Some(vec![30.0; 18]),
+            full_frames: Some(vec![4.0; 18]),
+            ..base()
+        };
+        // 16 ms at 120 Hz is two frames: a result in the second frame passes...
+        let ok = search(16.6, 2.0).report(Scenario::LogsSearch);
+        assert!(ok.pass);
+        let json = ok.to_json();
+        assert!(json.contains("\"latency_budget_frames\":2.0"));
+        assert!(json.contains("\"samples\":{\"first\":18,\"full\":18}"));
+        // ...a third frame fails, however short it was in milliseconds.
+        assert!(!search(9.0, 3.0).report(Scenario::LogsSearch).pass);
     }
 
     /// Runs `scenario` on a small session without frames: each `step` stands in for a frame,
-    /// and the executor settles between steps.
-    fn run_script(cx: &mut TestAppContext, scenario: Scenario, frames: Option<usize>) -> Script {
-        let snapshot = fdt_store::synth::session(3, 100, 100, 200);
+    /// and the executor settles between steps. With `draw`, a frame is rendered first so the
+    /// strip has bounds.
+    fn run_script(
+        cx: &mut TestAppContext,
+        scenario: Scenario,
+        frames: Option<usize>,
+        draw: bool,
+    ) -> Script {
+        let snapshot = fdt_store::synth::session(3, 100, 100, 2_000);
         let (shell, vcx) = open_shell_with(cx, |_| {
             SessionModel::fixed(snapshot, connected("stress", true))
         });
         let mut script = Script::new(scenario, frames);
         for _ in 0..3_000 {
-            vcx.update(|window, cx| script.step(&shell, window, cx));
+            vcx.update(|window, cx| {
+                if draw {
+                    window.render_frame(cx);
+                }
+                script.step(&shell, window, cx);
+            });
             vcx.run_until_parked();
             if script.is_done() {
                 break;
@@ -860,32 +1009,68 @@ mod tests {
 
     #[gpui_kit::test]
     fn scenario_scripts_complete_headless(cx: &mut TestAppContext) {
-        let s = run_script(cx, Scenario::LogsScroll, Some(10));
+        let s = run_script(cx, Scenario::LogsScroll, Some(10), false);
         assert!(s.is_done());
         assert_eq!(s.outcome().steps, 10);
         assert_eq!(s.outcome().last_position, Some(27));
 
-        let s = run_script(cx, Scenario::NetScroll, Some(10));
+        let s = run_script(cx, Scenario::NetScroll, Some(10), false);
         assert!(s.is_done());
         assert_eq!(s.outcome().last_position, Some(18));
 
-        let s = run_script(cx, Scenario::LogsSearch, None);
+        // Every keystroke yields both a first-results and a full-result sample.
+        let s = run_script(cx, Scenario::LogsSearch, None, false);
         assert!(s.is_done());
-        assert_eq!(s.outcome().keystrokes, 18);
-        assert_eq!(s.outcome().first.len(), 18);
+        let o = s.outcome();
+        assert_eq!(o.keystrokes, 18);
+        assert_eq!(o.samples.len(), 18);
+        assert_eq!(
+            o.samples.iter().filter(|x| x.full_seen.is_some()).count(),
+            18
+        );
+        assert!(o.samples.iter().all(|x| x.first_seen >= x.key_at));
 
-        let s = run_script(cx, Scenario::NetFilter, None);
+        let s = run_script(cx, Scenario::NetFilter, None, false);
         assert!(s.is_done());
         assert_eq!(s.outcome().keystrokes, 8);
-        assert_eq!(s.outcome().first.len(), 8);
+        assert_eq!(s.outcome().samples.len(), 8);
 
-        let s = run_script(cx, Scenario::ToolSwitch, Some(6));
+        let s = run_script(cx, Scenario::ToolSwitch, Some(6), false);
         assert!(s.is_done());
-        assert_eq!(s.outcome().first.len(), 6);
-        assert!(s.outcome().first.iter().all(|d| d.as_millis() < 1_000));
+        assert_eq!(s.outcome().samples.len(), 6);
+        assert!(s.outcome().error.is_none());
+    }
 
-        let s = run_script(cx, Scenario::StripDrag, Some(12));
+    #[gpui_kit::test]
+    fn strip_drag_selects_a_range_or_reports_an_error(cx: &mut TestAppContext) {
+        let s = run_script(cx, Scenario::StripDrag, Some(12), true);
         assert!(s.is_done());
+        assert_eq!(s.outcome().error, None);
         assert_eq!(s.outcome().steps, 12);
+    }
+
+    #[gpui_kit::test]
+    fn strip_drag_errors_when_the_strip_is_not_laid_out(cx: &mut TestAppContext) {
+        let snapshot = fdt_store::synth::session(3, 100, 100, 2_000);
+        let (shell, vcx) = open_shell_with(cx, |_| {
+            SessionModel::fixed(snapshot, connected("stress", true))
+        });
+        // Settings has no strip, so its bounds were never set.
+        vcx.update(|window, cx| {
+            shell.update(cx, |s, cx| {
+                s.navigate(Location::at(Page::Settings), window, cx)
+            });
+        });
+        vcx.run_until_parked();
+        let mut script = Script::new(Scenario::StripDrag, Some(12));
+        vcx.update(|window, cx| script.drag_step(&shell, window, cx));
+        assert!(script.is_done());
+        assert!(
+            script
+                .outcome()
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("strip"))
+        );
     }
 }
