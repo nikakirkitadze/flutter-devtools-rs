@@ -235,6 +235,9 @@ impl gpui_kit::Global for StartupConnect {}
 
 /// Like [`run`], but connects to `uri` once the first window's capture is attached, as if the
 /// URL had been pasted on the Start page.
+///
+/// This needs the window to draw frames: the capture host installs from a next-frame callback,
+/// so a locked or occluded session does not connect until frames resume.
 pub fn run_connected(uri: fdt_vm::uri::VmServiceUri) -> ExitCode {
     let store = load_store();
     gpui_kit::application()

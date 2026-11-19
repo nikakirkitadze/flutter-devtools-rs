@@ -32,9 +32,9 @@ Not-met budgets known from those earlier runs: Logs search and tool switch draw 
 
 ## Measured budgets
 
-Load: `uptime` before each batch is recorded. The machine was shared and busy (Chrome, Android Studio and its Dart processes; load average 124 on the 1-minute scale at one point at 19:05, 4.3 to 8.9 during the measurements below). The overhead numbers have a noise of about 1 % run to run (see the spread between the two bare runs), so only differences larger than that mean anything.
+Load: `uptime` before each batch is recorded. The machine was shared and busy (Chrome, Android Studio and its Dart processes; 1-minute load average 124.38 at 19:05 when the first idle attempt started, 88.33 at 19:06; later batches 4.3 to 8.2, listed per batch below). The overhead numbers have a noise of about 1 % run to run (see the spread between the two bare runs), so only differences larger than that mean anything.
 
-### Release budget tests (one run, load about 5)
+### Release budget tests (one run, load not recorded for this batch)
 
 | Measure | Budget | Measured | Verdict |
 |---|---|---|---|
@@ -45,7 +45,7 @@ Load: `uptime` before each batch is recorded. The machine was shared and busy (C
 | `strip_bars`, 72k frames at width 1000 | (internal) | worst 0.0064 ms | met |
 | Pretty-print of 1 MiB JSON (off the UI thread) | (internal) | 20.5 ms | met |
 
-### Attach: `scripts/jank-lab-it.sh debug`, 3 runs, load 4.3 to 4.7
+### Attach: `scripts/jank-lab-it.sh debug`, 3 runs, 1-minute load 4.48, 4.64, 4.26
 
 | Run | attach_ms | attach_to_data_ms | first_log_ms |
 |---|---|---|---|
@@ -57,18 +57,18 @@ Load: `uptime` before each batch is recorded. The machine was shared and busy (C
 
 ### Idle memory and CPU, connected
 
-**Real window: not measured** (screen locked, see the summary). Two attempts: `fdt --connect` with the app on its home screen, 30 s wait, 30 samples 2 s apart. The process stayed at 54 to 56 MB RSS and 0.0 % CPU on every sample, but it was not connected (no socket to the VM), so these numbers describe an idle, unconnected window and do not count.
+**Real window: not measured** (screen locked, see the summary). Two attempts: `fdt --connect` with the app on its home screen, 30 s wait, 30 samples 2 s apart. All 30 samples were 0.0 % CPU, with RSS 56,128 to 56,288 KB for the first 16 and 54,336 KB for the last 14 (about 54 to 56 MB), but it was not connected (no socket to the VM), so these numbers describe an idle, unconnected window and do not count.
 
-**Capture alone, no window (a lower bound, not the budget measurement).** `attach_hold` example (the real `Capture` connected to `jank_lab` in debug mode on its home screen), 30 s warm-up, then 30 samples 2 s apart, load 7.1 to 4.9:
+**Capture alone, no window (a lower bound, not the budget measurement).** `attach_hold` example (the real `Capture` connected to `jank_lab` in debug mode on its home screen), 30 s warm-up, then 30 samples 2 s apart, 1-minute load 7.11 before and 4.88 after. The sampled PID was the built `attach_hold` binary itself (started directly, not through `cargo run`):
 
 - RSS: 3,168 KB at the first sample, 3,216 KB for the other 29. Maximum 3.2 MB.
-- CPU: 0.0 on 25 samples, 0.1 on 5. Maximum 0.1 %.
+- CPU: 0.0 on 24 samples, 0.1 on 6. Maximum 0.1 %.
 
 The window adds its own cost (about 55 MB unconnected, from the idle runs above, plus snapshot rendering). The 150 MB and 1 % budgets are **not verified** for the whole app.
 
 ### Overhead on the profiled app (<= 2 % added to frame build time)
 
-`jank_lab` in profile mode on the Jank screen (`--profile --dart-define=SCENARIO=jank`; its `HeavyBuildPanel` burns 24 ms in `build` on each animation frame). `frame_build_sampler` collects 600 `Flutter.Frame` `build` values from a second VM client subscribed to the `Extension` stream only, counting only frames that started after it subscribed (the VM replays older events on subscribe; the first version of the sampler counted those and gave four identical runs, so it was fixed). "Attached" means the real `Capture` (the same code `fdt` uses) is connected as a third client; the window was not involved because it could not connect (locked screen), and the app only sees the capture's connection. Order: bare, attached, bare, attached. Load 7.8 to 8.9.
+`jank_lab` in profile mode on the Jank screen (`--profile --dart-define=SCENARIO=jank`; its `HeavyBuildPanel` burns 24 ms in `build` on each animation frame). `frame_build_sampler` collects 600 `Flutter.Frame` `build` values from a second VM client subscribed to the `Extension` stream only, counting only frames that started after it subscribed (the VM replays older events on subscribe; the first version of the sampler counted those and gave four identical runs, so it was fixed). "Attached" means the real `Capture` (the same code `fdt` uses) is connected as a third client; the window was not involved because it could not connect (locked screen), and the app only sees the capture's connection. Order: bare, attached, bare, attached. 1-minute load 8.16 before the first pair and 7.82 before the second.
 
 | Run | Median build (us) | Mean (us) | p90 (us) | Frames per second observed |
 |---|---|---|---|---|
@@ -128,7 +128,7 @@ The scroll interval budget is `max(plan budget, refresh period) + 0.5 ms` (rulin
 - R17: keystroke latency budgets are judged in frames after the keystroke's frame.
 - R18: the logs-search scenario types the next character after 5 frames or once the previous full result is drawn.
 - R19: an added draw-time pass (Task 21b) because bench-ui showed misses against the 4 ms draw budget; it cached static chrome and fixed benchmark artefacts.
-- R20: `fdt --connect <vm-service-url>` was added so a connected window can be started without clicks. A bad URL exits 2 with the parse message. It connects once the first window's capture is attached. It does not save the URL in recent URLs.
+- R20: `fdt --connect <vm-service-url>` was added so a connected window can be started without clicks. A bad URL exits 2 with the parse message. It connects once the first window's capture is attached, which needs the window to draw frames (the capture host installs from a next-frame callback), so a locked or occluded session does not connect until frames resume. It does not save the URL in recent URLs.
 
 ## Open decisions for the author
 
