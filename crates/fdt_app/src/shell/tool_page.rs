@@ -2,7 +2,6 @@
 
 use crate::nav::Tool;
 use crate::shell::sidebar::tool_icon;
-use fdt_ui::assets::icons;
 use fdt_ui::empty_state::EmptyState;
 use fdt_ui::theme::TokensExt as _;
 use fdt_ui::tokens::{font, space};
@@ -69,20 +68,16 @@ fn idle_copy(tool: Tool) -> (&'static str, &'static str) {
     }
 }
 
-/// The start page: where the user connects to a running app.
+/// The start page before the capture host exists: just its heading.
 pub fn render_start(cx: &App) -> impl IntoElement {
-    let _ = cx;
     div()
+        .id("start-page")
+        .test_support()
         .size_full()
         .flex()
-        .items_center()
         .justify_center()
-        .child(EmptyState::new(
-            "start-page",
-            icons::NETWORK,
-            "Connect to a running app",
-            "Running Flutter apps appear here.",
-        ))
+        .py(space::S32)
+        .child(crate::shell::start_page::heading(cx))
 }
 
 /// The page for `tool`: a header row and a centred empty state.

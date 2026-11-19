@@ -1,8 +1,9 @@
 //! Cross-platform key bindings.
 
 use crate::actions::{
-    ClearSelection, CloseWindow, GoBack, GoForward, Hide, HideOthers, Minimize, NewSession,
-    NewWindow, OpenPalette, OpenSettings, Quit, ShowShortcuts, ToggleFullScreen, ToggleRecording,
+    AppListConnect, AppListNext, AppListPrev, ClearSelection, CloseWindow, GoBack, GoForward, Hide,
+    HideOthers, Minimize, NewSession, NewWindow, OpenPalette, OpenSettings, Quit, ShowShortcuts,
+    ToggleFullScreen, ToggleRecording,
 };
 use crate::nav::Tool;
 use gpui_kit::KeyBinding;
@@ -13,6 +14,10 @@ pub const SHELL_CONTEXT: &str = "Shell";
 /// The shell, but not while a text input has focus, so typing `?` or pressing Escape in a field
 /// is left to the field.
 pub const SHELL_NOT_INPUT: &str = "Shell && !Input";
+
+/// Key context of the start page's app list. The URL field is outside it, so these keys never
+/// fire while typing.
+pub const APP_LIST_CONTEXT: &str = "AppList";
 
 /// `mac` on macOS, `other` everywhere else.
 pub fn platform(mac: &'static str, other: &'static str) -> &'static str {
@@ -56,6 +61,14 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new(platform("cmd-q", "ctrl-q"), Quit, None),
         KeyBinding::new(platform("cmd-w", "ctrl-w"), CloseWindow, None),
         KeyBinding::new(platform("ctrl-cmd-f", "f11"), ToggleFullScreen, None),
+    ]);
+    let list = Some(APP_LIST_CONTEXT);
+    out.extend([
+        KeyBinding::new("up", AppListPrev, list),
+        KeyBinding::new("k", AppListPrev, list),
+        KeyBinding::new("down", AppListNext, list),
+        KeyBinding::new("j", AppListNext, list),
+        KeyBinding::new("enter", AppListConnect, list),
     ]);
     if cfg!(target_os = "macos") {
         out.extend([

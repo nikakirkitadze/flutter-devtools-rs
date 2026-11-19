@@ -293,7 +293,14 @@ mod tests {
         let cmds = commands();
         for b in bindings() {
             let name = b.action().name();
-            if name == crate::actions::OpenPalette.name() {
+            // The palette opens the palette; the app-list keys only mean something while the
+            // start page's list has focus, so they are not commands.
+            let list_local = [
+                crate::actions::AppListPrev.name(),
+                crate::actions::AppListNext.name(),
+                crate::actions::AppListConnect.name(),
+            ];
+            if name == crate::actions::OpenPalette.name() || list_local.contains(&name) {
                 continue;
             }
             assert!(

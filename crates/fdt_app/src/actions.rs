@@ -36,7 +36,10 @@ gpui_kit::actions!(
         NewWindow,
         ConnectToApp,
         Disconnect,
-        StopWaiting
+        StopWaiting,
+        AppListPrev,
+        AppListNext,
+        AppListConnect
     ]
 );
 

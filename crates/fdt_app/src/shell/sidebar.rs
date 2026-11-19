@@ -132,6 +132,26 @@ impl MainWindow {
         .into_any_element()
     }
 
+    fn connect_item(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        item(
+            Item {
+                id: "sidebar-connect".into(),
+                icon: icons::CONNECT,
+                label: "Connect",
+                active: self.current().page == Page::Start,
+                disabled: false,
+                tooltip: None,
+                count: None,
+                on_click: Some(Box::new(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    let to = this.current().with_page(Page::Start);
+                    this.navigate(to, window, cx);
+                }))),
+            },
+            cx,
+        )
+        .into_any_element()
+    }
+
     pub(super) fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.tokens();
         let items: Vec<_> = Tool::ALL[1..]
@@ -152,6 +172,7 @@ impl MainWindow {
             .bg(Hsla::from(t.surface))
             .border_r(layout::BORDER)
             .border_color(Hsla::from(t.border))
+            .child(self.connect_item(cx))
             .child(self.tool_item(Tool::Timeline, cx))
             .child(
                 div()

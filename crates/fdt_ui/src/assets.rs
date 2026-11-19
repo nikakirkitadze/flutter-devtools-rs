@@ -75,6 +75,7 @@ pub mod icons {
     pub const SEARCH: IconName = IconName::Search;
     pub const KEYBOARD: IconName = IconName::Keyboard;
     pub const INFO: IconName = IconName::Info;
+    pub const CONNECT: IconName = IconName::Plug;
     pub const WARNING: IconName = IconName::TriangleAlert;
 }
 

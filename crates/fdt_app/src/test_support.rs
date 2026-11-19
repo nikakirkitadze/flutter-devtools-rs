@@ -9,6 +9,8 @@ use fdt_store::Snapshot;
 use fdt_store::net::{BodyKind, BodyLimits};
 use fdt_store::run::{AppInfo, Mode};
 use fdt_store::time::{EntryId, RunId};
+use fdt_vm::discovery::{AppKey, DiscoveredApp};
+use fdt_vm::service::Mode as VmMode;
 use gpui_kit::base::Root;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AppContext as _, Entity, TestAppContext, VisualTestContext};
@@ -70,10 +72,51 @@ pub fn open_shell_fake(
     (shell, vcx, handle)
 }
 
+/// Opens the shell with a fake capture and a start page fed by the returned apps channel.
+///
+/// With `initial` the list is published once before the page looks (a finished first scan);
+/// with `None` nothing has been published yet.
+pub fn open_start(
+    cx: &mut TestAppContext,
+    initial: Option<Vec<DiscoveredApp>>,
+) -> (
+    Entity<MainWindow>,
+    &mut VisualTestContext,
+    FakeHandle,
+    watch::Sender<Arc<[DiscoveredApp]>>,
+) {
+    let (shell, vcx, handle) = open_shell_fake(cx);
+    let (tx, rx) = watch::channel::<Arc<[DiscoveredApp]>>(Arc::from(Vec::new()));
+    if let Some(apps) = initial {
+        tx.send(Arc::from(apps)).unwrap();
+    }
+    shell.update_in(vcx, |s, window, cx| s.set_apps_source(rx, window, cx));
+    vcx.run_until_parked();
+    (shell, vcx, handle, tx)
+}
+
+pub fn discovered(name: &str, device: &str, mode: Option<VmMode>) -> DiscoveredApp {
+    DiscoveredApp {
+        key: AppKey {
+            package: name.to_string(),
+            device: device.to_string(),
+            workspace: format!("/work/{name}"),
+        },
+        vm_uri: format!("ws://127.0.0.1:1/{name}/ws"),
+        name: name.to_string(),
+        device: device.to_string(),
+        mode,
+        flutter_version: Some("3.47.9".to_string()),
+        workspace: Some(format!("/home/dev/projects/{name}")),
+        pid: None,
+    }
+}
+
 /// A capture stand-in: records every command and replays whatever the test sends.
 pub struct FakeCapture {
     dropped: Rc<std::cell::Cell<bool>>,
     log: Rc<RefCell<Vec<String>>>,
+    targets: Rc<RefCell<Vec<Target>>>,
     status: watch::Receiver<ConnStatus>,
     snaps: watch::Receiver<Arc<Snapshot>>,
 }
@@ -83,6 +126,8 @@ pub struct FakeHandle {
     /// Set when the `FakeCapture` is dropped.
     pub dropped: Rc<std::cell::Cell<bool>>,
     pub log: Rc<RefCell<Vec<String>>>,
+    /// Every target passed to `connect`, in order.
+    pub targets: Rc<RefCell<Vec<Target>>>,
     pub status: watch::Sender<ConnStatus>,
     pub snaps: watch::Sender<Arc<Snapshot>>,
 }
@@ -98,16 +143,19 @@ pub fn fake_capture() -> (FakeCapture, FakeHandle) {
     let (status_tx, status) = watch::channel(ConnStatus::Idle);
     let (snaps_tx, snaps) = watch::channel(Arc::new(Snapshot::empty()));
     let dropped = Rc::new(std::cell::Cell::new(false));
+    let targets = Rc::new(RefCell::new(Vec::new()));
     (
         FakeCapture {
             dropped: dropped.clone(),
             log: log.clone(),
+            targets: targets.clone(),
             status,
             snaps,
         },
         FakeHandle {
             dropped,
             log,
+            targets,
             status: status_tx,
             snaps: snaps_tx,
         },
@@ -127,7 +175,8 @@ impl FakeCapture {
 }
 
 impl CaptureControl for FakeCapture {
-    fn connect(&self, _target: Target) {
+    fn connect(&self, target: Target) {
+        self.targets.borrow_mut().push(target);
         self.record("connect");
     }
     fn disconnect(&self) {

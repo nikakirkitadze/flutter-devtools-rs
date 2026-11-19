@@ -5,6 +5,7 @@ mod banner;
 mod settings_page;
 mod shortcuts;
 mod sidebar;
+pub(crate) mod start_page;
 mod title_bar;
 mod tool_page;
 
@@ -14,7 +15,7 @@ use crate::actions::{
     ShowShortcuts, ShowState, ShowTimeline, ShowWidgets, StopWaiting, ToggleFrameHud,
     ToggleFullScreen, ToggleRecording, UseDarkTheme, UseLightTheme, UseSystemTheme, Zoom,
 };
-use crate::capture_host::CaptureControl;
+use crate::capture_host::{CaptureControl, CaptureHost};
 use crate::keymap::SHELL_CONTEXT;
 use crate::nav::{Location, NavHistory, Page, Tool};
 use crate::palette::view::{PaletteModel, open_palette};
@@ -24,12 +25,16 @@ use fdt_capture::ConnStatus;
 use fdt_ui::hud::FrameHud;
 use fdt_ui::theme::{self, ThemePreference, TokensExt as _};
 use fdt_ui::tokens::Appearance;
+use fdt_vm::discovery::DiscoveredApp;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::{
     Action, App, AppContext as _, Context, Div, Entity, FocusHandle, Focusable, Hsla,
     InteractiveElement as _, IntoElement, MouseButton, NavigationDirection, ParentElement as _,
     Render, Styled as _, TestSupportExt as _, Window, div, relative,
 };
+use start_page::StartPage;
+use std::sync::Arc;
+use tokio::sync::watch;
 
 /// Makes the window actions work from inside a dialog.
 ///
@@ -64,6 +69,9 @@ pub struct MainWindow {
     focus: FocusHandle,
     palette: Option<Entity<PaletteModel>>,
     session: Entity<SessionModel>,
+    /// The start page, created once the app list is available.
+    start: Option<Entity<StartPage>>,
+    _host_wait: Option<gpui_kit::Subscription>,
     /// Whether the last status seen was `Connected`, so only a new connection leaves Start.
     was_connected: bool,
     _appearance: gpui_kit::Subscription,
@@ -92,17 +100,61 @@ impl MainWindow {
                 this.status_changed(window, cx);
             }
         });
-        Self {
+        let host_wait = (!cx.has_global::<CaptureHost>()).then(|| {
+            cx.observe_global_in::<CaptureHost>(window, |this, window, cx| {
+                this.apps_from_host(window, cx);
+            })
+        });
+        let mut this = Self {
             history: NavHistory::new(Location::at(Page::Start)),
             counts: [None; 7],
             hud,
             focus,
             palette: None,
             session,
+            start: None,
+            _host_wait: host_wait,
             was_connected,
             _appearance: appearance,
             _session_subs: [observed, connected],
+        };
+        this.apps_from_host(window, cx);
+        this
+    }
+
+    /// Creates the start page from the host's discovery, once the host exists.
+    fn apps_from_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.start.is_some() || !cx.has_global::<CaptureHost>() {
+            return;
         }
+        let apps = cx.global::<CaptureHost>().apps();
+        self.set_apps_source(apps, window, cx);
+    }
+
+    /// Creates the start page over `apps` (a no-op if it exists).
+    pub(crate) fn set_apps_source(
+        &mut self,
+        apps: watch::Receiver<Arc<[DiscoveredApp]>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.start.is_some() {
+            return;
+        }
+        let session = self.session.clone();
+        let page = cx.new(|cx| StartPage::new(apps, session, window, cx));
+        if self.current().page == Page::Start {
+            let focus = page.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+        }
+        self.start = Some(page);
+        self._host_wait = None;
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_page(&self) -> Option<&Entity<StartPage>> {
+        self.start.as_ref()
     }
 
     pub fn session(&self) -> &Entity<SessionModel> {
@@ -244,7 +296,10 @@ impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.tokens();
         let page: gpui_kit::AnyElement = match self.current().page {
-            Page::Start => tool_page::render_start(cx).into_any_element(),
+            Page::Start => match &self.start {
+                Some(page) => page.clone().into_any_element(),
+                None => tool_page::render_start(cx).into_any_element(),
+            },
             Page::Tool(tool) => tool_page::render(tool, cx).into_any_element(),
             Page::Settings => {
                 let free = settings(cx).free_app_http_memory;
