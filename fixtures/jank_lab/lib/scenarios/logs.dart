@@ -3,6 +3,8 @@ import 'dart:developer' as developer;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
+import '../ext.dart';
+
 /// Provokes noisy logging: leveled `developer.log` records from two logger
 /// names, a burst of 1,000 `print` lines, a 30-line record, a reported
 /// Flutter error, and a widget that throws while building. Expect it in the
@@ -16,6 +18,27 @@ class LogsScreen extends StatefulWidget {
 
 class _LogsScreenState extends State<LogsScreen> {
   bool _throw = false;
+  late final VoidCallback _unregister;
+
+  @override
+  void initState() {
+    super.initState();
+    _unregister = registerJankActions({
+      'emit_levels': _emitLevels,
+      'print_burst': _printBurst,
+      'multi_line': _multiLine,
+      'report_error': _reportError,
+      'throw_in_build': () {
+        if (mounted) setState(() => _throw = true);
+      },
+    });
+  }
+
+  @override
+  void dispose() {
+    _unregister();
+    super.dispose();
+  }
 
   void _emitLevels() {
     developer.log('fine detail', name: 'jank_lab.net', level: 500);

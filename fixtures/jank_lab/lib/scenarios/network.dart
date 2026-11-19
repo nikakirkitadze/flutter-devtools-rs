@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 
+import '../ext.dart';
 import '../fixture_server.dart';
 
 /// Provokes network traffic against a loopback [FixtureServer]: a JSON GET, a
@@ -24,10 +25,24 @@ class _NetworkScreenState extends State<NetworkScreen> {
   WebSocket? _ws;
   Timer? _wsTimer;
   int _pings = 0;
+  late final VoidCallback _unregister;
 
   @override
   void initState() {
     super.initState();
+    _unregister = registerJankActions({
+      'load_products': _loadProducts,
+      'place_order': _placeOrder,
+      'download': _download,
+      'burst': _burst,
+      'open_socket': _openSocket,
+      'hero_image': () {
+        if (mounted) setState(() => _showImage = true);
+      },
+      'close_socket': _closeSocket,
+      'refused': _refused,
+      'slow': _slow,
+    });
     FixtureServer.start().then((s) {
       if (!mounted) {
         s.close();
@@ -39,6 +54,7 @@ class _NetworkScreenState extends State<NetworkScreen> {
 
   @override
   void dispose() {
+    _unregister();
     _wsTimer?.cancel();
     _ws?.close();
     _server?.close();
@@ -84,6 +100,25 @@ class _NetworkScreenState extends State<NetworkScreen> {
     ]);
     return '${results.length} responses';
   });
+
+  Future<void> _refused() => _run('GET refused', (_) async {
+    final r = await http.get(Uri.parse('http://127.0.0.1:1/'));
+    return '${r.statusCode}';
+  });
+
+  Future<void> _slow() => _run('GET slow', (base) async {
+    final r = await http.get(base.resolve('/slow'));
+    return '${r.statusCode}';
+  });
+
+  Future<void> _closeSocket() async {
+    _wsTimer?.cancel();
+    _wsTimer = null;
+    final ws = _ws;
+    _ws = null;
+    await ws?.close();
+    _log('ws: closed');
+  }
 
   Future<void> _openSocket() async {
     final base = _server?.baseUri;

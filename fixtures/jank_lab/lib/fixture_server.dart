@@ -82,6 +82,10 @@ class FixtureServer {
           ..add(bytes);
         await req.response.close();
         return;
+      } else if (req.method == 'GET' && path == '/slow') {
+        await Future<void>.delayed(const Duration(seconds: 8));
+        _json(req, 200, {'slow': true});
+        return;
       } else if (req.method == 'GET' && path == '/files/blob.bin') {
         final bytes = Uint8List(262144);
         for (var i = 0; i < bytes.length; i++) {
