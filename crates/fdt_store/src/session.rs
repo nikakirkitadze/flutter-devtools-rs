@@ -13,6 +13,9 @@ use std::sync::Arc;
 /// An immutable, cheaply clonable view of the session at one generation.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
+    /// Names the session this snapshot belongs to: every writer gets a new one, so a change
+    /// means the stored data was thrown away and replaced. 0 for the empty snapshot of no session.
+    pub session: u64,
     pub generation: u64,
     pub origin_host_us: i64,
     pub runs: Arc<[RunInfo]>,
@@ -26,6 +29,7 @@ impl Snapshot {
     /// A valid generation-0 snapshot with no runs.
     pub fn empty() -> Self {
         Self {
+            session: 0,
             generation: 0,
             origin_host_us: 0,
             runs: Arc::from(Vec::new()),
@@ -47,6 +51,7 @@ impl Snapshot {
 }
 
 pub struct SessionWriter {
+    session: u64,
     origin_host_us: i64,
     runs: Vec<RunInfo>,
     logs: LogStore,
@@ -71,9 +76,13 @@ impl SessionWriter {
     /// A writer whose stores seal chunks of `chunk` records, so tests can reach many chunks
     /// with few records.
     pub fn with_log_chunk(origin_host_us: i64, chunk: usize) -> Self {
+        static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let session = NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut empty = Snapshot::empty();
         empty.origin_host_us = origin_host_us;
+        empty.session = session;
         Self {
+            session,
             origin_host_us,
             runs: Vec::new(),
             logs: LogStore::new(chunk),
@@ -203,6 +212,7 @@ impl SessionWriter {
             self.generation += 1;
             self.dirty = false;
             self.last = Arc::new(Snapshot {
+                session: self.session,
                 generation: self.generation,
                 origin_host_us: self.origin_host_us,
                 runs: self.runs.clone().into(),
@@ -287,5 +297,14 @@ mod tests {
         assert_eq!(s.runs.len(), 1);
         w.reopen_run(RunId(9));
         assert!(!w.is_dirty());
+    }
+
+    #[test]
+    fn every_writer_names_its_own_session() {
+        let mut a = SessionWriter::new(0);
+        let mut b = SessionWriter::new(0);
+        assert_ne!(a.publish().session, 0);
+        assert_ne!(a.publish().session, b.publish().session);
+        assert_eq!(Snapshot::empty().session, 0);
     }
 }

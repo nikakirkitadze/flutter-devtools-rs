@@ -94,6 +94,8 @@ pub struct MainWindow {
     _host_wait: Option<gpui_kit::Subscription>,
     /// Whether the last status seen was `Connected`, so only a new connection leaves Start.
     was_connected: bool,
+    /// The session the window last saw, to notice when a new one replaces it.
+    session_id: u64,
     _appearance: gpui_kit::Subscription,
     _session_subs: [gpui_kit::Subscription; 4],
 }
@@ -114,15 +116,19 @@ impl MainWindow {
         });
         window.focus(&focus, cx);
         let was_connected = matches!(session.read(cx).status(), ConnStatus::Connected { .. });
+        let session_id = session.read(cx).snapshot().session;
         let observed = cx.observe(&session, |this, _, cx| {
             this.refresh_counts(cx);
             cx.notify();
         });
-        let connected = cx.subscribe_in(&session, window, |this, _, event, window, cx| {
-            if *event == SessionEvent::Status {
-                this.status_changed(window, cx);
-            }
-        });
+        let connected = cx.subscribe_in(
+            &session,
+            window,
+            |this, _, event, window, cx| match *event {
+                SessionEvent::Status => this.status_changed(window, cx),
+                SessionEvent::Snapshot => this.snapshot_changed(cx),
+            },
+        );
         let logs = cx.new(|cx| LogsView::new(session.clone(), window, cx));
         let selected = cx.subscribe_in(&logs, window, |this, _, event, window, cx| {
             let mut to = this.current().clone();
@@ -183,12 +189,30 @@ impl MainWindow {
             network,
             _host_wait: host_wait,
             was_connected,
+            session_id,
             _appearance: appearance,
             _session_subs: [observed, connected, selected, net_selected],
         };
         this.apps_from_host(window, cx);
         this.refresh_counts(cx);
         this
+    }
+
+    /// A new session replaced the old one (⌘N): nothing in the old session's history, range or
+    /// selection means anything now, so the window starts again on the same page.
+    fn snapshot_changed(&mut self, cx: &mut Context<Self>) {
+        let id = self.session.read(cx).snapshot().session;
+        let previous = std::mem::replace(&mut self.session_id, id);
+        // Session 0 is the empty snapshot before any capture: the first real session is not a
+        // replacement.
+        if previous == 0 || id == 0 || previous == id {
+            return;
+        }
+        self.history = NavHistory::new(Location::at(self.current().page));
+        // The views drop their selection and expansion with the range.
+        self.sync_logs(cx);
+        self.refresh_counts(cx);
+        cx.notify();
     }
 
     /// Creates the start page from the host's discovery, once the host exists.
@@ -735,6 +759,40 @@ mod tests {
 
     fn page(shell: &gpui_kit::Entity<MainWindow>, cx: &mut gpui_kit::VisualTestContext) -> Page {
         shell.read_with(cx, |s, _| s.current().page)
+    }
+
+    #[gpui_kit::test]
+    fn a_new_session_resets_range_selection_and_history(cx: &mut TestAppContext) {
+        use crate::test_support::{connected, log_at, open_shell_fake, snapshot};
+        let (shell, cx, fake) = open_shell_fake(cx);
+        let old = snapshot(|w, run| {
+            for i in 0..5 {
+                w.push_log(log_at(run, i, fdt_store::logs::LogLevel::Info));
+            }
+        });
+        fake.snaps.send(old.clone()).unwrap();
+        fake.status.send(connected("demo", true)).unwrap();
+        cx.run_until_parked();
+        press(cx, "cmd-5", "ctrl-5");
+        let id = old.logs.row(2).id;
+        let mut to = shell.read_with(cx, |s, _| s.current().clone());
+        to.range = Some(range());
+        to.selection = Some(Selection::Log(id));
+        cx.update(|window, cx| shell.update(cx, |s, cx| s.navigate(to, window, cx)));
+        assert!(shell.read_with(cx, |s, _| s.history().can_go_back()));
+        // The capture starts a new session: a snapshot from a new store.
+        press(cx, "cmd-n", "ctrl-n");
+        fake.snaps.send(snapshot(|_, _| {})).unwrap();
+        cx.run_until_parked();
+        shell.read_with(cx, |s, _| {
+            assert_eq!(s.current().page, Page::Tool(Tool::Logs));
+            assert_eq!(s.current().range, None);
+            assert_eq!(s.current().selection, None);
+            assert!(
+                !s.history().can_go_back(),
+                "Back must not reach the old session"
+            );
+        });
     }
 
     #[gpui_kit::test]
