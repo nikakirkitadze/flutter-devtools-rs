@@ -3,6 +3,8 @@
 //! This crate has no UI dependencies.
 
 pub mod dart_io;
+pub mod discovery;
+pub mod dtd;
 pub mod events;
 pub mod rpc;
 pub mod service;

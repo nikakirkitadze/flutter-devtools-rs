@@ -161,8 +161,126 @@ pub fn decode_notification(n: &Notification) -> Option<StreamEvent> {
             _ => return None,
         })
     })();
-    Some(decoded.unwrap_or_else(|| StreamEvent::Other {
-        stream: stream.to_string(),
-        kind: kind.to_string(),
+    Some(decoded.unwrap_or_else(|| {
+        if KNOWN_KINDS.contains(&kind) {
+            log::warn!("could not decode {kind} event on the {stream} stream; keeping it as Other");
+        }
+        StreamEvent::Other {
+            stream: stream.to_string(),
+            kind: kind.to_string(),
+        }
     }))
+}
+
+const KNOWN_KINDS: &[&str] = &[
+    "Logging",
+    "WriteEvent",
+    "Extension",
+    "IsolateStart",
+    "IsolateRunnable",
+    "IsolateExit",
+    "ServiceExtensionAdded",
+    "IsolateReload",
+    "ServiceRegistered",
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn note(stream: &str, event: Value) -> Notification {
+        Notification {
+            method: "streamNotify".into(),
+            params: json!({"streamId": stream, "event": event}),
+        }
+    }
+
+    fn iso() -> Value {
+        json!({"id": "isolates/1", "name": "main", "isSystemIsolate": false, "isolateGroupId": "isolateGroups/1"})
+    }
+
+    #[test]
+    fn isolate_lifecycle_events_decode() {
+        for (kind, want) in [
+            ("IsolateStart", "start"),
+            ("IsolateRunnable", "runnable"),
+            ("IsolateExit", "exit"),
+        ] {
+            let ev = decode_notification(&note(
+                "Isolate",
+                json!({"kind": kind, "timestamp": 1, "isolate": iso()}),
+            ))
+            .unwrap();
+            match (want, ev) {
+                ("start", StreamEvent::IsolateStart { isolate })
+                | ("runnable", StreamEvent::IsolateRunnable { isolate })
+                | ("exit", StreamEvent::IsolateExit { isolate }) => {
+                    assert_eq!(isolate.id, "isolates/1");
+                    assert_eq!(isolate.name, "main");
+                }
+                (_, other) => panic!("{kind} decoded as {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn service_extension_added_decodes() {
+        let ev = decode_notification(&note(
+            "Isolate",
+            json!({"kind": "ServiceExtensionAdded", "timestamp": 1, "isolate": iso(),
+                   "extensionRPC": "ext.flutter.reassemble"}),
+        ))
+        .unwrap();
+        match ev {
+            StreamEvent::ServiceExtensionAdded { isolate, rpc } => {
+                assert_eq!(isolate.id, "isolates/1");
+                assert_eq!(rpc, "ext.flutter.reassemble");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn isolate_reload_with_and_without_group() {
+        let with = decode_notification(&note(
+            "Isolate",
+            json!({"kind": "IsolateReload", "timestamp": 1, "isolate": iso(),
+                   "isolateGroup": {"type": "@IsolateGroup", "id": "isolateGroups/7"}}),
+        ))
+        .unwrap();
+        assert_eq!(
+            with,
+            StreamEvent::IsolateReload {
+                isolate_group: Some("isolateGroups/7".into())
+            }
+        );
+        let without = decode_notification(&note(
+            "Isolate",
+            json!({"kind": "IsolateReload", "timestamp": 1, "isolate": iso()}),
+        ))
+        .unwrap();
+        assert_eq!(
+            without,
+            StreamEvent::IsolateReload {
+                isolate_group: None
+            }
+        );
+    }
+
+    #[test]
+    fn known_kind_that_fails_to_decode_is_other() {
+        let ev = decode_notification(&note(
+            "Stdout",
+            json!({"kind": "WriteEvent", "timestamp": 1, "bytes": "!!not base64!!"}),
+        ))
+        .unwrap();
+        assert_eq!(
+            ev,
+            StreamEvent::Other {
+                stream: "Stdout".into(),
+                kind: "WriteEvent".into()
+            }
+        );
+    }
 }

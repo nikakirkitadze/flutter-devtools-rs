@@ -240,3 +240,28 @@ impl VmService {
         Ok(p.sockets)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn take(v: Value) -> Result<Option<Vec<u8>>, String> {
+        let mut m = serde_json::Map::new();
+        m.insert("b".into(), v);
+        take_bytes(&mut m, "b")
+    }
+
+    #[test]
+    fn byte_arrays_decode() {
+        assert_eq!(take(json!([0, 1, 255])), Ok(Some(vec![0, 1, 255])));
+        assert_eq!(take(Value::Null), Ok(None));
+    }
+
+    #[test]
+    fn byte_arrays_reject_out_of_range_and_non_arrays() {
+        assert!(take(json!([1, 256])).is_err());
+        assert!(take(json!([1, -1])).is_err());
+        assert!(take(json!("abc")).is_err());
+    }
+}
