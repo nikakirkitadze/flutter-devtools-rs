@@ -128,6 +128,8 @@ pub mod alpha {
     pub const PRESS_FILL: u8 = 0xCC;
     pub const SCRIM_DARK: u8 = 0x99;
     pub const SCRIM_LIGHT: u8 = 0x33;
+    /// Opacity of a control that cannot be used.
+    pub const DISABLED: f32 = 0.5;
 }
 
 pub mod font {
@@ -203,6 +205,9 @@ pub mod motion {
     /// How long a view waits before showing a loading skeleton or spinner.
     pub const LOADING_DELAY: Duration = Duration::from_millis(150);
 
+    /// How long a "load the full body" request spins before the view stops waiting.
+    pub const FULL_BODY_TIMEOUT: Duration = Duration::from_secs(30);
+
     /// Ease-out cubic bezier control points.
     pub const EASE_OUT: [f32; 4] = [0.0, 0.0, 0.2, 1.0];
 
@@ -248,6 +253,8 @@ pub mod layout {
     pub const START_WIDTH: Pixels = px(720.);
     pub const WATERFALL_WIDTH: Pixels = px(160.);
     pub const STATUS_DOT: Pixels = px(8.);
+    /// The tallest an image preview in the request details grows.
+    pub const IMAGE_PREVIEW_MAX: Pixels = px(320.);
 }
 
 /// Fixed column widths of the log and network tables.
@@ -467,5 +474,8 @@ mod tests {
             ]
         );
         assert_eq!(motion::LOADING_DELAY, Duration::from_millis(150));
+        assert_eq!(motion::FULL_BODY_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(layout::IMAGE_PREVIEW_MAX, px(320.));
+        assert_eq!(super::alpha::DISABLED, 0.5);
     }
 }

@@ -98,6 +98,8 @@ pub fn bindings() -> Vec<KeyBinding> {
     out.extend([
         KeyBinding::new("j", SelectDown, table),
         KeyBinding::new("k", SelectUp, table),
+        // Enter opens the selected request's details, as it does a log line's.
+        KeyBinding::new("enter", OpenDetails, table),
     ]);
     if cfg!(target_os = "macos") {
         out.extend([

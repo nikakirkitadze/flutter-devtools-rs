@@ -48,7 +48,8 @@ gpui_kit::actions!(
         OpenDetails,
         FollowLatest,
         GoToFirst,
-        FocusSearch
+        FocusSearch,
+        LoadFullBody
     ]
 );
 

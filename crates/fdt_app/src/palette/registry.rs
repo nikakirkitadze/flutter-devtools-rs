@@ -2,8 +2,8 @@
 
 use crate::actions::{
     About, ClearSelection, CloseWindow, Collapse, ConnectToApp, Disconnect, Expand, FocusSearch,
-    FollowLatest, GoBack, GoForward, GoToFirst, Minimize, NewSession, NewWindow, OpenDetails,
-    OpenSettings, Quit, SelectNext, SelectPrevious, ShowLogs, ShowMemory, ShowNetwork,
+    FollowLatest, GoBack, GoForward, GoToFirst, LoadFullBody, Minimize, NewSession, NewWindow,
+    OpenDetails, OpenSettings, Quit, SelectNext, SelectPrevious, ShowLogs, ShowMemory, ShowNetwork,
     ShowPerformance, ShowShortcuts, ShowState, ShowTimeline, ShowWidgets, StopWaiting,
     ToggleExpand, ToggleFrameHud, ToggleFullScreen, ToggleRecording, UseDarkTheme, UseLightTheme,
     UseSystemTheme, Zoom,
@@ -243,9 +243,16 @@ pub fn commands() -> Vec<CommandSpec> {
         CommandSpec {
             id: "logs.open_details",
             label: "Open Details",
-            keywords: &["logs", "inspect"],
+            keywords: &["logs", "inspect", "network", "request"],
             group: Group::View,
             action: || Box::new(OpenDetails),
+        },
+        CommandSpec {
+            id: "net.load_full_body",
+            label: "Load Full Response Body",
+            keywords: &["network", "request", "truncated", "rest"],
+            group: Group::View,
+            action: || Box::new(LoadFullBody),
         },
         CommandSpec {
             id: "logs.follow",

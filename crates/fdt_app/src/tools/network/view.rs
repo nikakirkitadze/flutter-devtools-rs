@@ -6,6 +6,7 @@
 //! full, off the UI thread ([`compute`]). At most one job runs; inputs that arrive meanwhile are
 //! picked up when it finishes. The UI thread only maps the visible rows.
 
+use super::details::DetailsState;
 use super::table::NetTable;
 use crate::nav::{EntryId, SessionTime, TimeRange};
 use crate::session_model::SessionModel;
@@ -16,13 +17,15 @@ use fdt_store::net_query::{
     ClassSet, MethodSet, NetFilter, NetTab, count_requests, filter_requests,
 };
 use fdt_ui::tokens::{motion, row};
+use gpui_kit::base::actions::Cancel;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::Size;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::table::{DataTable, TableEvent, TableState};
 use gpui_kit::{
-    AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable as _, IntoElement,
-    ParentElement as _, Render, SharedString, Styled as _, Subscription, Task, Window, div,
+    AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable as _,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
+    Subscription, Task, TestSupportExt as _, Window, div,
 };
 use std::sync::Arc;
 
@@ -68,6 +71,8 @@ struct Key {
 
 struct JobResult {
     filtered: Arc<[u32]>,
+    /// Whether any listed request is still pending (its waterfall bar grows).
+    has_pending: bool,
     /// Requests matching every filter but with the Errors tab, for the tab's count.
     errors: usize,
     tab: NetTab,
@@ -83,24 +88,32 @@ fn compute(snap: &Snapshot, filter: &NetFilter) -> JobResult {
             ..filter.clone()
         },
     );
+    let has_pending = filtered
+        .iter()
+        .any(|&seq| snap.net.request(seq as usize).status_class() == StatusClass::Pending);
     JobResult {
         filtered,
+        has_pending,
         errors,
         tab: filter.tab,
     }
 }
 
 pub struct NetworkView {
-    session: Entity<SessionModel>,
+    pub(super) session: Entity<SessionModel>,
     pub(super) filter: NetFilter,
     version: u64,
     /// The snapshot `filtered` refers to.
     pub(super) snap: Arc<Snapshot>,
     pub(super) filtered: Arc<[u32]>,
     pub(super) errors: usize,
+    /// Whether a listed request is pending.
+    has_pending: bool,
     pub(super) table: Entity<TableState<NetTable>>,
     /// The sequence number of the selected request.
-    selected: Option<u32>,
+    pub(super) selected: Option<u32>,
+    /// The details pane and what it caches.
+    pub(super) details: DetailsState,
     /// A selection from the location, waiting for the filter result it depends on.
     pending: Option<EntryId>,
     applied: Option<Key>,
@@ -129,6 +142,7 @@ impl NetworkView {
     pub fn new(session: Entity<SessionModel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let observed = cx.observe(&session, |this, _, cx| {
             this.clock_ticked(cx);
+            this.details_session_changed(cx);
             this.request(cx);
         });
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter by URL"));
@@ -156,6 +170,7 @@ impl NetworkView {
                     this.row_selected(*row, window.last_input_was_keyboard(), cx);
                 }
                 TableEvent::ClearSelection => this.selection_cleared(cx),
+                TableEvent::DoubleClickedRow(_) => this.open_details(cx),
                 _ => {}
             },
         );
@@ -166,8 +181,10 @@ impl NetworkView {
             snap,
             filtered: Arc::from(Vec::new()),
             errors: 0,
+            has_pending: false,
             table,
             selected: None,
+            details: DetailsState::new(),
             pending: None,
             applied: None,
             active: false,
@@ -292,14 +309,12 @@ impl NetworkView {
         let tab_changed = self.table.read(cx).delegate().tab != result.tab;
         self.applied = Some(key);
         self.errors = result.errors;
+        self.has_pending = result.has_pending;
         self.filtered = result.filtered;
         self.snap = snap;
         let (snap, rows) = (self.snap.clone(), self.filtered.clone());
         self.table.update(cx, |table, cx| {
-            let d = table.delegate_mut();
-            d.snap = snap;
-            d.rows = rows;
-            d.tab = result.tab;
+            table.delegate_mut().replace(snap, rows, result.tab);
             if tab_changed {
                 table.refresh(cx);
             }
@@ -348,7 +363,8 @@ impl NetworkView {
             .map(|d| d.as_secs());
         if tick != self.tick {
             self.tick = tick;
-            if self.active {
+            // Only a pending request's bar grows with the clock; otherwise nothing changes.
+            if self.active && self.has_pending {
                 cx.notify();
             }
         }
@@ -563,10 +579,11 @@ impl NetworkView {
         cx.notify();
     }
 
-    /// The table dropped its selection (Escape in the table).
+    /// The table dropped its selection (Escape in the table). Like a key press, it replaces the
+    /// history entry rather than pushing one.
     fn selection_cleared(&mut self, cx: &mut Context<Self>) {
         if self.selected.take().is_some() {
-            cx.emit(NetworkEvent::Selected(None));
+            cx.emit(NetworkEvent::Moved(None));
             cx.notify();
         }
     }
@@ -599,6 +616,16 @@ impl NetworkView {
     }
 
     // ---- test access ----
+
+    #[cfg(test)]
+    pub fn details_open(&self) -> bool {
+        self.details.open
+    }
+
+    #[cfg(test)]
+    pub fn visible_rows(&self, cx: &gpui_kit::App) -> usize {
+        self.table.read(cx).visible_range().rows().len()
+    }
 
     #[cfg(test)]
     pub fn filtered_len(&self) -> usize {
@@ -683,9 +710,17 @@ impl Render for NetworkView {
             self.render_empty(cx)
         } else {
             div()
+                .id("net-list")
+                .test_support()
                 .flex_1()
                 .min_h_0()
                 .w_full()
+                // The table takes Escape for itself, so details close before it sees the key.
+                .capture_action(cx.listener(|this, _: &Cancel, _, cx| {
+                    if this.close_details(cx) {
+                        cx.stop_propagation();
+                    }
+                }))
                 .child(
                     DataTable::new(&self.table)
                         .bordered(false)
@@ -693,13 +728,26 @@ impl Render for NetworkView {
                 )
                 .into_any_element()
         };
+        let content = if self.details.open && !self.filtered.is_empty() {
+            self.with_details(body, cx)
+        } else {
+            body
+        };
         div()
             .size_full()
             .flex()
             .flex_col()
             .child(self.render_tabs(cx))
             .children(self.has_toolbar(cx).then(|| self.render_toolbar(cx)))
-            .child(body)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(content),
+            )
     }
 }
 
@@ -813,25 +861,41 @@ mod tests {
         view.read_with(cx, |v, _| v.filtered_len())
     }
 
-    #[gpui_kit::test]
-    fn renders_only_visible_rows_at_100k(cx: &mut TestAppContext) {
-        let snap = snapshot(|w, run| fdt_store::synth::requests(w, run, 100_000, 7));
+    /// Cells built by one frame with `n` requests, and the rows the table shows.
+    fn cells_in_a_frame(cx: &mut TestAppContext, n: usize) -> (usize, usize) {
+        let snap = snapshot(|w, run| fdt_store::synth::requests(w, run, n, 7));
         let (shell, cx) = open_shell_snapshot(cx, snap);
-        // A window a little shorter than the minimum: 14 rows of 7 cells. A table draws
-        // rows x columns cells, so the count follows the window and never the 100,000 rows.
-        let mut size = fdt_ui::tokens::layout::WINDOW_MIN;
-        size.height -= gpui_kit::px(40.);
-        cx.simulate_resize(size);
         press(cx, "cmd-4", "ctrl-4");
         cx.run_until_parked();
         frame(cx);
         let view = shell.read_with(cx, |s, _| s.network_view().clone());
-        assert_eq!(filtered(&view, cx), 100_000);
+        assert_eq!(filtered(&view, cx), n);
         super::super::table::CELLS.with(|c| c.set(0));
         cx.update(|window, cx| window.render_frame(cx));
         let calls = super::super::table::CELLS.with(|c| c.get());
-        println!("render_td calls in one frame at 100k: {calls}");
-        assert!(calls > 0 && calls <= 100, "{calls} cells built");
+        let columns = view.read_with(cx, |v, cx| v.column_count(cx));
+        let visible = view.read_with(cx, |v, cx| v.visible_rows(cx));
+        println!("{n} requests: {calls} cells for {visible} visible rows of {columns} columns");
+        (calls, visible * columns)
+    }
+
+    #[gpui_kit::test]
+    fn renders_only_visible_rows_at_100k(cx: &mut TestAppContext) {
+        // The table draws (visible rows + overscan) x columns cells whatever the window size,
+        // and never a number that follows the 100,000 requests.
+        const OVERSCAN_ROWS: usize = 4;
+        let (small, small_visible) = cells_in_a_frame(cx, 1_000);
+        let (large, large_visible) = cells_in_a_frame(cx, 100_000);
+        assert!(small > 0 && large > 0);
+        assert_eq!(
+            small_visible, large_visible,
+            "same window, same visible rows"
+        );
+        assert!(
+            large <= small_visible + OVERSCAN_ROWS * 7,
+            "{large} cells for {large_visible} visible cells"
+        );
+        assert_eq!(small, large, "1k and 100k requests build the same cells");
     }
 
     #[gpui_kit::test]
@@ -1197,5 +1261,635 @@ mod tests {
         assert_eq!(view.read_with(cx, |v, cx| v.cell_text(0, 3, cx)), "500");
         assert_eq!(view.read_with(cx, |v, _| v.error_count()), 1);
         let _ = app_info;
+    }
+
+    // ---- details (Task 19) and the Task 18 carry-overs ----
+
+    use super::super::details::{RENDER_JOBS, load_full_hint};
+    use fdt_store::net::{BodyKind, BodyState, HttpUpdate};
+    use fdt_store::time::EntryId;
+    use std::sync::Arc as StdArc;
+
+    fn body(bytes: &[u8], full: u64) -> BodyState {
+        BodyState::Captured(fdt_store::net::Body {
+            bytes: StdArc::from(bytes.to_vec()),
+            full_len: full,
+        })
+    }
+
+    /// Adds request `seq` (started at `seq` seconds) after `tweak` has shaped it.
+    fn put(
+        w: &mut fdt_store::SessionWriter,
+        run: RunId,
+        seq: u64,
+        tweak: impl FnOnce(&mut HttpUpdate),
+    ) -> EntryId {
+        let mut u = HttpUpdate {
+            run,
+            isolate: "i".into(),
+            vm_id: format!("r{seq}"),
+            method: "POST".into(),
+            url: format!("http://a.com/item/{seq}?x=1"),
+            start: SessionTime(seq * 1_000 * MS),
+            start_clamped: false,
+            request_sent: None,
+            response_start: None,
+            end: Some(SessionTime((seq * 1_000 + 182) * MS)),
+            status: Some(200),
+            reason: None,
+            request_headers: vec![("Content-Type".into(), vec!["application/json".into()])],
+            response_headers: vec![
+                ("x-b".into(), vec!["1".into(), "2".into()]),
+                ("Content-Type".into(), vec!["application/json".into()]),
+                ("a-first".into(), vec!["z".into()]),
+            ],
+            request_content_length: None,
+            response_content_length: None,
+            events: vec![
+                (
+                    "Connection established".into(),
+                    SessionTime((seq * 1_000 + 20) * MS),
+                ),
+                ("Request sent".into(), SessionTime((seq * 1_000 + 40) * MS)),
+            ],
+            error: None,
+            websocket: false,
+            remote: None,
+        };
+        tweak(&mut u);
+        w.upsert_request(u).id
+    }
+
+    /// Opens Network over `snap`, selects row `row` and presses Enter.
+    fn open_details_over(
+        cx: &mut TestAppContext,
+        snap: StdArc<fdt_store::Snapshot>,
+        row: usize,
+    ) -> (
+        gpui_kit::Entity<crate::shell::MainWindow>,
+        gpui_kit::Entity<NetworkView>,
+        &mut VisualTestContext,
+    ) {
+        let (shell, cx) = open_shell_snapshot(cx, snap);
+        press(cx, "cmd-4", "ctrl-4");
+        cx.run_until_parked();
+        frame(cx);
+        let view = shell.read_with(cx, |s, _| s.network_view().clone());
+        click_row(cx, row);
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        frame(cx);
+        (shell, view, cx)
+    }
+
+    fn present(cx: &mut VisualTestContext, id: &str) -> bool {
+        frame(cx);
+        cx.update(|window, _| window.try_find(id.to_string()).is_some())
+    }
+
+    fn text_of(cx: &mut VisualTestContext, id: &str) -> Option<String> {
+        frame(cx);
+        cx.update(|window, _| {
+            window
+                .try_find(id.to_string())
+                .and_then(|e| e.label().map(str::to_string))
+        })
+    }
+
+    fn one_request(tweak: impl FnOnce(&mut HttpUpdate)) -> StdArc<fdt_store::Snapshot> {
+        snapshot(|w, run| {
+            put(w, run, 0, tweak);
+        })
+    }
+
+    #[gpui_kit::test]
+    fn details_open_on_selection_with_sections(cx: &mut TestAppContext) {
+        let snap = snapshot(|w, run| {
+            let id = put(w, run, 0, |u| {
+                u.error = None;
+            });
+            w.set_body_state(id, BodyKind::Response, body(br#"{"a":1,"b":[true]}"#, 18));
+            put(w, run, 1, |u| {
+                u.status = None;
+                u.end = None;
+                u.error = Some("SocketException: refused".into());
+            });
+        });
+        let (_shell, view, cx) = open_details_over(cx, snap, 0);
+        assert!(view.read_with(cx, |v, _| v.details_open()));
+        assert!(present(cx, "net-details"));
+        assert_eq!(
+            text_of(cx, "net-details-url").as_deref(),
+            Some("http://a.com/item/0?x=1")
+        );
+        assert_eq!(text_of(cx, "net-details-method").as_deref(), Some("POST"));
+        assert_eq!(text_of(cx, "net-details-status").as_deref(), Some("200"));
+        assert_eq!(
+            text_of(cx, "net-details-duration").as_deref(),
+            Some("182 ms")
+        );
+        for sec in [
+            "overview",
+            "request-headers",
+            "response-headers",
+            "request-body",
+            "response-body",
+            "timing",
+        ] {
+            assert!(present(cx, &format!("net-sec-{sec}")), "{sec}");
+        }
+        assert!(!present(cx, "net-sec-error"), "no error, no section");
+        assert_eq!(
+            text_of(cx, "net-overview-start").as_deref(),
+            Some("0:00.000")
+        );
+        assert_eq!(text_of(cx, "net-overview-run").as_deref(), Some("Run 1"));
+        assert!(!present(cx, "net-before-capture"));
+        // Headers are sorted by name, multi-values joined.
+        assert_eq!(
+            text_of(cx, "net-response-headers-0").as_deref(),
+            Some("a-first: z")
+        );
+        assert_eq!(
+            text_of(cx, "net-response-headers-1").as_deref(),
+            Some("Content-Type: application/json")
+        );
+        assert_eq!(
+            text_of(cx, "net-response-headers-2").as_deref(),
+            Some("x-b: 1, 2")
+        );
+        // Timing offsets and the total.
+        assert_eq!(
+            text_of(cx, "net-timing-0").as_deref(),
+            Some("Connection established: +20 ms")
+        );
+        assert_eq!(
+            text_of(cx, "net-timing-1").as_deref(),
+            Some("Request sent: +40 ms")
+        );
+        assert_eq!(
+            text_of(cx, "net-timing-total").as_deref(),
+            Some("Total: 182 ms")
+        );
+        // The JSON response body is pretty-printed, off the UI thread.
+        cx.run_until_parked();
+        assert_eq!(text_of(cx, "net-body-line-0").as_deref(), Some("{"));
+        assert_eq!(
+            text_of(cx, "net-body-line-1").as_deref(),
+            Some("  \"a\": 1,")
+        );
+        assert_eq!(text_of(cx, "net-body-line-4").as_deref(), Some("  ]"));
+        // Sections collapse.
+        click(cx, "net-sec-response-headers");
+        assert!(!present(cx, "net-response-headers-0"));
+        click(cx, "net-sec-response-headers");
+        assert!(present(cx, "net-response-headers-0"));
+        // A failed request shows its error.
+        click_row(cx, 1);
+        assert!(present(cx, "net-sec-error"));
+        assert_eq!(
+            text_of(cx, "net-error").as_deref(),
+            Some("SocketException: refused")
+        );
+        assert_eq!(text_of(cx, "net-details-status").as_deref(), Some("Failed"));
+        assert_eq!(text_of(cx, "net-body-empty").as_deref(), Some("No body."));
+        assert_eq!(
+            text_of(cx, "net-timing-total").as_deref(),
+            Some("Total: Pending")
+        );
+    }
+
+    #[gpui_kit::test]
+    fn before_capture_is_noted(cx: &mut TestAppContext) {
+        let snap = one_request(|u| u.start_clamped = true);
+        let (_s, _v, cx) = open_details_over(cx, snap, 0);
+        assert_eq!(
+            text_of(cx, "net-before-capture").as_deref(),
+            Some("Started before fdt connected")
+        );
+    }
+
+    #[gpui_kit::test]
+    fn rendered_lines_are_cached_per_body(cx: &mut TestAppContext) {
+        let snap = snapshot(|w, run| {
+            for i in 0..2 {
+                let id = put(w, run, i, |_| {});
+                w.set_body_state(id, BodyKind::Response, body(br#"{"i":0}"#, 7));
+            }
+        });
+        RENDER_JOBS.with(|c| c.set(0));
+        let (_s, view, cx) = open_details_over(cx, snap, 0);
+        for _ in 0..3 {
+            frame(cx);
+            view.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            RENDER_JOBS.with(|c| c.get()),
+            1,
+            "one job, however often it redraws"
+        );
+        click_row(cx, 1);
+        assert_eq!(RENDER_JOBS.with(|c| c.get()), 2);
+    }
+
+    #[gpui_kit::test]
+    fn a_truncated_json_body_is_text_without_the_invalid_note(cx: &mut TestAppContext) {
+        let snap = snapshot(|w, run| {
+            let id = put(w, run, 0, |_| {});
+            w.set_body_state(id, BodyKind::Response, body(b"{\"a\": [1, 2", 4_000));
+        });
+        let (_s, _v, cx) = open_details_over(cx, snap, 0);
+        cx.run_until_parked();
+        assert_eq!(
+            text_of(cx, "net-body-line-0").as_deref(),
+            Some("{\"a\": [1, 2")
+        );
+        assert!(
+            !present(cx, "net-body-note"),
+            "the truncation notice explains it"
+        );
+        assert!(present(cx, "net-body-truncated"));
+    }
+
+    #[gpui_kit::test]
+    fn invalid_json_and_binary_bodies_show_notes(cx: &mut TestAppContext) {
+        let snap = snapshot(|w, run| {
+            let id = put(w, run, 0, |_| {});
+            w.set_body_state(id, BodyKind::Response, body(b"{oops}", 6));
+            let id = put(w, run, 1, |u| {
+                u.response_headers = vec![(
+                    "content-type".into(),
+                    vec!["application/octet-stream".into()],
+                )];
+            });
+            w.set_body_state(
+                id,
+                BodyKind::Response,
+                body(&[0x89, 0x50, 0x4e, 0x47, 0, 1], 6),
+            );
+        });
+        let (_s, _v, cx) = open_details_over(cx, snap, 0);
+        cx.run_until_parked();
+        assert_eq!(
+            text_of(cx, "net-body-note").as_deref(),
+            Some("Not valid JSON. Shown as text.")
+        );
+        assert_eq!(text_of(cx, "net-body-line-0").as_deref(), Some("{oops}"));
+        click_row(cx, 1);
+        cx.run_until_parked();
+        assert_eq!(
+            text_of(cx, "net-body-note").as_deref(),
+            Some("Binary data, 6 B. Showing the first 4 KB.")
+        );
+        assert!(
+            text_of(cx, "net-body-line-0")
+                .unwrap()
+                .starts_with("00000000  89 50 4e 47")
+        );
+    }
+
+    #[gpui_kit::test]
+    fn pending_body_shows_skeleton_after_delay(cx: &mut TestAppContext) {
+        let snap = snapshot(|w, run| {
+            let id = put(w, run, 0, |_| {});
+            w.set_body_state(id, BodyKind::Response, BodyState::Pending);
+        });
+        let (_s, _v, cx) = open_details_over(cx, snap, 0);
+        assert!(!present(cx, "net-body-skeleton"), "not before the delay");
+        cx.executor()
+            .advance_clock(fdt_ui::tokens::motion::LOADING_DELAY);
+        cx.run_until_parked();
+        assert!(present(cx, "net-body-skeleton"));
+    }
+
+    fn connected_with(
+        cx: &mut TestAppContext,
+        build: impl FnOnce(&mut fdt_store::SessionWriter, RunId),
+    ) -> (
+        gpui_kit::Entity<crate::shell::MainWindow>,
+        gpui_kit::Entity<NetworkView>,
+        &mut VisualTestContext,
+        crate::test_support::FakeHandle,
+        fdt_store::SessionWriter,
+        RunId,
+    ) {
+        let (shell, cx, h) = open_shell_fake(cx);
+        let (mut w, run) = writer();
+        build(&mut w, run);
+        h.status.send(connected("demo", false)).unwrap();
+        h.snaps.send(w.publish()).unwrap();
+        cx.run_until_parked();
+        press(cx, "cmd-4", "ctrl-4");
+        cx.run_until_parked();
+        frame(cx);
+        let view = shell.read_with(cx, |s, _| s.network_view().clone());
+        click_row(cx, 0);
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        frame(cx);
+        (shell, view, cx, h, w, run)
+    }
+
+    #[gpui_kit::test]
+    fn truncated_body_offers_load_full_body_and_sends_the_command(cx: &mut TestAppContext) {
+        let (_s, _v, cx, h, mut w, run) = connected_with(cx, |w, run| {
+            let id = put(w, run, 0, |_| {});
+            w.set_body_state(id, BodyKind::Response, body(&[b'a'; 1024], 4096));
+        });
+        assert_eq!(
+            text_of(cx, "net-body-truncated").as_deref(),
+            Some("Showing the first 1.0 KB of 4.0 KB.")
+        );
+        assert!(present(cx, "net-load-full"));
+        click(cx, "net-load-full");
+        let id = EntryId { run, seq: 0 };
+        assert_eq!(
+            h.commands().last().map(String::as_str),
+            Some(format!("load_full_body({id:?}, Response)").as_str())
+        );
+        // A second click while waiting sends nothing more.
+        click(cx, "net-load-full");
+        assert_eq!(
+            h.commands()
+                .iter()
+                .filter(|c| c.starts_with("load_full_body"))
+                .count(),
+            1
+        );
+        // The spinner shows after the loading delay.
+        assert!(!present(cx, "net-load-full-spinner"));
+        cx.executor()
+            .advance_clock(fdt_ui::tokens::motion::LOADING_DELAY);
+        cx.run_until_parked();
+        assert!(present(cx, "net-load-full-spinner"));
+        // The full body arrives: notice, button and spinner go.
+        w.store_full_body(id, BodyKind::Response, vec![b'a'; 4096]);
+        h.snaps.send(w.publish()).unwrap();
+        cx.run_until_parked();
+        frame(cx);
+        assert!(!present(cx, "net-body-truncated"));
+        assert!(!present(cx, "net-load-full"));
+    }
+
+    #[gpui_kit::test]
+    fn load_full_spinner_gives_up_after_the_timeout(cx: &mut TestAppContext) {
+        let (_s, _v, cx, _h, _w, _run) = connected_with(cx, |w, run| {
+            let id = put(w, run, 0, |_| {});
+            w.set_body_state(id, BodyKind::Response, body(&[b'a'; 16], 4096));
+        });
+        click(cx, "net-load-full");
+        cx.executor()
+            .advance_clock(fdt_ui::tokens::motion::LOADING_DELAY);
+        cx.run_until_parked();
+        assert!(present(cx, "net-load-full-spinner"));
+        cx.executor()
+            .advance_clock(fdt_ui::tokens::motion::FULL_BODY_TIMEOUT);
+        cx.run_until_parked();
+        assert!(
+            !present(cx, "net-load-full-spinner"),
+            "the capture kept the stored body"
+        );
+        assert!(present(cx, "net-load-full"), "and the user may try again");
+    }
+
+    #[gpui_kit::test]
+    fn too_large_and_evicted_messages(cx: &mut TestAppContext) {
+        let snap = snapshot(|w, run| {
+            let id = put(w, run, 0, |_| {});
+            w.set_body_state(id, BodyKind::Response, BodyState::TooLarge { len: 5 << 20 });
+            let id = put(w, run, 1, |_| {});
+            w.set_body_state(id, BodyKind::Response, BodyState::Evicted { len: 300 });
+            let id = put(w, run, 2, |_| {});
+            w.set_body_state(
+                id,
+                BodyKind::Response,
+                BodyState::Unavailable {
+                    reason: "The app closed.".into(),
+                },
+            );
+        });
+        let (_s, _v, cx) = open_details_over(cx, snap, 0);
+        assert_eq!(
+            text_of(cx, "net-body-too-large").as_deref(),
+            Some("This body wasn't copied automatically (5.0 MB).")
+        );
+        assert!(present(cx, "net-load-full"));
+        click_row(cx, 1);
+        assert_eq!(
+            text_of(cx, "net-body-evicted").as_deref(),
+            Some("This body was removed to stay within the 200 MB body budget.")
+        );
+        assert!(!present(cx, "net-load-full"));
+        click_row(cx, 2);
+        assert_eq!(
+            text_of(cx, "net-body-unavailable").as_deref(),
+            Some("The app closed.")
+        );
+    }
+
+    #[gpui_kit::test]
+    fn load_full_body_disabled_when_disconnected(cx: &mut TestAppContext) {
+        let snap = snapshot(|w, run| {
+            let id = put(w, run, 0, |_| {});
+            w.set_body_state(id, BodyKind::Response, BodyState::TooLarge { len: 5 << 20 });
+        });
+        // A fixed session is not connected: the recorded run is over.
+        let (_s, view, cx) = open_details_over(cx, snap, 0);
+        assert!(present(cx, "net-load-full"));
+        assert!(view.read_with(cx, |v, cx| v.load_full_disabled(cx)));
+        assert_eq!(
+            load_full_hint(false),
+            Some("Reconnect to the app to load the rest.")
+        );
+        assert_eq!(load_full_hint(true), None);
+        click(cx, "net-load-full");
+        assert!(!present(cx, "net-load-full-spinner"));
+        cx.executor()
+            .advance_clock(fdt_ui::tokens::motion::LOADING_DELAY);
+        cx.run_until_parked();
+        assert!(
+            !present(cx, "net-load-full-spinner"),
+            "a disabled button sends nothing"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn copy_buttons_write_the_clipboard(cx: &mut TestAppContext) {
+        let snap = snapshot(|w, run| {
+            let id = put(w, run, 0, |u| {
+                u.request_headers = vec![("Accept".into(), vec!["*/*".into()])];
+            });
+            w.set_body_state(id, BodyKind::Response, body(b"caf\xc3\xa9 \xff", 6));
+            w.set_body_state(id, BodyKind::Request, body(b"{\"q\":1}", 7));
+        });
+        let (_s, _v, cx) = open_details_over(cx, snap, 0);
+        click(cx, "net-copy-url");
+        assert_eq!(clipboard(cx).as_deref(), Some("http://a.com/item/0?x=1"));
+        click(cx, "net-copy-headers");
+        assert_eq!(
+            clipboard(cx).as_deref(),
+            Some("Accept: */*\n\na-first: z\nContent-Type: application/json\nx-b: 1, 2")
+        );
+        click(cx, "net-copy-body");
+        assert_eq!(clipboard(cx).as_deref(), Some("caf\u{e9} \u{fffd}"));
+        click(cx, "net-request-copy-body");
+        assert_eq!(clipboard(cx).as_deref(), Some("{\"q\":1}"));
+    }
+
+    #[gpui_kit::test]
+    fn image_body_renders_an_image_element(cx: &mut TestAppContext) {
+        let png = crate::test_support::PNG;
+        let snap = snapshot(|w, run| {
+            let id = put(w, run, 0, |u| {
+                u.response_headers = vec![("content-type".into(), vec!["image/png".into()])];
+            });
+            w.set_body_state(id, BodyKind::Response, body(&png, png.len() as u64));
+            // Not an image at all, served as one: the hex preview takes over.
+            let id = put(w, run, 1, |u| {
+                u.response_headers = vec![("content-type".into(), vec!["image/png".into()])];
+            });
+            w.set_body_state(id, BodyKind::Response, body(b"not a png at all", 16));
+        });
+        let (_s, _v, cx) = open_details_over(cx, snap, 0);
+        cx.run_until_parked();
+        assert!(present(cx, "net-body-image"));
+        click_row(cx, 1);
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        frame(cx);
+        assert!(
+            present(cx, "net-body-image-fallback"),
+            "an image that fails to decode shows its bytes"
+        );
+        assert!(
+            text_of(cx, "net-body-line-0")
+                .unwrap_or_default()
+                .starts_with("00000000  6e 6f 74 20")
+        );
+    }
+
+    #[gpui_kit::test]
+    fn escape_closes_details_then_clears_selection_then_range(cx: &mut TestAppContext) {
+        let snap = snapshot(|w, run| feed(w, run, 0, 20));
+        let (shell, view, cx) = open_details_over(cx, snap, 3);
+        let range = crate::nav::TimeRange::new(SessionTime(0), SessionTime(1_000 * MS));
+        let mut to = shell.read_with(cx, |s, _| s.current().clone());
+        to.range = Some(range);
+        shell.update_in(cx, |s, w, cx| s.navigate(to, w, cx));
+        cx.run_until_parked();
+        frame(cx);
+        let back = shell.read_with(cx, |s, _| s.history().back_len());
+        // 1. Details close first; the selection and range stay.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!view.read_with(cx, |v, _| v.details_open()));
+        assert_eq!(view.read_with(cx, |v, _| v.selected()), Some(3));
+        // 2. Then the selection goes, replacing the history entry rather than pushing.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |v, _| v.selected()), None);
+        let (selection, range_now, now_back) = shell.read_with(cx, |s, _| {
+            (
+                s.current().selection,
+                s.current().range,
+                s.history().back_len(),
+            )
+        });
+        assert_eq!(selection, None);
+        assert_eq!(range_now, Some(range), "the range is still there");
+        assert_eq!(now_back, back, "Esc replaced the entry");
+        // 3. Then the range.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert_eq!(shell.read_with(cx, |s, _| s.current().range), None);
+        assert_eq!(shell.read_with(cx, |s, _| s.history().back_len()), back + 1);
+    }
+
+    #[gpui_kit::test]
+    fn the_websocket_lookup_happens_once_per_visible_row(cx: &mut TestAppContext) {
+        use fdt_store::net::SocketUpdate;
+        let snap = snapshot(|w, run| {
+            for n in 0..6u16 {
+                let start = 100 * (u64::from(n) + 1);
+                put(w, run, u64::from(n), |u| {
+                    u.url = format!("ws://a.com:{}/socket", 8000 + n);
+                    u.websocket = true;
+                    u.status = Some(101);
+                    u.remote = Some(("127.0.0.1".into(), 8000 + n));
+                    u.start = SessionTime(start * MS);
+                });
+                w.upsert_socket(SocketUpdate {
+                    run,
+                    isolate: "i".into(),
+                    vm_id: format!("s{n}"),
+                    address: "127.0.0.1".into(),
+                    port: 8000 + n,
+                    kind: "tcp".into(),
+                    start: SessionTime(start * MS),
+                    end: None,
+                    read_bytes: 1,
+                    write_bytes: 2,
+                    last_read: None,
+                    last_write: None,
+                });
+            }
+        });
+        let (shell, cx) = open_shell_snapshot(cx, snap);
+        press(cx, "cmd-4", "ctrl-4");
+        cx.run_until_parked();
+        let view = shell.read_with(cx, |s, _| s.network_view().clone());
+        super::super::table::SOCKET_LOOKUPS.with(|c| c.set(0));
+        super::super::table::CELLS.with(|c| c.set(0));
+        click_tab(cx, 1);
+        assert_eq!(filtered(&view, cx), 6);
+        cx.update(|window, cx| window.render_frame(cx));
+        let cells = super::super::table::CELLS.with(|c| c.get());
+        let lookups = super::super::table::SOCKET_LOOKUPS.with(|c| c.get());
+        assert!(cells >= 5 * 6, "{cells} cells");
+        assert!(
+            lookups > 0 && lookups <= 6,
+            "{lookups} lookups for {cells} cells"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn the_clock_only_redraws_while_a_pending_request_is_listed(cx: &mut TestAppContext) {
+        let redraws = |cx: &mut TestAppContext, pending: bool| {
+            let (shell, cx, h) = open_shell_fake(cx);
+            let (mut w, run) = writer();
+            request(&mut w, run, "GET", "http://a.com/ok", Some(200), 0, Some(5));
+            if pending {
+                request(&mut w, run, "GET", "http://a.com/slow", None, 10, None);
+            }
+            h.status.send(connected("demo", true)).unwrap();
+            h.snaps.send(w.publish()).unwrap();
+            cx.run_until_parked();
+            press(cx, "cmd-4", "ctrl-4");
+            cx.run_until_parked();
+            frame(cx);
+            let view = shell.read_with(cx, |s, _| s.network_view().clone());
+            let count = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = count.clone();
+            let _sub = cx.update(|_, cx| {
+                cx.observe(&view, move |_, _| {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })
+            });
+            for _ in 0..3 {
+                cx.executor()
+                    .advance_clock(std::time::Duration::from_secs(1));
+                cx.run_until_parked();
+            }
+            count.load(std::sync::atomic::Ordering::SeqCst)
+        };
+        assert_eq!(
+            redraws(cx, false),
+            0,
+            "nothing is growing, so nothing redraws"
+        );
+        assert!(redraws(cx, true) >= 3, "a pending bar grows each second");
     }
 }

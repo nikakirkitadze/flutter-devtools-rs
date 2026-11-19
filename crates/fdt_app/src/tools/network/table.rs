@@ -30,7 +30,12 @@ use std::sync::Arc;
 thread_local! {
     /// Cells built by `render_td`, for the "only visible rows" test.
     pub(crate) static CELLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Linear socket lookups made by the WebSockets rows.
+    pub(crate) static SOCKET_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
+
+/// Rows whose socket cells are kept between draws.
+const WS_ROWS_KEPT: usize = 256;
 
 pub(super) struct NetTable {
     pub snap: Arc<Snapshot>,
@@ -39,6 +44,9 @@ pub(super) struct NetTable {
     pub tab: NetTab,
     pub span: TimeRange,
     pub now: SessionTime,
+    /// The WebSockets cells of the row drawn last, so the lookup is made once per row and not
+    /// once per cell.
+    ws_rows: std::cell::RefCell<std::collections::HashMap<usize, [String; 4]>>,
 }
 
 impl NetTable {
@@ -49,7 +57,42 @@ impl NetTable {
             tab: NetTab::Requests,
             span: TimeRange::new(SessionTime(0), SessionTime(1)),
             now: SessionTime(0),
+            ws_rows: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Shows `rows` of `snap` under `tab`.
+    pub fn replace(&mut self, snap: Arc<Snapshot>, rows: Arc<[u32]>, tab: NetTab) {
+        self.snap = snap;
+        self.rows = rows;
+        self.tab = tab;
+        self.ws_rows.get_mut().clear();
+    }
+
+    /// A WebSockets cell (1 to 4) of `row`, looking the socket up once per row.
+    fn ws_cell(&self, row: usize, r: &HttpRecord, col: usize) -> String {
+        let mut cached = self.ws_rows.borrow_mut();
+        // A frame draws a few dozen rows; a long scroll must not keep them all.
+        if cached.len() > WS_ROWS_KEPT {
+            cached.clear();
+        }
+        let cells = cached.entry(row).or_insert_with(|| self.ws_cells(r));
+        cells[col.min(4) - 1].clone()
+    }
+
+    /// State, sent, received and last activity of a WebSockets row. One linear socket lookup.
+    fn ws_cells(&self, r: &HttpRecord) -> [String; 4] {
+        #[cfg(test)]
+        SOCKET_LOOKUPS.with(|c| c.set(c.get() + 1));
+        let socket = self.snap.net.socket_for(r.id);
+        [
+            socket_state(socket).to_string(),
+            socket.map_or_else(dash, |s| format_bytes(s.write_bytes)),
+            socket.map_or_else(dash, |s| format_bytes(s.read_bytes)),
+            socket
+                .and_then(|s| s.last_read.max(s.last_write))
+                .map_or_else(dash, format_offset),
+        ]
     }
 
     fn record(&self, row: usize) -> Option<&Arc<HttpRecord>> {
@@ -60,15 +103,9 @@ impl NetTable {
     fn text(&self, row: usize, col: usize) -> Option<String> {
         let r = self.record(row)?;
         if self.tab == NetTab::WebSockets {
-            let socket = self.snap.net.socket_for(r.id);
             return Some(match col {
                 0 => r.url.clone(),
-                1 => socket_state(socket).to_string(),
-                2 => socket.map_or_else(dash, |s| format_bytes(s.write_bytes)),
-                3 => socket.map_or_else(dash, |s| format_bytes(s.read_bytes)),
-                _ => socket
-                    .and_then(|s| s.last_read.max(s.last_write))
-                    .map_or_else(dash, format_offset),
+                _ => self.ws_cell(row, r, col),
             });
         }
         match col {
@@ -144,10 +181,12 @@ impl TableDelegate for NetTable {
             return cell.into_any_element();
         };
         if self.tab == NetTab::WebSockets {
-            let text = self.text(row_ix, col_ix).unwrap_or_default();
+            let text = match col_ix {
+                0 => r.url.clone(),
+                _ => self.ws_cell(row_ix, &r, col_ix),
+            };
             return match col_ix {
-                1 => cell.text_color(Hsla::from(t.text_muted)),
-                4 => cell.text_color(Hsla::from(t.text_muted)),
+                1 | 4 => cell.text_color(Hsla::from(t.text_muted)),
                 _ => cell,
             }
             .child(text)

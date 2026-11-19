@@ -13,10 +13,11 @@ pub(crate) mod tool_page;
 
 use crate::actions::{
     About, ClearSelection, CloseWindow, Collapse, ConnectToApp, Disconnect, Expand, FocusSearch,
-    FollowLatest, GoBack, GoForward, GoToFirst, Minimize, NewSession, OpenDetails, OpenPalette,
-    OpenSettings, SelectNext, SelectPrevious, ShowLogs, ShowMemory, ShowNetwork, ShowPerformance,
-    ShowShortcuts, ShowState, ShowTimeline, ShowWidgets, StopWaiting, ToggleExpand, ToggleFrameHud,
-    ToggleFullScreen, ToggleRecording, UseDarkTheme, UseLightTheme, UseSystemTheme, Zoom,
+    FollowLatest, GoBack, GoForward, GoToFirst, LoadFullBody, Minimize, NewSession, OpenDetails,
+    OpenPalette, OpenSettings, SelectNext, SelectPrevious, ShowLogs, ShowMemory, ShowNetwork,
+    ShowPerformance, ShowShortcuts, ShowState, ShowTimeline, ShowWidgets, StopWaiting,
+    ToggleExpand, ToggleFrameHud, ToggleFullScreen, ToggleRecording, UseDarkTheme, UseLightTheme,
+    UseSystemTheme, Zoom,
 };
 use crate::capture_host::{CaptureControl, CaptureHost};
 use crate::keymap::SHELL_CONTEXT;
@@ -316,6 +317,13 @@ impl MainWindow {
             && self.logs.update(cx, |logs, cx| logs.close_details(cx))
     }
 
+    /// Closes the Network details pane if it is open; true when it was.
+    fn close_network_details(&mut self, cx: &mut Context<Self>) -> bool {
+        self.current().page == Page::Tool(Tool::Network)
+            && self.network_routed(cx)
+            && self.network.update(cx, |net, cx| net.close_details(cx))
+    }
+
     /// Runs `f` on the Logs list when it is the current page (the palette reaches it this way).
     fn with_logs(
         &mut self,
@@ -584,6 +592,10 @@ impl Render for MainWindow {
             }))
             .on_action(cx.listener(|this, _: &OpenDetails, _, cx| {
                 this.with_logs(cx, |v, cx| v.open_details(cx));
+                this.with_network(cx, |v, cx| v.open_details(cx));
+            }))
+            .on_action(cx.listener(|this, _: &LoadFullBody, _, cx| {
+                this.with_network(cx, |v, cx| v.load_full_selected(cx));
             }))
             .on_action(cx.listener(|this, _: &FollowLatest, _, cx| {
                 this.with_logs(cx, |v, cx| v.follow_latest(cx));
@@ -627,7 +639,7 @@ impl Render for MainWindow {
             .on_action(cx.listener(|this, _: &GoForward, w, cx| this.go_forward(w, cx)))
             .on_action(cx.listener(|this, _: &FocusSearch, w, cx| this.focus_search(w, cx)))
             .on_action(cx.listener(|this, _: &ClearSelection, w, cx| {
-                if this.close_logs_details(cx) {
+                if this.close_logs_details(cx) || this.close_network_details(cx) {
                     return;
                 }
                 if let Some(to) = this.current().cleared() {
