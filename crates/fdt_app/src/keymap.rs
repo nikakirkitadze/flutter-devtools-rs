@@ -1,8 +1,8 @@
 //! Cross-platform key bindings.
 
 use crate::actions::{
-    ClearSelection, CloseWindow, GoBack, GoForward, Hide, HideOthers, Minimize, OpenPalette,
-    OpenSettings, Quit, ShowShortcuts, ToggleFullScreen,
+    ClearSelection, CloseWindow, GoBack, GoForward, Hide, HideOthers, Minimize, NewSession,
+    NewWindow, OpenPalette, OpenSettings, Quit, ShowShortcuts, ToggleFullScreen, ToggleRecording,
 };
 use crate::nav::Tool;
 use gpui_kit::KeyBinding;
@@ -49,6 +49,9 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new(platform("cmd-]", "ctrl-]"), GoForward, not_input),
         KeyBinding::new("escape", ClearSelection, not_input),
         KeyBinding::new("?", ShowShortcuts, not_input),
+        KeyBinding::new(platform("cmd-r", "ctrl-r"), ToggleRecording, shell),
+        KeyBinding::new(platform("cmd-n", "ctrl-n"), NewSession, shell),
+        KeyBinding::new(platform("cmd-shift-n", "ctrl-shift-n"), NewWindow, None),
         KeyBinding::new(platform("cmd-,", "ctrl-,"), OpenSettings, None),
         KeyBinding::new(platform("cmd-q", "ctrl-q"), Quit, None),
         KeyBinding::new(platform("cmd-w", "ctrl-w"), CloseWindow, None),

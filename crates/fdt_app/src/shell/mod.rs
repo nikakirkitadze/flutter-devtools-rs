@@ -1,6 +1,7 @@
 //! The main window: sidebar, current tool page and overlays.
 
 mod about;
+mod banner;
 mod settings_page;
 mod shortcuts;
 mod sidebar;
@@ -8,21 +9,24 @@ mod title_bar;
 mod tool_page;
 
 use crate::actions::{
-    About, ClearSelection, CloseWindow, GoBack, GoForward, Minimize, OpenPalette, OpenSettings,
-    ShowLogs, ShowMemory, ShowNetwork, ShowPerformance, ShowShortcuts, ShowState, ShowTimeline,
-    ShowWidgets, ToggleFrameHud, ToggleFullScreen, UseDarkTheme, UseLightTheme, UseSystemTheme,
-    Zoom,
+    About, ClearSelection, CloseWindow, ConnectToApp, Disconnect, GoBack, GoForward, Minimize,
+    NewSession, OpenPalette, OpenSettings, ShowLogs, ShowMemory, ShowNetwork, ShowPerformance,
+    ShowShortcuts, ShowState, ShowTimeline, ShowWidgets, StopWaiting, ToggleFrameHud,
+    ToggleFullScreen, ToggleRecording, UseDarkTheme, UseLightTheme, UseSystemTheme, Zoom,
 };
+use crate::capture_host::CaptureControl;
 use crate::keymap::SHELL_CONTEXT;
 use crate::nav::{Location, NavHistory, Page, Tool};
 use crate::palette::view::{PaletteModel, open_palette};
+use crate::session_model::{SessionEvent, SessionModel};
 use crate::settings::{settings, update_settings};
+use fdt_capture::ConnStatus;
 use fdt_ui::hud::FrameHud;
 use fdt_ui::theme::{self, ThemePreference, TokensExt as _};
 use fdt_ui::tokens::Appearance;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::{
-    Action, AppContext as _, Context, Div, Entity, FocusHandle, Focusable, Hsla,
+    Action, App, AppContext as _, Context, Div, Entity, FocusHandle, Focusable, Hsla,
     InteractiveElement as _, IntoElement, MouseButton, NavigationDirection, ParentElement as _,
     Render, Styled as _, TestSupportExt as _, Window, div, relative,
 };
@@ -59,11 +63,13 @@ pub struct MainWindow {
     hud: Entity<FrameHud>,
     focus: FocusHandle,
     palette: Option<Entity<PaletteModel>>,
+    session: Entity<SessionModel>,
     _appearance: gpui_kit::Subscription,
+    _session_subs: [gpui_kit::Subscription; 2],
 }
 
 impl MainWindow {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>, session: Entity<SessionModel>) -> Self {
         let hud = cx.new(|cx| FrameHud::new(window, cx));
         let focus = cx.focus_handle();
         cx.observe_window_activation(window, |_, window, cx| {
@@ -77,13 +83,48 @@ impl MainWindow {
             this.appearance_changed(os, window, cx);
         });
         window.focus(&focus, cx);
+        let observed = cx.observe(&session, |_, _, cx| cx.notify());
+        let connected = cx.subscribe_in(&session, window, |this, _, event, window, cx| {
+            if *event == SessionEvent::Status {
+                this.status_changed(window, cx);
+            }
+        });
         Self {
             history: NavHistory::new(Location::at(Page::Start)),
             counts: [None; 7],
             hud,
             focus,
             palette: None,
+            session,
             _appearance: appearance,
+            _session_subs: [observed, connected],
+        }
+    }
+
+    pub fn session(&self) -> &Entity<SessionModel> {
+        &self.session
+    }
+
+    /// Leaves the start page for Logs once an app is connected.
+    fn status_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let connected = matches!(self.session.read(cx).status(), ConnStatus::Connected { .. });
+        if connected && self.current().page == Page::Start {
+            self.show(Tool::Logs, window, cx);
+        }
+    }
+
+    fn toggle_recording(&mut self, cx: &mut Context<Self>) {
+        let session = self.session.read(cx);
+        if let (ConnStatus::Connected { recording, .. }, Some(control)) =
+            (session.status(), session.control())
+        {
+            control.set_recording(!recording);
+        }
+    }
+
+    fn with_control(&self, cx: &App, f: impl FnOnce(&dyn CaptureControl)) {
+        if let Some(control) = self.session.read(cx).control() {
+            f(control);
         }
     }
 
@@ -199,7 +240,11 @@ impl Render for MainWindow {
         let page: gpui_kit::AnyElement = match self.current().page {
             Page::Start => tool_page::render_start(cx).into_any_element(),
             Page::Tool(tool) => tool_page::render(tool, cx).into_any_element(),
-            Page::Settings => settings_page::render(settings(cx).theme, cx).into_any_element(),
+            Page::Settings => {
+                let free = settings(cx).free_app_http_memory;
+                settings_page::render(settings(cx).theme, free, cx.weak_entity(), cx)
+                    .into_any_element()
+            }
         };
         let nav = |dir| MouseButton::Navigate(dir);
         let root = div()
@@ -233,6 +278,20 @@ impl Render for MainWindow {
                 about::open_about(this.focus_handle(), w, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, w, cx| this.open_settings(w, cx)))
+            .on_action(cx.listener(|this, _: &ToggleRecording, _, cx| this.toggle_recording(cx)))
+            .on_action(cx.listener(|this, _: &NewSession, _, cx| {
+                this.with_control(cx, |c| c.new_session());
+            }))
+            .on_action(cx.listener(|this, _: &Disconnect, _, cx| {
+                this.with_control(cx, |c| c.disconnect());
+            }))
+            .on_action(cx.listener(|this, _: &StopWaiting, _, cx| {
+                this.with_control(cx, |c| c.stop_waiting());
+            }))
+            .on_action(cx.listener(|this, _: &ConnectToApp, w, cx| {
+                let to = this.current().with_page(Page::Start);
+                this.navigate(to, w, cx);
+            }))
             .on_action(cx.listener(|this, _: &UseSystemTheme, w, cx| {
                 this.set_theme(ThemePreference::System, w, cx)
             }))
@@ -265,6 +324,7 @@ impl Render for MainWindow {
                 cx.listener(|this, _, _, cx| this.go_forward(cx)),
             )
             .child(self.render_title_bar(window, cx))
+            .children(self.render_banner(cx))
             .child(
                 div()
                     .flex()

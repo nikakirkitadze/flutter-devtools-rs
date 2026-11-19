@@ -1,9 +1,10 @@
 //! The command registry the palette, menus and cheat sheet are built from.
 
 use crate::actions::{
-    About, ClearSelection, CloseWindow, GoBack, GoForward, Minimize, OpenSettings, Quit, ShowLogs,
-    ShowMemory, ShowNetwork, ShowPerformance, ShowShortcuts, ShowState, ShowTimeline, ShowWidgets,
-    ToggleFrameHud, ToggleFullScreen, UseDarkTheme, UseLightTheme, UseSystemTheme, Zoom,
+    About, ClearSelection, CloseWindow, ConnectToApp, Disconnect, GoBack, GoForward, Minimize,
+    NewSession, NewWindow, OpenSettings, Quit, ShowLogs, ShowMemory, ShowNetwork, ShowPerformance,
+    ShowShortcuts, ShowState, ShowTimeline, ShowWidgets, StopWaiting, ToggleFrameHud,
+    ToggleFullScreen, ToggleRecording, UseDarkTheme, UseLightTheme, UseSystemTheme, Zoom,
 };
 #[cfg(target_os = "macos")]
 use crate::actions::{Hide, HideOthers, ShowAll};
@@ -100,6 +101,34 @@ pub fn commands() -> Vec<CommandSpec> {
             action: || Box::new(ClearSelection),
         },
         CommandSpec {
+            id: "connect.open",
+            label: "Connect to an App…",
+            keywords: &["attach", "start", "vm service", "url"],
+            group: Group::App,
+            action: || Box::new(ConnectToApp),
+        },
+        CommandSpec {
+            id: "connect.disconnect",
+            label: "Disconnect",
+            keywords: &["detach", "stop"],
+            group: Group::App,
+            action: || Box::new(Disconnect),
+        },
+        CommandSpec {
+            id: "connect.stop_waiting",
+            label: "Stop Waiting for the App",
+            keywords: &["reconnect", "cancel"],
+            group: Group::App,
+            action: || Box::new(StopWaiting),
+        },
+        CommandSpec {
+            id: "session.new",
+            label: "New Session",
+            keywords: &["clear", "reset", "empty"],
+            group: Group::App,
+            action: || Box::new(NewSession),
+        },
+        CommandSpec {
             id: "app.settings",
             label: "Open Settings",
             keywords: &["preferences"],
@@ -154,6 +183,13 @@ pub fn commands() -> Vec<CommandSpec> {
             action: || Box::new(ToggleFrameHud),
         },
         CommandSpec {
+            id: "view.recording",
+            label: "Start or Stop Recording",
+            keywords: &["record", "pause", "resume"],
+            group: Group::View,
+            action: || Box::new(ToggleRecording),
+        },
+        CommandSpec {
             id: "view.shortcuts",
             label: "Show Keyboard Shortcuts",
             keywords: &["keys", "help", "cheat sheet"],
@@ -187,6 +223,13 @@ pub fn commands() -> Vec<CommandSpec> {
             keywords: &[],
             group: Group::Window,
             action: || Box::new(CloseWindow),
+        },
+        CommandSpec {
+            id: "window.new",
+            label: "New Window",
+            keywords: &["second", "another"],
+            group: Group::Window,
+            action: || Box::new(NewWindow),
         },
         CommandSpec {
             id: "window.minimize",

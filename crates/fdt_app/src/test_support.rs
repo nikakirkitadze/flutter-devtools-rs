@@ -1,11 +1,21 @@
 //! Helpers shared by the app's UI tests.
 
+use crate::capture_host::CaptureControl;
 use crate::keymap::platform;
+use crate::session_model::SessionModel;
 use crate::shell::MainWindow;
+use fdt_capture::{ConnStatus, Target};
+use fdt_store::Snapshot;
+use fdt_store::net::{BodyKind, BodyLimits};
+use fdt_store::run::{AppInfo, Mode};
+use fdt_store::time::{EntryId, RunId};
 use gpui_kit::base::Root;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AppContext as _, Entity, TestAppContext, VisualTestContext};
 use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::Arc;
+use tokio::sync::watch;
 
 /// App-level setup shared with production, without fonts.
 ///
@@ -18,12 +28,25 @@ pub fn init(cx: &mut TestAppContext) {
     });
 }
 
-/// Opens the shell in a test window with focus on it.
+/// Opens the shell in a test window with focus on it. Its session is fixed: `Idle`, no capture.
+///
+/// Never installs a capture host, so no test touches the real DTD registry.
 pub fn open_shell(cx: &mut TestAppContext) -> (Entity<MainWindow>, &mut VisualTestContext) {
+    open_shell_with(cx, |_| {
+        SessionModel::fixed(Arc::new(Snapshot::empty()), ConnStatus::Idle)
+    })
+}
+
+/// Like [`open_shell`], with a session built by `session`.
+pub fn open_shell_with(
+    cx: &mut TestAppContext,
+    session: impl FnOnce(&mut gpui_kit::Context<SessionModel>) -> SessionModel,
+) -> (Entity<MainWindow>, &mut VisualTestContext) {
     init(cx);
     let slot: RefCell<Option<Entity<MainWindow>>> = RefCell::new(None);
     let (_, vcx) = cx.add_window_view(|window, cx| {
-        let shell = cx.new(|cx| MainWindow::new(window, cx));
+        let session = cx.new(session);
+        let shell = cx.new(|cx| MainWindow::new(window, cx, session));
         *slot.borrow_mut() = Some(shell.clone());
         Root::new(shell, window, cx)
     });
@@ -32,6 +55,116 @@ pub fn open_shell(cx: &mut TestAppContext) -> (Entity<MainWindow>, &mut VisualTe
     vcx.update(|window, cx| window.focus(&focus, cx));
     vcx.run_until_parked();
     (shell, vcx)
+}
+
+/// Opens the shell with a [`FakeCapture`] attached to its session.
+pub fn open_shell_fake(
+    cx: &mut TestAppContext,
+) -> (Entity<MainWindow>, &mut VisualTestContext, FakeHandle) {
+    let (fake, handle) = fake_capture();
+    let (shell, vcx) = open_shell_with(cx, |cx| {
+        let mut model = SessionModel::new(cx);
+        model.attach(Box::new(fake), cx);
+        model
+    });
+    (shell, vcx, handle)
+}
+
+/// A capture stand-in: records every command and replays whatever the test sends.
+pub struct FakeCapture {
+    log: Rc<RefCell<Vec<String>>>,
+    status: watch::Receiver<ConnStatus>,
+    snaps: watch::Receiver<Arc<Snapshot>>,
+}
+
+/// The test's side of a [`FakeCapture`].
+pub struct FakeHandle {
+    pub log: Rc<RefCell<Vec<String>>>,
+    pub status: watch::Sender<ConnStatus>,
+    pub snaps: watch::Sender<Arc<Snapshot>>,
+}
+
+impl FakeHandle {
+    pub fn commands(&self) -> Vec<String> {
+        self.log.borrow().clone()
+    }
+}
+
+pub fn fake_capture() -> (FakeCapture, FakeHandle) {
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let (status_tx, status) = watch::channel(ConnStatus::Idle);
+    let (snaps_tx, snaps) = watch::channel(Arc::new(Snapshot::empty()));
+    (
+        FakeCapture {
+            log: log.clone(),
+            status,
+            snaps,
+        },
+        FakeHandle {
+            log,
+            status: status_tx,
+            snaps: snaps_tx,
+        },
+    )
+}
+
+impl FakeCapture {
+    fn record(&self, what: impl Into<String>) {
+        self.log.borrow_mut().push(what.into());
+    }
+}
+
+impl CaptureControl for FakeCapture {
+    fn connect(&self, _target: Target) {
+        self.record("connect");
+    }
+    fn disconnect(&self) {
+        self.record("disconnect");
+    }
+    fn stop_waiting(&self) {
+        self.record("stop_waiting");
+    }
+    fn set_recording(&self, on: bool) {
+        self.record(format!("set_recording({on})"));
+    }
+    fn new_session(&self) {
+        self.record("new_session");
+    }
+    fn load_full_body(&self, _id: EntryId, _kind: BodyKind) {
+        self.record("load_full_body");
+    }
+    fn set_free_app_http_memory(&self, on: bool) {
+        self.record(format!("set_free_app_http_memory({on})"));
+    }
+    fn set_body_limits(&self, _limits: BodyLimits) {
+        self.record("set_body_limits");
+    }
+    fn status(&self) -> watch::Receiver<ConnStatus> {
+        self.status.clone()
+    }
+    fn snapshots(&self) -> watch::Receiver<Arc<Snapshot>> {
+        self.snaps.clone()
+    }
+}
+
+pub fn app_info(name: &str) -> AppInfo {
+    AppInfo {
+        name: name.to_string(),
+        device: Some("macOS".to_string()),
+        mode: Mode::Debug,
+        flutter_version: None,
+        workspace: None,
+        vm_uri: "ws://127.0.0.1:1/ws".to_string(),
+        pid: None,
+    }
+}
+
+pub fn connected(name: &str, recording: bool) -> ConnStatus {
+    ConnStatus::Connected {
+        run: RunId(1),
+        app: app_info(name),
+        recording,
+    }
 }
 
 /// Whether a test-supported element with `id` is in the next rendered frame.

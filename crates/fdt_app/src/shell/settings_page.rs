@@ -1,13 +1,17 @@
-//! The settings page: theme preference and a pointer to the shortcut list.
+//! The settings page: theme preference, network capture and a pointer to the shortcut list.
 
 use crate::actions::{ShowShortcuts, UseDarkTheme, UseLightTheme, UseSystemTheme};
+use crate::session_model::for_each_control;
+use crate::settings::update_settings;
+use crate::shell::MainWindow;
 use fdt_ui::theme::{ThemePreference, TokensExt as _};
 use fdt_ui::tokens::{alpha, font, layout, radius, row, space};
 use gpui_kit::component::kbd::Kbd;
+use gpui_kit::component::switch::Switch;
 use gpui_kit::{
     Action, AnyElement, App, Hsla, InteractiveElement as _, IntoElement, Keystroke,
     ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
-    TestSupportExt as _, Window, div,
+    TestSupportExt as _, WeakEntity, Window, div,
 };
 
 fn dispatcher(
@@ -98,7 +102,41 @@ fn section(title: &'static str, rows: Vec<AnyElement>, cx: &App) -> impl IntoEle
         .children(rows)
 }
 
-pub fn render(pref: ThemePreference, cx: &App) -> impl IntoElement {
+/// Switches "free app memory" for the setting and for every open window's capture.
+fn set_free_http_memory(on: bool, shell: &WeakEntity<MainWindow>, cx: &mut App) {
+    update_settings(cx, |s| s.free_app_http_memory = on);
+    for_each_control(cx, |control| control.set_free_app_http_memory(on));
+    let _ = shell.update(cx, |_, cx| cx.notify());
+}
+
+fn free_http_memory_row(on: bool, shell: WeakEntity<MainWindow>, cx: &App) -> AnyElement {
+    let t = cx.tokens();
+    div()
+        .flex()
+        .flex_col()
+        .gap(space::S4)
+        .py(space::S8)
+        .child(
+            Switch::new("settings-free-http-memory")
+                .checked(on)
+                .label("Free app memory after copying requests")
+                .on_change(move |checked, _, cx| set_free_http_memory(*checked, &shell, cx)),
+        )
+        .child(
+            div()
+                .text_size(font::BODY)
+                .text_color(Hsla::from(t.text_muted))
+                .child("Clears the app's own HTTP profile after fdt copies each request. Other tools attached to the app lose those requests."),
+        )
+        .into_any_element()
+}
+
+pub fn render(
+    pref: ThemePreference,
+    free_http_memory: bool,
+    shell: WeakEntity<MainWindow>,
+    cx: &App,
+) -> impl IntoElement {
     let t = cx.tokens();
     let theme = segment_row(
         vec![
@@ -174,6 +212,11 @@ pub fn render(pref: ThemePreference, cx: &App) -> impl IntoElement {
                 .child(section(
                     "Appearance",
                     vec![row("Theme", theme, cx).into_any_element()],
+                    cx,
+                ))
+                .child(section(
+                    "Network",
+                    vec![free_http_memory_row(free_http_memory, shell, cx)],
                     cx,
                 ))
                 .child(section(

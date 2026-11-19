@@ -4,9 +4,10 @@
 //! Each stops the press from reaching `TitleBar`'s drag handling, so a click on a
 //! control never starts a window move.
 
-use crate::actions::{GoBack, GoForward, OpenPalette};
+use crate::actions::{ConnectToApp, GoBack, GoForward, OpenPalette};
 use crate::keymap::SHELL_CONTEXT;
 use crate::shell::MainWindow;
+use fdt_capture::ConnStatus;
 use fdt_ui::assets::icons;
 use fdt_ui::theme::TokensExt as _;
 use fdt_ui::tokens::{font, layout, radius, row, space};
@@ -16,9 +17,38 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, TitleBar};
 use gpui_kit::{
     Action, AnyElement, App, Context, Hsla, InteractiveElement as _, IntoElement, MouseButton,
-    ParentElement as _, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window,
-    div,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
+    TestSupportExt as _, Window, div,
 };
+use std::time::Duration;
+
+/// The text of the connection chip for `status`.
+pub fn chip_label(status: &ConnStatus) -> String {
+    match status {
+        ConnStatus::Idle => "No app connected".to_string(),
+        ConnStatus::Connecting { label } => format!("Connecting to {label}…"),
+        ConnStatus::Connected { app, .. } => {
+            let mode = match app.mode {
+                fdt_store::run::Mode::Debug => Some("debug"),
+                fdt_store::run::Mode::Profile => Some("profile"),
+                fdt_store::run::Mode::Unknown => None,
+            };
+            let parts = [Some(app.name.as_str()), app.device.as_deref(), mode];
+            parts.into_iter().flatten().collect::<Vec<_>>().join(" · ")
+        }
+        ConnStatus::Disconnected { app, .. } => {
+            let name = app.as_ref().map_or("App", |a| a.name.as_str());
+            format!("{name} · disconnected")
+        }
+        ConnStatus::Failed { .. } => "Couldn't connect".to_string(),
+    }
+}
+
+/// `Rec 0:05`, minutes growing past 59 rather than rolling into hours.
+pub fn rec_label(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    format!("Rec {}:{:02}", secs / 60, secs % 60)
+}
 
 /// Keeps a press on a control from being read as the start of a window drag.
 fn claim_press(window: &mut Window, cx: &mut App) {
@@ -68,6 +98,74 @@ fn nav_button(
 }
 
 impl MainWindow {
+    /// Connection status and, while connected, the recording state. Clicking it opens the
+    /// start page.
+    fn render_connection_chip(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = cx.tokens();
+        let session = self.session.read(cx);
+        let status = session.status();
+        let label = chip_label(status);
+        let text_color = match status {
+            ConnStatus::Disconnected { .. } => t.warning,
+            ConnStatus::Idle | ConnStatus::Failed { .. } => t.text_muted,
+            _ => t.text,
+        };
+        let mut chip = div()
+            .id("connection-chip")
+            .test_support()
+            .aria_label(SharedString::from(label.clone()))
+            .occlude()
+            .flex()
+            .items_center()
+            .gap(space::S8)
+            .h(row::TABLE)
+            .px(space::S8)
+            .rounded(radius::CONTROL)
+            .text_size(font::BODY)
+            .text_color(Hsla::from(text_color))
+            .cursor_pointer()
+            .hover(|s| s.bg(t.border.with_alpha(fdt_ui::tokens::alpha::ACTIVE_ROW)))
+            .on_mouse_down(MouseButton::Left, |_, window, cx| claim_press(window, cx))
+            .on_click(|_, window, cx| window.dispatch_action(Box::new(ConnectToApp), cx));
+        if matches!(status, ConnStatus::Disconnected { .. }) {
+            chip = chip.child(
+                Icon::new(icons::WARNING)
+                    .size(layout::ICON_MD)
+                    .text_color(Hsla::from(t.warning)),
+            );
+        }
+        chip = chip.child(label);
+        if let ConnStatus::Connected { recording, .. } = status {
+            let rec = if *recording {
+                let text = rec_label(session.recording_elapsed().unwrap_or_default());
+                div()
+                    .id("rec-chip")
+                    .test_support()
+                    .aria_label(SharedString::from(text.clone()))
+                    .flex()
+                    .items_center()
+                    .gap(space::S4)
+                    .text_color(Hsla::from(t.text))
+                    .child(
+                        div()
+                            .size(layout::STATUS_DOT)
+                            .rounded_full()
+                            .bg(Hsla::from(t.danger)),
+                    )
+                    .child(text)
+            } else {
+                div()
+                    .id("rec-chip")
+                    .test_support()
+                    .aria_label("Paused")
+                    .text_color(Hsla::from(t.text_muted))
+                    .child("Paused")
+            };
+            chip = chip.child(rec);
+        }
+        chip.into_any_element()
+    }
+
     pub(super) fn render_title_bar(
         &self,
         window: &mut Window,
@@ -121,12 +219,7 @@ impl MainWindow {
                     .gap(space::S8)
                     .child(back)
                     .child(forward)
-                    .child(
-                        div()
-                            .text_size(font::BODY)
-                            .text_color(Hsla::from(t.text_muted))
-                            .child("No app connected"),
-                    ),
+                    .child(self.render_connection_chip(cx)),
             )
             .child(div().flex_1())
             .child(div().pr(space::S12).child(palette))

@@ -2,9 +2,9 @@
 
 use crate::actions::show_tool;
 use crate::actions::{
-    About, CloseWindow, GoBack, GoForward, Minimize, OpenPalette, OpenSettings, Quit,
-    ShowShortcuts, ToggleFrameHud, ToggleFullScreen, UseDarkTheme, UseLightTheme, UseSystemTheme,
-    Zoom,
+    About, CloseWindow, ConnectToApp, Disconnect, GoBack, GoForward, Minimize, NewSession,
+    NewWindow, OpenPalette, OpenSettings, Quit, ShowShortcuts, StopWaiting, ToggleFrameHud,
+    ToggleFullScreen, ToggleRecording, UseDarkTheme, UseLightTheme, UseSystemTheme, Zoom,
 };
 #[cfg(target_os = "macos")]
 use crate::actions::{Hide, HideOthers, ShowAll};
@@ -55,8 +55,17 @@ pub fn app_menus() -> Vec<Menu> {
 
     vec![
         Menu::new("fdt").items(app),
+        Menu::new("File").items([
+            MenuItem::action("New Session", NewSession),
+            MenuItem::action("New Window", NewWindow),
+            MenuItem::separator(),
+            MenuItem::action("Connect to an App…", ConnectToApp),
+            MenuItem::action("Disconnect", Disconnect),
+            MenuItem::action("Stop Waiting for the App", StopWaiting),
+        ]),
         Menu::new("View").items([
             MenuItem::action("Command Palette…", OpenPalette),
+            MenuItem::action("Start or Stop Recording", ToggleRecording),
             MenuItem::action("Show Frame Times", ToggleFrameHud),
             MenuItem::separator(),
             MenuItem::action("Theme: Match System", UseSystemTheme),
@@ -96,7 +105,7 @@ mod tests {
     fn menus_only_use_registered_commands() {
         let menus = app_menus();
         let names: Vec<_> = menus.iter().map(|m| m.name.to_string()).collect();
-        assert_eq!(names, ["fdt", "View", "Go", "Window", "Help"]);
+        assert_eq!(names, ["fdt", "File", "View", "Go", "Window", "Help"]);
         let registered: Vec<_> = commands().iter().map(|c| (c.action)().name()).collect();
         let mut used = Vec::new();
         for m in &menus {

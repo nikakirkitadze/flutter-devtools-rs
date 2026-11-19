@@ -164,6 +164,18 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn the_cheat_sheet_lists_the_session_shortcuts(cx: &mut TestAppContext) {
+        let (_shell, cx) = open_shell(cx);
+        cx.dispatch_action(ShowShortcuts);
+        cx.run_until_parked();
+        for id in ["view.recording", "session.new", "window.new"] {
+            let row: &'static str = Box::leak(format!("shortcut-row-{id}").into_boxed_str());
+            assert!(exists(cx, row), "{id}");
+        }
+        assert!(!exists(cx, "shortcut-row-connect.open"));
+    }
+
+    #[gpui_kit::test]
     fn escape_closes_the_cheat_sheet(cx: &mut TestAppContext) {
         let (_shell, cx) = open_shell(cx);
         press(cx, "?", "?");

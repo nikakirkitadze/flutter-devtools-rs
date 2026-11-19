@@ -30,7 +30,13 @@ gpui_kit::actions!(
         CloseWindow,
         Hide,
         HideOthers,
-        ShowAll
+        ShowAll,
+        ToggleRecording,
+        NewSession,
+        NewWindow,
+        ConnectToApp,
+        Disconnect,
+        StopWaiting
     ]
 );
 
