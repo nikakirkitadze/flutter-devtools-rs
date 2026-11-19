@@ -1759,6 +1759,7 @@ dependencies = [
  "regex",
  "serde_json",
  "tokio",
+ "url",
 ]
 
 [[package]]

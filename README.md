@@ -40,6 +40,22 @@ trees and log bursts, for trying the tools against something real.
 cargo test --workspace
 ```
 
+### Live integration test
+
+`crates/fdt_capture/tests/jank_lab_live.rs` runs the real capture against a running `jank_lab`
+(discovery, logs, network, hot restart). It is ignored unless `FDT_JANK_LAB=1`. With Flutter
+installed and a desktop device available:
+
+```
+scripts/jank-lab-it.sh debug     # or: profile
+```
+
+The script starts `flutter run --machine` for the fixture, waits for the VM service, runs the
+test with `FDT_JANK_LAB_VM_URI` set, and stops only the app it started. It prints `attach_ms`
+and `first_log_ms`. Discovery uses your real registry directory and picks the app named
+`jank_lab`; other Dart tooling on the machine is ignored. In CI this is the `jank_lab_live` job
+(Linux, under `xvfb-run`).
+
 ## Licence
 
 Apache-2.0. Bundled fonts (Inter, JetBrains Mono) are under the SIL Open Font License. The
