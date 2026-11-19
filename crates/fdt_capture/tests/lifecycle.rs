@@ -779,3 +779,101 @@ fn load_full_body_after_the_app_stopped_changes_nothing() {
         }
     });
 }
+
+#[test]
+fn new_session_then_app_stops_is_detected() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let app = fake(1, 100);
+        let (cap, _apps) = start_discovered(&rt, cfg());
+        cap.connect(Target::Discovered(disc(&app.server)));
+        let first = common::settle(&cap, Duration::from_millis(100), Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        cap.new_session();
+        common::wait_for(&cap, Duration::from_secs(5), "the new session", |s| {
+            s.origin_host_us > first.origin_host_us && s.runs.len() == 1
+        })
+        .await;
+        drop(app);
+        wait_status(&cap, "waiting", is_waiting).await;
+        common::wait_for(&cap, Duration::from_secs(5), "the run to end", |s| {
+            s.runs.first().is_some_and(|r| r.ended.is_some())
+        })
+        .await;
+    });
+}
+
+#[test]
+fn stop_waiting_cancels_an_in_flight_url_retry() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let app = fake(1, 100);
+        let cap = Capture::start(
+            rt.handle(),
+            CaptureConfig {
+                reconnect_uri_retry: Duration::from_millis(50),
+                reconnect_uri_give_up: Duration::from_secs(60),
+                ..cfg()
+            },
+            None,
+        );
+        cap.connect(Target::Uri(
+            VmServiceUri::parse(app.server.ws_uri().as_str()).unwrap(),
+        ));
+        common::settle(&cap, Duration::from_millis(100), Duration::from_secs(5)).await;
+        // The link drops; the retry reaches the app again, but the app never answers getVM.
+        app.server.set_latency(Duration::from_secs(60));
+        app.server.close_abruptly();
+        common::eventually(Duration::from_secs(5), "a retry stuck in getVM", || {
+            app.count("getVM") >= 2 && app.server.open_connections() == 1
+        })
+        .await;
+        // The retry is quiet: the status still says Disconnected.
+        assert!(matches!(
+            *cap.status().borrow(),
+            ConnStatus::Disconnected { .. }
+        ));
+        cap.stop_waiting();
+        common::eventually(Duration::from_secs(2), "the retry to be cancelled", || {
+            app.server.open_connections() == 0
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(app.count("getVM"), 2, "kept retrying");
+        assert!(matches!(
+            *cap.status().borrow(),
+            ConnStatus::Disconnected {
+                waiting_for: None,
+                ..
+            }
+        ));
+    });
+}
+
+#[test]
+fn dropped_link_with_the_app_still_listed_reconnects() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let app = fake(1, 100);
+        let (cap, apps) = start_discovered(
+            &rt,
+            CaptureConfig {
+                reconnect_uri_retry: Duration::from_millis(50),
+                ..cfg()
+            },
+        );
+        apps.send(Arc::from(vec![disc(&app.server)])).unwrap();
+        cap.connect(Target::Discovered(disc(&app.server)));
+        common::settle(&cap, Duration::from_millis(100), Duration::from_secs(5)).await;
+        app.server.close_abruptly();
+        // The list never changes; the capture looks at it again by itself.
+        wait_status(&cap, "reconnected", |s| {
+            matches!(s, ConnStatus::Connected { .. })
+        })
+        .await;
+        assert!(matches!(
+            *cap.status().borrow(),
+            ConnStatus::Connected { run: RunId(1), .. }
+        ));
+    });
+}

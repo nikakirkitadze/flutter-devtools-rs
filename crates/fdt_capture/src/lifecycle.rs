@@ -33,12 +33,24 @@ pub(crate) struct UriRetry {
     give_up: Instant,
 }
 
+/// Retrying a discovered app that is listed but would not connect.
+pub(crate) struct DiscRetry {
+    next: Option<Instant>,
+    give_up: Instant,
+}
+
 /// Session state that exists only for the lifecycle rules.
 pub(crate) struct Lifecycle {
     /// What the last connect command asked for.
     target: Option<Target>,
     waiting_for: Option<AppKey>,
     retry: Option<UriRetry>,
+    disc_retry: Option<DiscRetry>,
+    /// The last discovered list, to look for the app we wait for.
+    pub(crate) apps: std::sync::Arc<[DiscoveredApp]>,
+    /// The generation the live connection started with. Its own `Closed` and `Failed` carry
+    /// that generation even after a new session bumped the current one.
+    floor: Option<u64>,
     /// The connection in progress was started by us (a reconnect), not by the user.
     auto: bool,
     /// The status to go back to when an automatic attempt fails.
@@ -57,6 +69,9 @@ impl Lifecycle {
             target: None,
             waiting_for: None,
             retry: None,
+            disc_retry: None,
+            apps: std::sync::Arc::from(Vec::new()),
+            floor: None,
             auto: false,
             restore: None,
             recording: true,
@@ -68,7 +83,14 @@ impl Lifecycle {
 
     /// When the session task should wake to retry the URL.
     pub(crate) fn retry_due(&self) -> Option<Instant> {
-        self.retry.as_ref()?.next
+        let a = self.retry.as_ref().and_then(|r| r.next);
+        let b = self.disc_retry.as_ref().and_then(|r| r.next);
+        [a, b].into_iter().flatten().min()
+    }
+
+    /// Whether a `Closed`/`Failed` from generation `g` ends the live connection.
+    pub(crate) fn ends_live_connection(&self, g: u64, current: u64) -> bool {
+        self.floor.is_some_and(|f| g >= f && g <= current)
     }
 }
 
@@ -95,7 +117,9 @@ impl Session {
         if !auto {
             self.life.waiting_for = None;
             self.life.retry = None;
+            self.life.disc_retry = None;
         }
+        self.life.floor = Some(self.conn_gen);
         self.life.auto = auto;
         self.life.restore = auto.then_some(previous);
         self.life.target = Some(target.clone());
@@ -113,6 +137,7 @@ impl Session {
 
     /// Ends the open run, if any, and makes everything from the connection stale.
     fn finish_run(&mut self) {
+        self.life.floor = None;
         let Some(run) = self.current_run.take() else {
             return;
         };
@@ -156,7 +181,15 @@ impl Session {
             .map_or("The app", |a| a.name.as_str());
         let reason = format!("{name} stopped.");
         match self.life.target.clone() {
-            Some(Target::Discovered(a)) => self.life.waiting_for = Some(a.key),
+            Some(Target::Discovered(a)) => {
+                self.life.waiting_for = Some(a.key);
+                // The app may still be listed (a dropped link): look again after a moment.
+                let now = Instant::now();
+                self.life.disc_retry = Some(DiscRetry {
+                    next: Some(now + self.cfg.reconnect_uri_retry),
+                    give_up: now + self.cfg.reconnect_uri_give_up,
+                });
+            }
             Some(Target::Uri(uri)) => {
                 let now = Instant::now();
                 self.life.retry = Some(UriRetry {
@@ -188,11 +221,17 @@ impl Session {
         if let Some(prev) = self.life.restore.take() {
             self.set_status_if_changed(prev);
         }
-        let retry = self.cfg.reconnect_uri_retry;
+        let next = Instant::now() + self.cfg.reconnect_uri_retry;
         if let Some(r) = &mut self.life.retry {
-            let next = Instant::now() + retry;
             if next > r.give_up {
                 self.life.retry = None;
+            } else {
+                r.next = Some(next);
+            }
+        }
+        if let Some(r) = &mut self.life.disc_retry {
+            if next > r.give_up {
+                self.life.disc_retry = None;
             } else {
                 r.next = Some(next);
             }
@@ -201,13 +240,26 @@ impl Session {
 
     /// The URL retry timer fired.
     pub(crate) fn retry_tick(&mut self) {
+        let now = Instant::now();
+        if let Some(r) = &mut self.life.disc_retry
+            && r.next.is_some_and(|n| n <= now)
+        {
+            r.next = None;
+            if now >= r.give_up {
+                self.life.disc_retry = None;
+            } else {
+                let apps = self.life.apps.clone();
+                self.on_discovery_list(&apps);
+            }
+            return;
+        }
         let Some(r) = &mut self.life.retry else {
             return;
         };
         if r.next.take().is_none() {
             return;
         }
-        if Instant::now() >= r.give_up {
+        if now >= r.give_up {
             self.life.retry = None;
             return;
         }
@@ -216,7 +268,12 @@ impl Session {
     }
 
     /// The discovered apps changed: connect to the one we are waiting for.
-    pub(crate) fn on_discovery(&mut self, apps: &[DiscoveredApp]) {
+    pub(crate) fn on_discovery(&mut self, apps: std::sync::Arc<[DiscoveredApp]>) {
+        self.life.apps = apps.clone();
+        self.on_discovery_list(&apps);
+    }
+
+    fn on_discovery_list(&mut self, apps: &[DiscoveredApp]) {
         let waiting = matches!(
             *self.status.borrow(),
             ConnStatus::Disconnected {
@@ -244,6 +301,7 @@ impl Session {
         self.conn_gen += 1;
         self.life.waiting_for = None;
         self.life.retry = None;
+        self.life.disc_retry = None;
         self.life.auto = false;
         self.life.restore = None;
         if had_connection {
@@ -255,23 +313,18 @@ impl Session {
     pub(crate) fn stop_waiting(&mut self) {
         self.life.waiting_for = None;
         self.life.retry = None;
-        if self.life.auto && matches!(*self.status.borrow(), ConnStatus::Connecting { .. }) {
-            // A reconnect is in flight; call it off.
+        self.life.disc_retry = None;
+        if self.life.auto {
+            // A reconnect is in flight (quiet for a URL); call it off.
             if let Some(c) = self.conn.take() {
                 c.abort();
             }
             self.conn_gen += 1;
+            self.life.floor = None;
             self.life.auto = false;
-            self.life.restore = None;
-            let st = self.disconnected(format!(
-                "{} stopped.",
-                self.life
-                    .app
-                    .as_ref()
-                    .map_or("The app", |a| a.name.as_str())
-            ));
-            self.status.send_replace(st);
-            return;
+            if let Some(prev) = self.life.restore.take() {
+                self.set_status_if_changed(prev);
+            }
         }
         self.status.send_if_modified(|s| match s {
             ConnStatus::Disconnected { waiting_for, .. } if waiting_for.is_some() => {
@@ -310,11 +363,12 @@ impl Session {
             w.set_body_limits(limits);
             w
         });
-        let same = self
-            .life
-            .last_vm
-            .clone()
-            .filter(|v| v.pid.is_some() && v.pid == app.pid && v.start_time == vm_start_time);
+        let same = self.life.last_vm.clone().filter(|v| {
+            v.pid.is_some()
+                && v.start_time.is_some()
+                && v.pid == app.pid
+                && v.start_time == vm_start_time
+        });
         let (id, clock, app) = match same {
             // The same VM again: the app never stopped, only the connection did.
             Some(v) => {
@@ -345,6 +399,7 @@ impl Session {
         });
         self.life.waiting_for = None;
         self.life.retry = None;
+        self.life.disc_retry = None;
         self.life.auto = false;
         self.life.restore = None;
         self.life.app = Some(app.clone());

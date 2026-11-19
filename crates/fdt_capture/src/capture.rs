@@ -178,13 +178,17 @@ impl Session {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<SessionMsg>) {
         let mut due: Option<Instant> = None;
         let mut discovery = self.discovery.take();
+        if let Some(d) = &discovery {
+            self.life.apps = d.borrow().clone();
+        }
         loop {
             let retry_due = self.life.retry_due();
             tokio::select! {
                 msg = rx.recv() => match msg {
                     Some(SessionMsg::Command(Command::Shutdown)) => break,
                     Some(SessionMsg::Command(c)) => self.command(c),
-                    Some(SessionMsg::Ingest(g, i)) if g == self.conn_gen => self.ingest(i),
+                    Some(SessionMsg::Ingest(g, i))
+                        if g == self.conn_gen || self.ends_live_connection(g, &i) => self.ingest(i),
                     Some(SessionMsg::Ingest(g, i)) => {
                         log::debug!("ignoring stale connection {g}");
                         self.on_stale(i);
@@ -209,7 +213,7 @@ impl Session {
                         None => std::future::pending().await,
                     }
                 } => match changed {
-                    Ok(apps) => self.on_discovery(&apps),
+                    Ok(apps) => self.on_discovery(apps),
                     // The discovery side is gone; nothing more will arrive.
                     Err(_) => discovery = None,
                 },
@@ -238,6 +242,11 @@ impl Session {
         self.snap_tx.send_replace(writer.publish());
         self.last_publish = Some(now);
         None
+    }
+
+    fn ends_live_connection(&self, g: u64, i: &Ingest) -> bool {
+        matches!(i, Ingest::Closed | Ingest::Failed { .. })
+            && self.life.ends_live_connection(g, self.conn_gen)
     }
 
     /// Publishes now, whatever the interval.
