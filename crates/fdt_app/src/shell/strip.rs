@@ -141,6 +141,12 @@ pub struct StripView {
 }
 
 impl StripView {
+    /// The width in pixels the strip was last laid out for.
+    #[cfg(test)]
+    pub(crate) fn laid_out_width(&self) -> Option<usize> {
+        self.cache.as_ref().map(|c| c.layout.width_px)
+    }
+
     fn layout(&mut self, snap: &Snapshot, span: TimeRange, width_px: usize) -> Arc<StripLayout> {
         if let Some(c) = &self.cache
             && c.generation == snap.generation
@@ -224,8 +230,14 @@ impl MainWindow {
         let surface = canvas(
             {
                 let state = state.clone();
-                move |bounds, window, _| {
-                    state.borrow_mut().bounds = bounds;
+                move |bounds, window, cx| {
+                    let previous = std::mem::replace(&mut state.borrow_mut().bounds, bounds);
+                    // The layout was bucketed for the previous width (or the window's, before the
+                    // first paint); rebuild the strip view once for the width it really has.
+                    if (f32::from(previous.size.width) - f32::from(bounds.size.width)).abs() >= 1.0
+                    {
+                        cx.notify(window.current_view());
+                    }
                     window.insert_hitbox(bounds, HitboxBehavior::Normal)
                 }
             },

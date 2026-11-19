@@ -1579,7 +1579,7 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(
             text_of(cx, "net-body-note").as_deref(),
-            Some("Binary data, 6 B. Showing the first 4 KB.")
+            Some("Binary data, 6 B.")
         );
         assert!(
             text_of(cx, "net-body-line-0")

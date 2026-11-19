@@ -133,7 +133,7 @@ fn done(id: &str) -> Value {
 }
 
 struct Fake {
-    server: ScriptedServer,
+    server: Arc<ScriptedServer>,
     profile: Arc<Profile>,
 }
 
@@ -150,9 +150,9 @@ impl Fake {
 fn fake_with(pid: u32, start: i64, body_len: usize, latency_on_body: bool) -> Fake {
     let profile = Arc::new(Profile::default());
     let p = profile.clone();
-    let slot: Arc<OnceLock<Arc<ScriptedServer>>> = Arc::default();
+    let slot: Arc<OnceLock<std::sync::Weak<ScriptedServer>>> = Arc::default();
     let s2 = slot.clone();
-    let server = ScriptedServer::start(move |method, params| match method {
+    let server = Arc::new(ScriptedServer::start(move |method, params| match method {
         "getVM" => Ok(json!({"type": "VM", "pid": pid, "startTime": start,
             "operatingSystem": "macos",
             "isolates": [{"id": "isolates/1", "name": "main", "isSystemIsolate": false}]})),
@@ -167,7 +167,7 @@ fn fake_with(pid: u32, start: i64, body_len: usize, latency_on_body: bool) -> Fa
         "ext.dart.io.socketProfilingEnabled" => Ok(json!({"type": "Success"})),
         "ext.dart.io.getHttpProfile" => Ok(p.answer(params["updatedSince"].as_i64())),
         "ext.dart.io.getHttpProfileRequest" => {
-            if latency_on_body && let Some(s) = s2.get() {
+            if latency_on_body && let Some(s) = s2.get().and_then(std::sync::Weak::upgrade) {
                 s.set_latency(Duration::from_secs(60));
             }
             Ok(
@@ -177,8 +177,11 @@ fn fake_with(pid: u32, start: i64, body_len: usize, latency_on_body: bool) -> Fa
         }
         "s1.flutterVersion" => Ok(json!({"frameworkVersion": "3.99.0"})),
         _ => Err((-32601, "Method not found".into())),
-    });
-    let _ = &slot;
+    }));
+    // (Weak: a strong handle would make the handler keep its own server alive.)
+    // The handler needs the server to hold the body reply; without this the body arrives at once
+    // and the `Pending` window the test waits for is a race.
+    slot.set(Arc::downgrade(&server)).ok();
     Fake { server, profile }
 }
 

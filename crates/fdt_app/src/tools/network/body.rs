@@ -76,7 +76,8 @@ pub fn guess(content_type: Option<&str>, bytes: &[u8]) -> BodyKindGuess {
 
 /// The preview of `bytes` as `kind`. At most [`RENDER_MAX`] bytes are read.
 pub fn render_lines(kind: BodyKindGuess, bytes: &[u8]) -> RenderedBody {
-    let capped = bytes.len() > RENDER_MAX;
+    // A body cut exactly at the cap is capped too: the caller may have truncated it.
+    let capped = bytes.len() >= RENDER_MAX;
     let bytes = &bytes[..bytes.len().min(RENDER_MAX)];
     match kind {
         BodyKindGuess::Json => {
@@ -193,12 +194,15 @@ fn hex(bytes: &[u8]) -> RenderedBody {
             format!("{:08x}  {:<47}  {ascii}", n * 16, cells.join(" "))
         })
         .collect();
+    let size = format_bytes(bytes.len() as u64);
+    let note = if bytes.len() > HEX_BYTES {
+        format!("Binary data, {size}. Showing the first 4 KB.")
+    } else {
+        format!("Binary data, {size}.")
+    };
     RenderedBody {
         lines,
-        note: Some(format!(
-            "Binary data, {}. Showing the first 4 KB.",
-            format_bytes(bytes.len() as u64)
-        )),
+        note: Some(note),
     }
 }
 
@@ -315,10 +319,10 @@ mod tests {
             "00000000  89 50 4e 47 0d 0a 1a 0a                          .PNG...."
         );
         assert_eq!(r.lines.len(), 1);
-        assert_eq!(
-            r.note.as_deref(),
-            Some("Binary data, 8 B. Showing the first 4 KB.")
-        );
+        assert_eq!(r.note.as_deref(), Some("Binary data, 8 B."));
+        let exact = render_lines(BodyKindGuess::Binary, &[7u8; HEX_BYTES]);
+        assert_eq!(exact.note.as_deref(), Some("Binary data, 4.0 KB."));
+        assert_eq!(exact.lines.len(), HEX_BYTES / 16);
         let long: Vec<u8> = (0..=255u8).cycle().take(10_000).collect();
         let r = render_lines(BodyKindGuess::Binary, &long);
         assert_eq!(r.lines.len(), HEX_BYTES / 16, "only the first 4 KiB");
@@ -335,6 +339,16 @@ mod tests {
         let r = render_lines(BodyKindGuess::Image(ImageFormat::Png), &PNG);
         assert_eq!(r.lines.len(), 5);
         assert!(r.lines[0].starts_with("00000000  89 50 4e 47"));
+    }
+
+    #[test]
+    fn a_json_body_cut_exactly_at_the_cap_counts_as_capped() {
+        let mut body = br#"{"a":""#.to_vec();
+        body.resize(RENDER_MAX, b'x');
+        let r = render_lines(BodyKindGuess::Json, &body);
+        assert_eq!(r.note, None, "shown as text, without the invalid-JSON note");
+        assert_eq!(r.lines.len(), 1);
+        assert!(r.lines[0].starts_with("{\"a\":"));
     }
 
     #[test]

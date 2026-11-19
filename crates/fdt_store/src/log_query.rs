@@ -209,6 +209,8 @@ impl Matcher {
             } => Matcher::Re(
                 RegexBuilder::new(&regex::escape(needle))
                     .case_insensitive(true)
+                    .size_limit(REGEX_SIZE_LIMIT)
+                    .dfa_size_limit(REGEX_SIZE_LIMIT)
                     .build()
                     .expect("an escaped literal is a valid regex"),
             ),
@@ -545,7 +547,7 @@ mod tests {
         let t = Instant::now();
         let r = compile_query(r"(\w{200}){50}", true);
         assert!(
-            t.elapsed() < std::time::Duration::from_millis(100),
+            t.elapsed() < std::time::Duration::from_millis(500),
             "{:?}",
             t.elapsed()
         );

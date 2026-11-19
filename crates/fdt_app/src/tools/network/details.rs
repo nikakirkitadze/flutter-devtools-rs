@@ -41,6 +41,9 @@ thread_local! {
 const BODY_ROWS: usize = 24;
 /// The most headers listed per section.
 const HEADERS_MAX: usize = 200;
+/// Images larger than this show the hex fallback instead of being decoded.
+const IMAGE_PREVIEW_MAX: usize = 8 << 20;
+const IMAGE_TOO_LARGE: &str = "Image too large to preview.";
 /// Lines of a failed image's hex preview.
 const FALLBACK_LINES: usize = 64;
 
@@ -78,11 +81,19 @@ fn build(content_type: Option<&str>, body: &Body) -> Rendered {
             bytes = &bytes[..e.valid_up_to()];
         }
     }
+    // A very large image is not copied and decoded for a preview.
+    let too_large = matches!(kind, BodyKindGuess::Image(_)) && bytes.len() > IMAGE_PREVIEW_MAX;
+    if too_large {
+        kind = BodyKindGuess::Binary;
+    }
     let image = match kind {
         BodyKindGuess::Image(format) => Some(Arc::new(Image::from_bytes(format, bytes.to_vec()))),
         _ => None,
     };
-    let RenderedBody { lines, note } = render_lines(kind, bytes);
+    let RenderedBody { lines, mut note } = render_lines(kind, bytes);
+    if too_large {
+        note = Some(IMAGE_TOO_LARGE.to_string());
+    }
     Rendered {
         lines: Arc::new(lines),
         note,
@@ -1212,4 +1223,28 @@ fn error_body(rec: &HttpRecord, cx: &mut Context<NetworkView>) -> AnyElement {
         .text_color(Hsla::from(t.danger))
         .child(error)
         .into_any_element()
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+
+    fn png_of(len: usize) -> Body {
+        let mut bytes = crate::test_support::PNG.to_vec();
+        bytes.resize(len, 0);
+        Body {
+            full_len: len as u64,
+            bytes: bytes.into(),
+        }
+    }
+
+    #[test]
+    fn an_image_over_8_mib_shows_hex_and_a_note_without_decoding() {
+        let r = build(Some("image/png"), &png_of(9 << 20));
+        assert!(r.image.is_none(), "no copy or decode of a 9 MiB image");
+        assert_eq!(r.note.as_deref(), Some("Image too large to preview."));
+        assert!(r.lines[0].starts_with("00000000  89 50 4e 47"));
+        let ok = build(Some("image/png"), &png_of(1 << 20));
+        assert!(ok.image.is_some());
+    }
 }

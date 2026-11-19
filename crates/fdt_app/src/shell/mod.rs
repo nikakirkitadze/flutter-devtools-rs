@@ -690,6 +690,8 @@ impl Render for MainWindow {
                 nav(NavigationDirection::Forward),
                 cx.listener(|this, _, w, cx| this.go_forward(w, cx)),
             )
+            // The `TitleBar` frame itself stays uncached: its window-drag hit areas are not
+            // replayed by a cached frame. Only its content, the title facet, is cached.
             .child(TitleBar::new().child(self.chrome.title.clone().cached(chrome::title_style())))
             .children(self.render_banner(cx))
             .child(
@@ -1036,6 +1038,31 @@ mod tests {
                 chrome.name()
             );
         }
+    }
+
+    #[gpui_kit::test]
+    fn resizing_the_window_rebuilds_the_strip_for_the_new_width(cx: &mut TestAppContext) {
+        use crate::perf::{Counter, snapshot};
+        let snap = crate::test_support::snapshot(|w, run| fdt_store::synth::logs(w, run, 2_000, 3));
+        let (shell, cx) = crate::test_support::open_shell_snapshot(cx, snap);
+        cx.simulate_resize(fdt_ui::tokens::layout::WINDOW_MIN);
+        press(cx, "cmd-5", "ctrl-5");
+        cx.run_until_parked();
+        for _ in 0..3 {
+            draw_frame(cx);
+        }
+        let before = snapshot()[Counter::Strip as usize];
+        cx.simulate_resize(gpui_kit::size(gpui_kit::px(1400.), gpui_kit::px(700.)));
+        for _ in 0..3 {
+            draw_frame(cx);
+        }
+        assert!(
+            snapshot()[Counter::Strip as usize] > before,
+            "the strip is rebuilt for its new width"
+        );
+        let shown = shell.read_with(cx, |s, _| s.strip_bounds().size.width);
+        let laid = shell.read_with(cx, |s, _| s.strip.laid_out_width());
+        assert_eq!(laid, Some(f32::from(shown).round() as usize));
     }
 
     #[gpui_kit::test]

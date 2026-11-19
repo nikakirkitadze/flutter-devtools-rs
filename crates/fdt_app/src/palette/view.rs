@@ -41,11 +41,21 @@ struct PaletteView {
     input: Entity<InputState>,
     scroll: UniformListScrollHandle,
     selected: usize,
+    /// Whether the user has moved the selection since the last query change.
+    moved: bool,
     last_query: SharedString,
     shell: WeakEntity<MainWindow>,
     shell_focus: FocusHandle,
     _subs: Vec<Subscription>,
     _load: Task<()>,
+}
+
+/// The row to select after the background items merge in: the item the user had moved to, if it
+/// is still listed; otherwise the top row. `moved_to` is `None` when the user had not moved.
+fn selection_after_merge(moved_to: Option<&str>, model: &PaletteModel) -> usize {
+    moved_to
+        .and_then(|id| (0..model.row_count()).find(|&row| model.item(row).id == id))
+        .unwrap_or(0)
 }
 
 impl PaletteView {
@@ -88,12 +98,24 @@ impl PaletteView {
             let items = scan.await;
             this.update(cx, |this, cx| {
                 let recents = settings(cx).recent_commands.clone();
+                let before = this.moved.then(|| {
+                    let m = target.read(cx);
+                    (this.selected < m.row_count()).then(|| m.item(this.selected).id.clone())
+                });
                 target.update(cx, |m, cx| {
                     m.extend(items, &recents);
                     cx.notify();
                 });
-                this.selected = 0;
-                this.scroll.scroll_to_item(0, ScrollStrategy::Top);
+                let row = selection_after_merge(before.flatten().as_deref(), target.read(cx));
+                this.selected = row;
+                this.scroll.scroll_to_item(
+                    row,
+                    if row == 0 {
+                        ScrollStrategy::Top
+                    } else {
+                        ScrollStrategy::Nearest
+                    },
+                );
             })
             .ok();
         });
@@ -102,6 +124,7 @@ impl PaletteView {
             input,
             scroll: UniformListScrollHandle::new(),
             selected: 0,
+            moved: false,
             last_query: SharedString::default(),
             shell,
             shell_focus,
@@ -117,6 +140,7 @@ impl PaletteView {
             cx.notify();
         });
         self.selected = 0;
+        self.moved = false;
         self.scroll.scroll_to_item(0, ScrollStrategy::Top);
         cx.notify();
     }
@@ -131,6 +155,7 @@ impl PaletteView {
         } else {
             self.selected.saturating_sub(1)
         };
+        self.moved = true;
         self.scroll
             .scroll_to_item(self.selected, ScrollStrategy::Nearest);
         cx.notify();
@@ -339,6 +364,29 @@ mod tests {
 
     fn first_id(m: &Entity<PaletteModel>, cx: &mut gpui_kit::VisualTestContext) -> String {
         m.read_with(cx, |m, _| m.item(0).id.clone())
+    }
+
+    #[test]
+    fn merging_keeps_the_item_the_user_moved_to() {
+        let mut model = PaletteModel::new(command_items(), &[]);
+        let moved_id = model.item(3).id.clone();
+        let extra = |id: &str| PaletteItem {
+            id: id.to_string(),
+            label: id.to_string(),
+            detail: None,
+            keywords: Vec::new(),
+            group: model.item(0).group,
+            kind: ItemKind::SearchLogs(String::new()),
+        };
+        let more = vec![extra("req:a"), extra("req:b")];
+        model.extend(more, &[]);
+        // The user had moved: the same item stays selected, wherever it ranks now.
+        let row = selection_after_merge(Some(&moved_id), &model);
+        assert_eq!(model.item(row).id, moved_id);
+        // The user had not moved: the top row.
+        assert_eq!(selection_after_merge(None, &model), 0);
+        // The item vanished: the top row.
+        assert_eq!(selection_after_merge(Some("gone"), &model), 0);
     }
 
     #[gpui_kit::test]

@@ -85,6 +85,8 @@ fn strip_key(shell: &MainWindow, cx: &App) -> String {
             session.snapshot().generation,
             session.recording_elapsed(),
             shell.current().range,
+            // The width the strip was last painted at: the layout is bucketed per pixel.
+            shell.strip_bounds().size.width,
         )
     )
 }

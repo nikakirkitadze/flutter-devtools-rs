@@ -169,6 +169,8 @@ impl StartPage {
 
     /// Starts a connection; false when the window has no capture yet.
     fn connect(&mut self, target: Target, pending: Pending, cx: &mut Context<Self>) -> bool {
+        // Any new attempt, from a row, the URL field or a recent URL, ends the last app-row error.
+        self.connect_error = None;
         let session = self.session.read(cx);
         let Some(control) = session.control() else {
             return false;
@@ -915,5 +917,30 @@ mod tests {
             label(cx, "start-connect-error").unwrap(),
             "Not ready to connect yet. Try again in a moment."
         );
+    }
+
+    #[gpui_kit::test]
+    fn a_url_or_recent_connect_clears_the_app_row_error(cx: &mut TestAppContext) {
+        let (shell, cx) = crate::test_support::open_shell(cx);
+        let (_tx, rx) = tokio::sync::watch::channel::<
+            std::sync::Arc<[fdt_vm::discovery::DiscoveredApp]>,
+        >(std::sync::Arc::from(two_apps()));
+        shell.update_in(cx, |s, window, cx| s.set_apps_source(rx, window, cx));
+        cx.run_until_parked();
+        click(cx, "start-app-0");
+        assert!(label(cx, "start-connect-error").is_some());
+        type_url(&shell, cx, "http://127.0.0.1:50300/abc=/");
+        assert!(!crate::test_support::exists(cx, "start-connect-error"));
+        click(cx, "start-app-0");
+        assert!(label(cx, "start-connect-error").is_some());
+        cx.update(|_, cx| {
+            crate::settings::update_settings(cx, |s| {
+                s.recent_urls
+                    .push("ws://127.0.0.1:50300/abc=/ws".to_string());
+            });
+        });
+        cx.run_until_parked();
+        click(cx, "start-recent-0");
+        assert!(!crate::test_support::exists(cx, "start-connect-error"));
     }
 }

@@ -807,6 +807,9 @@ fn tick(driver: Rc<RefCell<Driver>>, window: &mut Window, cx: &mut App) {
         }
         _ => cx.notify(shell.read(cx).logs_view().entity_id()),
     }
+    // Notifying the shell each frame is a cost a real wheel scroll does not have (it notifies only
+    // the scrolled view). That cost is outside the measured draw: it is paid when the frame is
+    // requested, not inside the frame's draw.
     cx.notify(shell.entity_id());
     window.on_next_frame(move |window, cx| tick(driver, window, cx));
 }
