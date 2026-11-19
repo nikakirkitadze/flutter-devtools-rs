@@ -1,10 +1,11 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use fdt_store::clock::{Calibration, RunClock};
+use fdt_store::frames::strip_bars;
 use fdt_store::log_query::{LogFilter, compile_query, filter_logs};
 use fdt_store::net::StatusClass;
 use fdt_store::net_query::{ClassSet, MethodSet, NetFilter, NetTab, filter_requests};
 use fdt_store::run::{AppInfo, Mode};
-use fdt_store::time::SessionTime;
+use fdt_store::time::{SessionTime, TimeRange};
 use fdt_store::{SessionWriter, Snapshot, synth};
 use std::hint::black_box;
 use std::sync::Arc;
@@ -113,5 +114,27 @@ fn net_filter_100k(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, log_search_100k, log_search_1m, net_filter_100k);
+fn strip_bars_72k(c: &mut Criterion) {
+    let mut w = SessionWriter::new(0);
+    let run = start(&mut w);
+    synth::frames(&mut w, run, 72_000, 7, 120);
+    let snap = w.publish();
+    let whole = TimeRange::new(SessionTime(0), snap.latest_time());
+    let sub = TimeRange::new(SessionTime(100_000_000_000), SessionTime(110_000_000_000));
+    let mut g = c.benchmark_group("strip_bars_72k");
+    for (label, range, width) in [("whole_1000", whole, 1_000), ("sub_500", sub, 500)] {
+        g.bench_function(label, |b| {
+            b.iter(|| black_box(strip_bars(&snap.frames, range, width)))
+        });
+    }
+    g.finish();
+}
+
+criterion_group!(
+    benches,
+    log_search_100k,
+    log_search_1m,
+    net_filter_100k,
+    strip_bars_72k
+);
 criterion_main!(benches);

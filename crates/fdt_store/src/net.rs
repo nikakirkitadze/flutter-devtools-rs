@@ -7,8 +7,6 @@ use crate::time::{EntryId, RunId, SessionTime};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-/// Requests (and sockets) per chunk.
-pub const NET_CHUNK: usize = 1024;
 /// A websocket request and its socket must start within this of each other.
 const LINK_WINDOW_NS: u64 = 2_000_000_000;
 
@@ -512,7 +510,7 @@ impl NetStore {
             return;
         };
         let g = Self::gap(r.start, s.start);
-        if *addr != s.address || *port != s.port || g > LINK_WINDOW_NS {
+        if r.id.run != s.id.run || *addr != s.address || *port != s.port || g > LINK_WINDOW_NS {
             return;
         }
         if s.websocket.is_some_and(|w| w.seq as usize != ri) {
@@ -922,6 +920,33 @@ mod tests {
             s.net.request(2).response_body,
             BodyState::Captured(_)
         ));
+    }
+
+    #[test]
+    fn sockets_link_only_within_their_run() {
+        let (mut w, run1) = writer(4);
+        let run2 = RunId(2);
+        let ws = |run, vm: &str| {
+            let mut r = http(run, vm, "http://10.0.0.2:8080/ws", 1_000);
+            r.websocket = true;
+            r.status = Some(101);
+            r.remote = Some(("10.0.0.2".into(), 8080));
+            r
+        };
+        // Socket of run 1, requests of run 2: no link.
+        w.upsert_socket(socket(run1, "s1", "10.0.0.2", 8080, 1_000));
+        let r2 = w.upsert_request(ws(run2, "1")).id;
+        let s = w.publish();
+        assert!(s.net.socket_for(r2).is_none());
+        // A run 1 request takes the run 1 socket, never the run 2 one.
+        let r1 = w.upsert_request(ws(run1, "7")).id;
+        let s = w.publish();
+        assert_eq!(s.net.socket_for(r1).map(|x| x.id.run), Some(run1));
+        // A run 2 socket links to the run 2 request, not the run 1 one.
+        let late = w.upsert_socket(socket(run2, "s2", "10.0.0.2", 8080, 1_100));
+        let s = w.publish();
+        assert_eq!(s.net.socket_for(r2).map(|x| x.id), Some(late));
+        assert_eq!(s.net.socket_for(r1).map(|x| x.id.run), Some(run1));
     }
 
     #[test]

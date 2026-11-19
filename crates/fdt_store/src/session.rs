@@ -1,6 +1,7 @@
 //! The single writer and the immutable snapshots views read.
 
 use crate::clock::RunClock;
+use crate::frames::{FrameInput, FrameStore, FramesSnapshot};
 use crate::logs::{LOG_CHUNK, LogInput, LogStore, LogsSnapshot};
 use crate::net::{
     BodyKind, BodyLimits, BodyState, HttpUpdate, NetSnapshot, NetStore, RequestUpsert, SocketUpdate,
@@ -17,6 +18,7 @@ pub struct Snapshot {
     pub runs: Arc<[RunInfo]>,
     pub logs: LogsSnapshot,
     pub net: NetSnapshot,
+    pub frames: FramesSnapshot,
     latest: SessionTime,
 }
 
@@ -29,6 +31,7 @@ impl Snapshot {
             runs: Arc::from(Vec::new()),
             logs: LogsSnapshot::default(),
             net: NetSnapshot::default(),
+            frames: FramesSnapshot::default(),
             latest: SessionTime(0),
         }
     }
@@ -48,6 +51,7 @@ pub struct SessionWriter {
     runs: Vec<RunInfo>,
     logs: LogStore,
     net: NetStore,
+    frames: FrameStore,
     latest: SessionTime,
     generation: u64,
     dirty: bool,
@@ -72,6 +76,7 @@ impl SessionWriter {
             runs: Vec::new(),
             logs: LogStore::new(chunk),
             net: NetStore::new(chunk),
+            frames: FrameStore::new(chunk),
             latest: SessionTime(0),
             generation: 0,
             dirty: false,
@@ -100,6 +105,16 @@ impl SessionWriter {
         let at = input.time;
         let id = self.logs.push(input);
         self.touch(at);
+        id
+    }
+
+    /// Stores a frame; its bucket in every level of detail is updated too.
+    pub fn push_frame(&mut self, f: FrameInput) -> EntryId {
+        let end = SessionTime(f.start.0.saturating_add(f.elapsed_us as u64 * 1_000));
+        let start = f.start;
+        let id = self.frames.push(f);
+        self.touch(start);
+        self.touch(end);
         id
     }
 
@@ -177,6 +192,7 @@ impl SessionWriter {
                 runs: self.runs.clone().into(),
                 logs: self.logs.snapshot(),
                 net: self.net.snapshot(self.latest),
+                frames: self.frames.snapshot(),
                 latest: self.latest,
             });
         }

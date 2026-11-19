@@ -3,6 +3,7 @@
 
 pub mod chunked;
 pub mod clock;
+pub mod frames;
 pub mod log_query;
 pub mod logs;
 pub mod net;

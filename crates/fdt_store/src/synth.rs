@@ -1,5 +1,6 @@
 //! Deterministic synthetic datasets for tests and benches (no `rand`).
 
+use crate::frames::FrameInput;
 use crate::logs::{LogInput, LogLevel, LogSource};
 use crate::net::HttpUpdate;
 use crate::session::SessionWriter;
@@ -223,6 +224,31 @@ pub fn requests(w: &mut SessionWriter, run: RunId, n: usize, seed: u64) {
             error,
             websocket: false,
             remote: Some(("127.0.0.1".into(), 53452)),
+        });
+    }
+}
+
+/// Appends `n` frames at `1/hz` spacing: 3 % slow (budget to 2x budget) and
+/// 1 % janky (over 2x budget), where budget is `1/hz`.
+pub fn frames(w: &mut SessionWriter, run: RunId, n: usize, seed: u64, hz: u32) {
+    let mut r = Rng(seed.wrapping_mul(0xA24B_AED4_963E_E407) | 1);
+    let hz = hz.max(1) as u64;
+    let budget = (1_000_000 / hz).max(4);
+    for i in 0..n as u64 {
+        let elapsed = match r.below(100) {
+            0 => 2 * budget + 1 + r.below(2 * budget),
+            1..=3 => budget + r.below(budget),
+            _ => budget / 4 + r.below(budget / 2),
+        } as u32;
+        let build = (elapsed as u64 * (30 + r.below(30)) / 100) as u32;
+        w.push_frame(FrameInput {
+            run,
+            number: i,
+            start: SessionTime(i * (1_000_000_000 / hz)),
+            elapsed_us: elapsed,
+            build_us: build,
+            raster_us: elapsed - build,
+            vsync_overhead_us: r.below(300) as u32,
         });
     }
 }
