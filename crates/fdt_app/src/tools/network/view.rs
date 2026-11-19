@@ -8,6 +8,8 @@
 
 use super::details::DetailsState;
 use super::table::NetTable;
+use super::toolbar::{toolbar_build, toolbar_key, toolbar_style};
+use crate::facet::Facet;
 use crate::nav::{EntryId, SessionTime, TimeRange};
 use crate::session_model::SessionModel;
 use crate::shell::strip::session_span;
@@ -24,8 +26,8 @@ use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::table::{DataTable, TableEvent, TableState};
 use gpui_kit::{
     AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable as _,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
-    Subscription, Task, TestSupportExt as _, Window, div,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, ScrollStrategy, SharedString,
+    Styled as _, Subscription, Task, TestSupportExt as _, Window, div,
 };
 use std::sync::Arc;
 
@@ -127,6 +129,8 @@ pub struct NetworkView {
     /// Focus the table the next time it is drawn.
     focus_wanted: bool,
     pub(super) input: Entity<InputState>,
+    /// The toolbar, replayed until what it shows changes. A scroll notifies this view but not it.
+    toolbar: Entity<Facet<NetworkView>>,
     /// The text of the field the filter was last started for.
     query: SharedString,
     /// The recording clock's whole seconds at the last redraw, so pending bars grow.
@@ -174,6 +178,12 @@ impl NetworkView {
                 _ => {}
             },
         );
+        let owner = cx.entity();
+        let toolbar = cx.new(|fcx| {
+            let mut facet = Facet::new(&owner, toolbar_build, toolbar_key, fcx);
+            facet.also_observe(&input, fcx);
+            facet
+        });
         Self {
             session,
             filter: NetFilter::default(),
@@ -194,6 +204,7 @@ impl NetworkView {
             skeleton_task: None,
             focus_wanted: false,
             input,
+            toolbar,
             query: SharedString::default(),
             tick: None,
             _table_sub: table_sub,
@@ -620,9 +631,16 @@ impl NetworkView {
         !self.running && self.applied.is_some_and(|k| k.version == self.version)
     }
 
-    /// Scrolls `row` into view (the benchmark's scripted scroll).
+    /// Scrolls `row` to the top of the table (the benchmark's scripted scroll).
+    ///
+    /// Strict, so a few rows at a time really move the table. The non-strict call keeps a row
+    /// that is already on screen where it is and then jumps a whole page, which is not a scroll.
     pub fn scroll_to_row(&self, row: usize, cx: &mut Context<Self>) {
-        self.table.update(cx, |t, cx| t.scroll_to_row(row, cx));
+        self.table.update(cx, |t, cx| {
+            t.vertical_scroll_handle
+                .scroll_to_item_strict(row, ScrollStrategy::Top);
+            cx.notify();
+        });
     }
 
     /// Sets the filter field and runs the filter, as typing would.
@@ -699,6 +717,7 @@ impl NetworkView {
 
 impl Render for NetworkView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::perf::bump(crate::perf::Counter::NetworkView, 1);
         // The table is not on screen until a filter job has produced rows, so the request waits.
         if self.focus_wanted && !self.filtered.is_empty() {
             self.focus_wanted = false;
@@ -755,7 +774,10 @@ impl Render for NetworkView {
             .flex()
             .flex_col()
             .child(self.render_tabs(cx))
-            .children(self.has_toolbar(cx).then(|| self.render_toolbar(cx)))
+            .children(
+                self.has_toolbar(cx)
+                    .then(|| self.toolbar.clone().cached(toolbar_style())),
+            )
             .child(
                 div()
                     .flex()
@@ -1908,5 +1930,35 @@ mod tests {
             "nothing is growing, so nothing redraws"
         );
         assert!(redraws(cx, true) >= 3, "a pending bar grows each second");
+    }
+
+    #[gpui_kit::test]
+    fn scrolling_the_table_rebuilds_neither_the_toolbar_nor_the_chrome(cx: &mut TestAppContext) {
+        use crate::perf::{Counter, snapshot as renders};
+        let snap = snapshot(|w, run| fdt_store::synth::requests(w, run, 5_000, 7));
+        let (shell, cx) = open_shell_snapshot(cx, snap);
+        cx.simulate_resize(fdt_ui::tokens::layout::WINDOW_MIN);
+        press(cx, "cmd-4", "ctrl-4");
+        cx.run_until_parked();
+        let draw = |cx: &mut VisualTestContext| cx.update(|w, cx| w.draw(cx).clear(cx));
+        for _ in 0..3 {
+            draw(cx);
+        }
+        let view = shell.read_with(cx, |s, _| s.network_view().clone());
+        let before = renders();
+        for i in 1..=6 {
+            view.update(cx, |v, cx| v.scroll_to_row(i * 5, cx));
+            draw(cx);
+        }
+        let after = renders();
+        let delta = |c: Counter| after[c as usize] - before[c as usize];
+        for part in [
+            Counter::NetworkToolbar,
+            Counter::TitleBar,
+            Counter::Sidebar,
+            Counter::Strip,
+        ] {
+            assert_eq!(delta(part), 0, "{} rebuilt while scrolling", part.name());
+        }
     }
 }

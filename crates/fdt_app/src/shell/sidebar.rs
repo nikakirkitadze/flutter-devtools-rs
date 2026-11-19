@@ -152,7 +152,8 @@ impl MainWindow {
         .into_any_element()
     }
 
-    pub(super) fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_sidebar(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        crate::perf::bump(crate::perf::Counter::Sidebar, 1);
         let t = cx.tokens();
         let items: Vec<_> = Tool::ALL[1..]
             .iter()
@@ -214,5 +215,6 @@ impl MainWindow {
                 },
                 cx,
             ))
+            .into_any_element()
     }
 }

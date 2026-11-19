@@ -26,6 +26,7 @@
 use crate::actions::show_tool;
 use crate::app::start_fixed;
 use crate::nav::{Location, Page, Tool};
+use crate::perf::{Counter, N as COUNTERS, snapshot};
 use crate::shell::MainWindow;
 use fdt_capture::ConnStatus;
 use fdt_store::run::{AppInfo, Mode};
@@ -190,6 +191,10 @@ fn median(samples: &[f64]) -> Option<f64> {
 #[derive(Clone, Debug)]
 pub struct Measured {
     pub draw_ms: Vec<f64>,
+    /// Per drawn frame: request layout (render), prepaint and paint, in ms.
+    pub phases_ms: [Vec<f64>; 3],
+    /// Renders per counter over the measured frames.
+    pub renders: Vec<(&'static str, u64)>,
     pub interval_ms: Vec<f64>,
     /// Keystroke to drawn (first results for `logs-search`), or switch to drawn.
     pub latency_ms: Option<Vec<f64>>,
@@ -303,6 +308,19 @@ impl Measured {
                 None => json.push_str(&format!(",\"samples\":{{\"latency\":{}}}", l.len())),
             }
         }
+        json.push_str(&format!(
+            ",\"phases_ms\":{{\"request_layout\":{},\"prepaint\":{},\"paint\":{}}}",
+            pct_json(percentiles(&self.phases_ms[0])),
+            pct_json(percentiles(&self.phases_ms[1])),
+            pct_json(percentiles(&self.phases_ms[2])),
+        ));
+        let draws = self.draw_ms.len().max(1) as f64;
+        let renders: Vec<String> = self
+            .renders
+            .iter()
+            .map(|(name, n)| format!("\"{name}\":{:?}", r3(*n as f64 / draws)))
+            .collect();
+        json.push_str(&format!(",\"renders_per_frame\":{{{}}}", renders.join(",")));
         json.push_str(&format!(
             ",\"budget\":{{{budget}}},\"interval_budget_ms\":{effective:?},\"interval_plan_budget_ms\":{plan:?},\"refresh_ms\":{:?},\"refresh_source\":\"{}\",\"pass\":{pass}}}",
             r3(self.refresh_ms),
@@ -641,6 +659,12 @@ struct Driver {
     window_id: WindowId,
     /// `(draw_start, draw_end)` of each frame drawn while measuring.
     draws: Vec<(Instant, Instant)>,
+    /// The phase split of each frame in `draws`, in ms.
+    phases: Vec<[f64; 3]>,
+    /// Render counters when measuring began.
+    renders_start: Option<[u64; COUNTERS]>,
+    /// Render counters when the last measured frame was recorded.
+    renders_end: [u64; COUNTERS],
     reported_refresh: Option<Duration>,
     /// The script is done; one more frame runs so the last result's draw is recorded.
     finishing: bool,
@@ -658,6 +682,11 @@ impl Driver {
                 }
                 if since.is_some_and(|s| t.draw_start >= s) {
                     self.draws.push((t.draw_start, t.draw_end));
+                    self.phases.push([
+                        ms(t.phases.request_layout),
+                        ms(t.phases.prepaint),
+                        ms(t.phases.paint),
+                    ]);
                 }
             }
         }
@@ -710,6 +739,15 @@ impl Driver {
                 .iter()
                 .map(|(a, b)| ms(b.saturating_duration_since(*a)))
                 .collect(),
+            phases_ms: std::array::from_fn(|i| self.phases.iter().map(|p| p[i]).collect()),
+            renders: Counter::ALL
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let start = self.renders_start.map_or(0, |s| s[i]);
+                    (c.name(), self.renders_end[i].saturating_sub(start))
+                })
+                .collect(),
             interval_ms,
             latency_ms: has_latency.then_some(first_ms),
             latency_frames: has_latency.then_some(first_frames),
@@ -729,7 +767,11 @@ fn tick(driver: Rc<RefCell<Driver>>, window: &mut Window, cx: &mut App) {
             let shell = d.shell.clone();
             d.script.step(&shell, window, cx);
         }
+        if d.renders_start.is_none() && d.script.measuring_since().is_some() {
+            d.renders_start = Some(snapshot());
+        }
         d.collect();
+        d.renders_end = snapshot();
         if let Some(error) = d.script.outcome().error.clone() {
             fail(d.scenario, &error);
         }
@@ -750,7 +792,22 @@ fn tick(driver: Rc<RefCell<Driver>>, window: &mut Window, cx: &mut App) {
         }
         d.finishing = d.script.is_done();
     }
-    window.refresh();
+    // Ask for the next frame the way the app does: notify the view the script is working in, as a
+    // scroll or a keystroke would, and the window's root so a frame is drawn even before that
+    // view is on screen. `window.refresh()` would redraw every view and defeat the views that are
+    // cached between frames, so it would measure a frame the app never draws.
+    let (shell, scenario) = {
+        let d = driver.borrow();
+        (d.shell.clone(), d.scenario)
+    };
+    match scenario {
+        Scenario::ToolSwitch => {}
+        _ if scenario.home() == Tool::Network => {
+            cx.notify(shell.read(cx).network_view().entity_id())
+        }
+        _ => cx.notify(shell.read(cx).logs_view().entity_id()),
+    }
+    cx.notify(shell.entity_id());
     window.on_next_frame(move |window, cx| tick(driver, window, cx));
 }
 
@@ -839,6 +896,9 @@ pub fn run(scenario: Scenario, frames: Option<usize>) -> ExitCode {
                 collector: FrameTimingCollector::new(),
                 window_id: handle.window_id(),
                 draws: Vec::new(),
+                phases: Vec::new(),
+                renders_start: None,
+                renders_end: [0; COUNTERS],
                 reported_refresh: None,
                 finishing: false,
             }));
@@ -917,6 +977,8 @@ mod tests {
     fn base() -> Measured {
         Measured {
             draw_ms: vec![1.0; 100],
+            phases_ms: [vec![], vec![], vec![]],
+            renders: vec![],
             interval_ms: vec![8.3; 100],
             latency_ms: None,
             latency_frames: None,

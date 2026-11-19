@@ -11,8 +11,9 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::skeleton::Skeleton;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::{
-    AnyElement, Context, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, div,
+    AnyElement, App, Context, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
+    SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled as _,
+    TestSupportExt as _, Window, div,
 };
 use std::sync::Arc;
 
@@ -25,8 +26,43 @@ fn level_slug(level: LogLevel) -> &'static str {
     }
 }
 
+pub(super) fn toolbar_build(
+    view: &mut LogsView,
+    _: &mut Window,
+    cx: &mut Context<LogsView>,
+) -> AnyElement {
+    view.render_toolbar(cx)
+}
+
+/// Everything the toolbar reads from the list, as text.
+pub(super) fn toolbar_key(view: &LogsView, cx: &App) -> String {
+    format!(
+        "{:?}",
+        (
+            cx.appearance(),
+            view.counts,
+            view.filter.levels,
+            view.filter.sources,
+            view.regex,
+            &view.search_error,
+            view.searching(),
+            view.match_count(),
+            view.follow_state(),
+            view.show_skeleton,
+        )
+    )
+}
+
+pub(super) fn toolbar_style() -> StyleRefinement {
+    StyleRefinement::default()
+        .w_full()
+        .h(layout::TOOLBAR_HEIGHT)
+        .flex_none()
+}
+
 impl LogsView {
     pub(super) fn render_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
+        crate::perf::bump(crate::perf::Counter::LogsToolbar, 1);
         let t = *cx.tokens();
         let weak = cx.weak_entity();
         let chips = ALL_LEVELS.map(|level| {

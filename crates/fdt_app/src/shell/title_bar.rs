@@ -12,9 +12,9 @@ use fdt_ui::assets::icons;
 use fdt_ui::theme::TokensExt as _;
 use fdt_ui::tokens::{font, layout, radius, row, space};
 use gpui_kit::assets::IconName;
+use gpui_kit::component::Icon;
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Icon, TitleBar};
 use gpui_kit::{
     Action, AnyElement, App, Context, Hsla, InteractiveElement as _, IntoElement, MouseButton,
     ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
@@ -209,11 +209,14 @@ impl MainWindow {
         )
     }
 
-    pub(super) fn render_title_bar(
+    /// What the title bar holds: the history buttons and chips on the left and the palette button
+    /// on the right. The bar's frame (window drag area, controls) is built by `TitleBar` itself.
+    pub(super) fn render_title_content(
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
+        crate::perf::bump(crate::perf::Counter::TitleBar, 1);
         let t = cx.tokens();
         let hint = Kbd::binding_for_action(&OpenPalette, Some(SHELL_CONTEXT), window);
         let back = nav_button(
@@ -254,7 +257,11 @@ impl MainWindow {
             .child(Icon::new(icons::SEARCH).size(layout::ICON_MD))
             .child(div().flex_1().child("Search commands"))
             .children(hint);
-        TitleBar::new()
+        div()
+            .flex()
+            .flex_1()
+            .h_full()
+            .items_center()
             .child(
                 div()
                     .flex()
@@ -267,6 +274,7 @@ impl MainWindow {
             )
             .child(div().flex_1())
             .child(div().pr(space::S12).child(palette))
+            .into_any_element()
     }
 }
 

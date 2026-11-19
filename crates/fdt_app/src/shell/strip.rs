@@ -193,6 +193,7 @@ impl MainWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        crate::perf::bump(crate::perf::Counter::Strip, 1);
         let t = cx.tokens();
         let session = self.session.read(cx);
         let snap = session.snapshot().clone();
@@ -230,6 +231,8 @@ impl MainWindow {
             },
             move |bounds: Bounds<Pixels>, hitbox: Hitbox, window, _cx| {
                 let st = paint_state.clone();
+                // The strip is a view of its own, so a drag redraws only it.
+                let view = window.current_view();
                 let l = &paint_layout;
                 let scale = f32::from(bounds.size.width) / l.width_px.max(1) as f32;
                 let (ox, oy) = (bounds.origin.x, bounds.origin.y);
@@ -304,10 +307,10 @@ impl MainWindow {
                         start_x: e.position.x,
                         x: e.position.x,
                     });
-                    window.refresh();
+                    cx.notify(view);
                 });
                 let state = st.clone();
-                window.on_mouse_event(move |e: &MouseMoveEvent, _, window, _| {
+                window.on_mouse_event(move |e: &MouseMoveEvent, _, _, cx| {
                     let mut s = state.borrow_mut();
                     let Some(d) = s.drag.as_mut() else { return };
                     if e.pressed_button == Some(MouseButton::Left) {
@@ -315,7 +318,7 @@ impl MainWindow {
                     } else {
                         s.drag = None;
                     }
-                    window.refresh();
+                    cx.notify(view);
                 });
                 let state = st;
                 let target = shell;
@@ -323,7 +326,7 @@ impl MainWindow {
                     let Some(d) = state.borrow_mut().drag.take() else {
                         return;
                     };
-                    window.refresh();
+                    cx.notify(view);
                     if f32::from((e.position.x - d.start_x).abs()) < MIN_DRAG_PX {
                         return;
                     }

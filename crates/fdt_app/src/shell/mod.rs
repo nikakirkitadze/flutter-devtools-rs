@@ -2,6 +2,7 @@
 
 mod about;
 mod banner;
+mod chrome;
 mod counts;
 mod settings_page;
 mod shortcuts;
@@ -33,7 +34,7 @@ use fdt_ui::hud::FrameHud;
 use fdt_ui::theme::{self, ThemePreference, TokensExt as _};
 use fdt_ui::tokens::Appearance;
 use fdt_vm::discovery::DiscoveredApp;
-use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::{TitleBar, WindowExt as _};
 use gpui_kit::{
     Action, App, AppContext as _, Context, Div, Entity, FocusHandle, Focusable, Hsla,
     InteractiveElement as _, IntoElement, MouseButton, NavigationDirection, ParentElement as _,
@@ -78,6 +79,8 @@ pub struct MainWindow {
     counts_running: bool,
     counts_task: Option<gpui_kit::Task<()>>,
     strip: StripView,
+    /// The title bar's content, the sidebar and the strip, replayed until their inputs change.
+    chrome: chrome::Parts,
     hud: Entity<FrameHud>,
     focus: FocusHandle,
     palette: Option<Entity<PaletteModel>>,
@@ -161,6 +164,8 @@ impl MainWindow {
                 this.apps_from_host(window, cx);
             })
         });
+        let shell = cx.entity();
+        let chrome = chrome::Parts::new(&shell, cx);
         let mut this = Self {
             history: NavHistory::new(Location::at(Page::Start)),
             counts: [None; 7],
@@ -168,6 +173,7 @@ impl MainWindow {
             counts_running: false,
             counts_task: None,
             strip: StripView::default(),
+            chrome,
             hud,
             focus,
             palette: None,
@@ -533,8 +539,16 @@ pub fn format_count(n: u64) -> String {
     }
 }
 
+impl MainWindow {
+    /// The session strip, cached.
+    fn strip_view(&self) -> impl IntoElement {
+        self.chrome.strip.clone().cached(chrome::strip_style())
+    }
+}
+
 impl Render for MainWindow {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::perf::bump(crate::perf::Counter::MainWindow, 1);
         let t = cx.tokens();
         let page: gpui_kit::AnyElement = match self.current().page {
             Page::Start => match &self.start {
@@ -542,16 +556,16 @@ impl Render for MainWindow {
                 None => tool_page::render_start(cx).into_any_element(),
             },
             Page::Tool(Tool::Logs) if self.logs_routed(cx) => {
-                let strip = self.render_strip(window, cx);
+                let strip = self.strip_view();
                 tool_page::render_with(Tool::Logs, strip, self.logs.clone()).into_any_element()
             }
             Page::Tool(Tool::Network) if self.network_routed(cx) => {
-                let strip = self.render_strip(window, cx);
+                let strip = self.strip_view();
                 tool_page::render_with(Tool::Network, strip, self.network.clone())
                     .into_any_element()
             }
             Page::Tool(tool) => {
-                let strip = self.render_strip(window, cx);
+                let strip = self.strip_view();
                 tool_page::render(tool, strip, cx).into_any_element()
             }
             Page::Settings => {
@@ -676,7 +690,7 @@ impl Render for MainWindow {
                 nav(NavigationDirection::Forward),
                 cx.listener(|this, _, w, cx| this.go_forward(w, cx)),
             )
-            .child(self.render_title_bar(window, cx))
+            .child(TitleBar::new().child(self.chrome.title.clone().cached(chrome::title_style())))
             .children(self.render_banner(cx))
             .child(
                 div()
@@ -684,7 +698,7 @@ impl Render for MainWindow {
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .child(self.render_sidebar(cx))
+                    .child(self.chrome.sidebar.clone().cached(chrome::sidebar_style()))
                     .child(
                         div()
                             .id("page-area")
@@ -974,5 +988,97 @@ mod tests {
         press(cx, "cmd-,", "ctrl-,");
         assert!(exists(cx, "settings-page"));
         assert!(exists(cx, "settings-scroll"));
+    }
+
+    /// Draws one frame the way the platform does: no forced refresh, so a view that was not
+    /// notified reuses its previous frame.
+    fn draw_frame(cx: &mut gpui_kit::VisualTestContext) {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    #[gpui_kit::test]
+    fn scrolling_the_logs_list_renders_only_the_list(cx: &mut TestAppContext) {
+        use crate::perf::{Counter, snapshot};
+        let snap = crate::test_support::snapshot(|w, run| fdt_store::synth::logs(w, run, 5_000, 7));
+        let (shell, cx) = crate::test_support::open_shell_snapshot(cx, snap);
+        cx.simulate_resize(fdt_ui::tokens::layout::WINDOW_MIN);
+        press(cx, "cmd-5", "ctrl-5");
+        cx.run_until_parked();
+        for _ in 0..3 {
+            draw_frame(cx);
+        }
+        let logs = shell.read_with(cx, |s, _| s.logs_view().clone());
+        let before = snapshot();
+        for i in 1..=8 {
+            // What a wheel event does: moves the list and notifies the view that owns it.
+            cx.update(|_, cx| {
+                logs.read(cx).scroll_to_row(i * 3);
+                cx.notify(logs.entity_id());
+            });
+            draw_frame(cx);
+        }
+        let after = snapshot();
+        let renders = |c: Counter| after[c as usize] - before[c as usize];
+        assert!(
+            renders(Counter::LogsView) >= 8,
+            "the list renders on scroll"
+        );
+        for chrome in [
+            Counter::TitleBar,
+            Counter::Sidebar,
+            Counter::Strip,
+            Counter::LogsToolbar,
+        ] {
+            assert_eq!(
+                renders(chrome),
+                0,
+                "{} rebuilt while scrolling",
+                chrome.name()
+            );
+        }
+    }
+
+    #[gpui_kit::test]
+    fn chrome_is_rebuilt_when_what_it_shows_changes(cx: &mut TestAppContext) {
+        use crate::nav::{SessionTime, TimeRange};
+        use crate::perf::{Counter, snapshot};
+        let snap = crate::test_support::snapshot(|w, run| fdt_store::synth::logs(w, run, 2_000, 3));
+        let (shell, cx) = crate::test_support::open_shell_snapshot(cx, snap);
+        cx.simulate_resize(fdt_ui::tokens::layout::WINDOW_MIN);
+        press(cx, "cmd-5", "ctrl-5");
+        cx.run_until_parked();
+        for _ in 0..3 {
+            draw_frame(cx);
+        }
+        let renders = |cx: &mut gpui_kit::VisualTestContext,
+                       change: &dyn Fn(&mut gpui_kit::VisualTestContext)| {
+            let before = snapshot();
+            change(cx);
+            for _ in 0..2 {
+                draw_frame(cx);
+            }
+            let after = snapshot();
+            move |c: Counter| after[c as usize] - before[c as usize]
+        };
+        // Another tool: the sidebar marks it; Back was already available, so the title bar is
+        // the same.
+        let changed = renders(cx, &|cx| press(cx, "cmd-6", "ctrl-6"));
+        assert!(changed(Counter::Sidebar) >= 1, "the active item moved");
+        assert_eq!(changed(Counter::TitleBar), 0, "no title bar input changed");
+        // Back to Logs, then a range: the strip shows it, the title bar has a chip, the sidebar
+        // is the same.
+        press(cx, "cmd-5", "ctrl-5");
+        for _ in 0..2 {
+            draw_frame(cx);
+        }
+        let range = TimeRange::new(SessionTime(100_000_000), SessionTime(900_000_000));
+        let changed = renders(cx, &|cx| {
+            let mut loc = shell.read_with(cx, |s, _| s.current().clone());
+            loc.range = Some(range);
+            shell.update_in(cx, |s, w, cx| s.navigate(loc, w, cx));
+        });
+        assert!(changed(Counter::Strip) >= 1, "the strip shows the range");
+        assert!(changed(Counter::TitleBar) >= 1, "the range chip appeared");
+        assert_eq!(changed(Counter::Sidebar), 0, "no sidebar input changed");
     }
 }

@@ -6,10 +6,12 @@
 //! it finishes.
 
 use super::model::{Follow, RowMap, RowRef, display_line, short_query_error};
+use super::toolbar::{toolbar_build, toolbar_key, toolbar_style};
 use crate::actions::{
     Collapse, Expand, FollowLatest, GoToFirst, OpenDetails, SelectNext, SelectPrevious,
     ToggleExpand,
 };
+use crate::facet::Facet;
 use crate::keymap::LOGS_LIST_CONTEXT;
 use crate::nav::{EntryId, TimeRange};
 use crate::session_model::SessionModel;
@@ -186,6 +188,8 @@ pub struct LogsView {
     focus_wanted: bool,
     /// The search field.
     pub(super) search: Entity<InputState>,
+    /// The toolbar, replayed until what it shows changes. A scroll notifies this view but not it.
+    toolbar: Entity<Facet<LogsView>>,
     /// The text of the field the filter was last started for (or tried to).
     query: SharedString,
     pub(super) regex: bool,
@@ -225,6 +229,12 @@ impl LogsView {
             },
         );
         let snap = session.read(cx).snapshot().clone();
+        let owner = cx.entity();
+        let toolbar = cx.new(|fcx| {
+            let mut facet = Facet::new(&owner, toolbar_build, toolbar_key, fcx);
+            facet.also_observe(&search, fcx);
+            facet
+        });
         let mut this = Self {
             session,
             filter: LogFilter::default(),
@@ -245,6 +255,7 @@ impl LogsView {
             rendered: 0..0,
             focus_wanted: false,
             search,
+            toolbar,
             query: SharedString::default(),
             regex: false,
             applied_query: None,
@@ -850,8 +861,11 @@ impl LogsView {
     }
 
     /// Scrolls `row` to the top of the list (the benchmark's scripted scroll).
+    ///
+    /// Strict, so a few rows at a time really move the list. The non-strict call keeps a row
+    /// that is already on screen where it is and then jumps a whole page, which is not a scroll.
     pub fn scroll_to_row(&self, row: usize) {
-        self.scroll.scroll_to_item(row, ScrollStrategy::Top);
+        self.scroll.scroll_to_item_strict(row, ScrollStrategy::Top);
     }
 
     #[cfg(test)]
@@ -898,6 +912,7 @@ impl LogsView {
         ITEMS.with(|c| c.set(c.get() + range.len()));
         let count = self.rows.row_count();
         let range = range.start.min(count)..range.end.min(count);
+        crate::perf::bump(crate::perf::Counter::LogsRows, range.len() as u64);
         self.rendered = range.clone();
         let t = *cx.tokens();
         range.map(|r| self.render_row(r, &t, cx)).collect()
@@ -1220,6 +1235,7 @@ impl<E: gpui_kit::Styled> RowTint for E {
 
 impl Render for LogsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::perf::bump(crate::perf::Counter::LogsView, 1);
         if std::mem::take(&mut self.focus_wanted)
             && !window.context_stack().iter().any(|c| c.contains("Input"))
         {
@@ -1261,7 +1277,7 @@ impl Render for LogsView {
             .size_full()
             .flex()
             .flex_col()
-            .child(self.render_toolbar(cx))
+            .child(self.toolbar.clone().cached(toolbar_style()))
             .child(
                 div()
                     .flex()
@@ -2292,5 +2308,40 @@ mod tests {
             Some("Search is limited to 1,000 characters.")
         );
         assert_eq!(view.read_with(cx, |v, _| v.filtered_len()), 40);
+    }
+
+    #[gpui_kit::test]
+    fn toolbar_is_rebuilt_when_a_filter_changes_but_not_by_scrolling(cx: &mut TestAppContext) {
+        use crate::perf::{Counter, count};
+        let snap = snapshot(|w, run| fdt_store::synth::logs(w, run, 5_000, 7));
+        let (shell, cx) = open_shell_snapshot(cx, snap);
+        cx.simulate_resize(fdt_ui::tokens::layout::WINDOW_MIN);
+        press(cx, "cmd-5", "ctrl-5");
+        cx.run_until_parked();
+        let draw = |cx: &mut VisualTestContext| cx.update(|w, cx| w.draw(cx).clear(cx));
+        for _ in 0..3 {
+            draw(cx);
+        }
+        let view = view_of(&shell, cx);
+        let before = count(Counter::LogsToolbar);
+        for i in 1..=4 {
+            cx.update(|_, cx| {
+                view.read(cx).scroll_to_row(i * 7);
+                cx.notify(view.entity_id());
+            });
+            draw(cx);
+        }
+        assert_eq!(
+            count(Counter::LogsToolbar),
+            before,
+            "scrolling rebuilt the toolbar"
+        );
+        view.update(cx, |v, cx| v.level_clicked(LogLevel::Error, cx));
+        cx.run_until_parked();
+        draw(cx);
+        assert!(
+            count(Counter::LogsToolbar) > before,
+            "the level chips changed"
+        );
     }
 }
