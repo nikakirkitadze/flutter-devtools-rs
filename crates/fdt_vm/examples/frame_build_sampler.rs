@@ -77,13 +77,14 @@ async fn main() {
     builds.sort_unstable();
     let mean = builds.iter().sum::<i64>() as f64 / builds.len() as f64;
     println!(
-        "frames={} first_number={} last_number={} seconds={:.1} build_us median={} mean={mean:.1} p90={} min={} max={}",
+        "frames={} first_number={} last_number={} seconds={:.1} build_us median={} mean={mean:.1} p90={} p99={} min={} max={}",
         builds.len(),
         numbers[0],
         numbers[numbers.len() - 1],
         started.elapsed().as_secs_f64(),
         percentile(&builds, 0.5),
         percentile(&builds, 0.9),
+        percentile(&builds, 0.99),
         builds[0],
         builds[builds.len() - 1],
     );

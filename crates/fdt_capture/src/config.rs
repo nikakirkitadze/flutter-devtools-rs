@@ -11,7 +11,9 @@ pub struct CaptureConfig {
     pub timeline_poll: Duration,
     /// One `getVMTimeline` call gives up after this long.
     pub timeline_call_timeout: Duration,
-    /// How often CPU samples are fetched while frames are being drawn.
+    /// How often CPU samples are fetched while frames are being drawn. 15 s, not 5 s: each fetch
+    /// can cost the app one frame of 80 to 110 ms (M3 verification, `docs/milestones/m3-review.md`),
+    /// and the VM keeps about 40 s of samples, so 15 s still leaves a margin.
     pub cpu_poll: Duration,
     /// One `getPerfettoCpuSamples` call gives up after this long.
     pub cpu_call_timeout: Duration,
@@ -44,7 +46,7 @@ impl Default for CaptureConfig {
             socket_poll: Duration::from_secs(2),
             timeline_poll: Duration::from_millis(500),
             timeline_call_timeout: Duration::from_secs(5),
-            cpu_poll: Duration::from_secs(5),
+            cpu_poll: Duration::from_secs(15),
             cpu_call_timeout: Duration::from_secs(5),
             refresh_timeout: Duration::from_secs(1),
             body_limits: BodyLimits::default(),
