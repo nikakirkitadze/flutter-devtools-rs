@@ -16,7 +16,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use fdt_analysis::explain::{Cause, Explanation, explain};
+use fdt_analysis::explain::{Cause, CpuState, Explanation, explain};
 use fdt_analysis::rebuilds::frame_rebuilds;
 use fdt_capture::{Capture, CaptureConfig, CaptureRuntime, ConnStatus, Target};
 use fdt_store::Snapshot;
@@ -125,7 +125,7 @@ fn with_phases(s: &Snapshot, from: usize) -> usize {
 }
 
 /// Observes for `window`, fetching CPU samples each round, then explains every frame `pick`
-/// returns from `from` on. Requires at least 5 such frames and at least 80 % of them accepted
+/// returns from `from` on. Requires at least 5 judged frames (with `covered_only`, only those with covering CPU samples) and at least 80 % of them accepted
 /// by `ok`. Prints the fraction and the slowest accepted frame's sentence.
 #[allow(clippy::too_many_arguments)]
 async fn attributed(
@@ -136,6 +136,7 @@ async fn attributed(
     what: &str,
     window: Duration,
     pick: impl Fn(&Snapshot, usize) -> Vec<usize>,
+    covered_only: bool,
     ok: impl Fn(&Explanation) -> bool,
 ) -> String {
     let end = Instant::now() + window;
@@ -150,36 +151,40 @@ async fn attributed(
     cap.fetch_cpu_samples();
     sleep(Duration::from_millis(1000)).await;
     let snap = cap.snapshots().borrow().clone();
-    let frames = pick(&snap, from);
-    let mut good = 0;
+    let candidates = pick(&snap, from);
+    let (mut judged, mut good) = (0, 0);
     let mut sentence = None;
-    let mut wrong = Vec::new();
-    for &seq in &frames {
+    let mut misses: std::collections::BTreeMap<String, usize> = Default::default();
+    for &seq in &candidates {
         let e = explain(&snap, seq);
+        // Frames without covering CPU samples cannot be attributed from samples.
+        if covered_only && e.cpu != CpuState::Covered {
+            continue;
+        }
+        judged += 1;
         if ok(&e) {
             good += 1;
             sentence.get_or_insert(e.sentence);
-        } else if wrong.len() < 3 {
-            wrong.push(format!("frame {seq}: {}", e.sentence));
+        } else {
+            let kind = match &e.cause {
+                Cause::HotFunction { function, .. } => format!("HotFunction({function})"),
+                c => format!("{c:?}").chars().take(40).collect(),
+            };
+            *misses.entry(format!("{kind} cpu={:?}", e.cpu)).or_default() += 1;
         }
     }
     println!(
-        "{what}: {good}/{} frames attributed correctly ({:.0}%); {}",
-        frames.len(),
-        100.0 * good as f64 / frames.len().max(1) as f64,
+        "{what}: covered {judged} of {} candidates, attributed {good} of {judged} ({:.0}%); misses {misses:?}; {}",
+        candidates.len(),
+        100.0 * good as f64 / judged.max(1) as f64,
         sentence.as_deref().unwrap_or("-")
     );
+    assert!(judged >= 5, "{what}: only {judged} judged frames");
     assert!(
-        frames.len() >= 5,
-        "{what}: only {} candidate frames",
-        frames.len()
+        good * 5 >= judged * 4,
+        "{what}: {good}/{judged} attributed; misses {misses:?}"
     );
-    assert!(
-        good * 5 >= frames.len() * 4,
-        "{what}: {good}/{} attributed; wrong e.g. {wrong:?}",
-        frames.len()
-    );
-    format!("{good}/{}", frames.len())
+    format!("{good}/{judged}")
 }
 
 fn frames_len(cap: &Capture) -> usize {
@@ -220,6 +225,7 @@ async fn perf_checks(cap: &Capture, vm: &VmService, iso: &str) {
         "jank (cpu)",
         Duration::from_secs(3),
         build_janky,
+        true,
         |e| matches!(&e.cause, Cause::HotFunction { function, .. } if function.contains("_HeavyBuildPanelState.build")),
     )
     .await;
@@ -236,6 +242,7 @@ async fn perf_checks(cap: &Capture, vm: &VmService, iso: &str) {
         "jank (tracing)",
         Duration::from_secs(3),
         build_janky,
+        false,
         |e| matches!(&e.cause, Cause::WidgetBuild { widget, .. } if &**widget == "HeavyBuildPanel"),
     )
     .await;
@@ -265,6 +272,7 @@ async fn perf_checks(cap: &Capture, vm: &VmService, iso: &str) {
         "raster",
         Duration::from_secs(3),
         raster_janky,
+        false,
         |e| matches!(e.cause, Cause::Raster { save_layers } if save_layers >= 10),
     )
     .await;
