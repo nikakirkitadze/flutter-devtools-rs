@@ -21,11 +21,13 @@ pub struct AppInfo {
     pub pid: Option<u32>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RunInfo {
     pub id: RunId,
     pub app: AppInfo,
     pub started: SessionTime,
     pub ended: Option<SessionTime>,
     pub clock: RunClock,
+    /// The display's refresh rate, once known.
+    pub refresh_hz: Option<f32>,
 }

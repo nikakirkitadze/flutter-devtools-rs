@@ -90,14 +90,14 @@ pub fn strip_layout(snap: &Snapshot, span: TimeRange, width_px: usize) -> StripL
         .map(|b| {
             let x = x_of(b.start);
             let width = (x_of(b.end) - x).max(1.0);
-            let kind = if b.max_elapsed_us <= BUDGET_US {
+            let kind = if b.max_us <= BUDGET_US {
                 BarKind::Ok
-            } else if b.max_elapsed_us <= JANK_US {
+            } else if b.max_us <= JANK_US {
                 BarKind::Slow
             } else {
                 BarKind::Janky
             };
-            let h = (b.max_elapsed_us as f32 / JANK_US as f32).min(1.0);
+            let h = (b.max_us as f32 / JANK_US as f32).min(1.0);
             (x, width, h, kind)
         })
         .collect();
@@ -415,7 +415,7 @@ mod tests {
             number: n,
             start: SessionTime(start_ms * MS),
             elapsed_us,
-            build_us: elapsed_us / 2,
+            build_us: elapsed_us,
             raster_us: elapsed_us / 2,
             vsync_overhead_us: 0,
         }

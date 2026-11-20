@@ -1,6 +1,6 @@
 //! Deterministic synthetic datasets for tests and benches (no `rand`).
 
-use crate::frames::FrameInput;
+use crate::frames::{FrameInput, RasterPhase, UiPhases};
 use crate::logs::{LogInput, LogLevel, LogSource};
 use crate::net::HttpUpdate;
 use crate::session::SessionWriter;
@@ -241,15 +241,42 @@ pub fn frames(w: &mut SessionWriter, run: RunId, n: usize, seed: u64, hz: u32) {
             _ => budget / 4 + r.below(budget / 2),
         } as u32;
         let build = (elapsed as u64 * (30 + r.below(30)) / 100) as u32;
-        w.push_frame(FrameInput {
+        let start = SessionTime(i * (1_000_000_000 / hz));
+        let stored = w.push_frame(FrameInput {
             run,
             number: i,
-            start: SessionTime(i * (1_000_000_000 / hz)),
+            start,
             elapsed_us: elapsed,
             build_us: build,
             raster_us: elapsed - build,
             vsync_overhead_us: r.below(300) as u32,
         });
+        if stored.is_some() {
+            let part = |pct: u32| build * pct / 100;
+            let (layout, paint, composite, finalize) = (part(10), part(15), part(10), part(5));
+            w.set_frame_ui(
+                run,
+                i,
+                UiPhases {
+                    begin: start,
+                    ui_us: build,
+                    build_us: build - layout - paint - composite - finalize,
+                    layout_us: layout,
+                    paint_us: paint,
+                    composite_us: composite,
+                    finalize_us: finalize,
+                    widgets_built: None,
+                },
+            );
+            w.set_frame_raster(
+                run,
+                i,
+                RasterPhase {
+                    start: SessionTime(start.0 + u64::from(build) * 1_000),
+                    raster_us: elapsed - build,
+                },
+            );
+        }
     }
 }
 

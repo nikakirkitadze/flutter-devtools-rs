@@ -1,7 +1,9 @@
 //! The single writer and the immutable snapshots views read.
 
 use crate::clock::RunClock;
-use crate::frames::{FrameInput, FrameStore, FramesSnapshot};
+use crate::frames::{
+    DEFAULT_BUDGET_US, FrameInput, FrameStore, FramesSnapshot, RasterPhase, UiPhases, budget_us,
+};
 use crate::logs::{LOG_CHUNK, LogInput, LogStore, LogsSnapshot};
 use crate::net::{
     BodyKind, BodyLimits, BodyState, HttpUpdate, NetSnapshot, NetStore, RequestUpsert, SocketUpdate,
@@ -42,6 +44,19 @@ impl Snapshot {
 
     pub fn run(&self, id: RunId) -> Option<&RunInfo> {
         self.runs.iter().find(|r| r.id == id)
+    }
+
+    /// The frame budget of a run; the default for an unknown run.
+    pub fn frame_budget_us(&self, run: RunId) -> u32 {
+        self.run(run)
+            .map_or(DEFAULT_BUDGET_US, |r| budget_us(r.refresh_hz))
+    }
+
+    /// The last run's frame budget, or the default with no runs.
+    pub fn latest_budget_us(&self) -> u32 {
+        self.runs
+            .last()
+            .map_or(DEFAULT_BUDGET_US, |r| budget_us(r.refresh_hz))
     }
 
     /// The latest stored event time or run boundary.
@@ -107,6 +122,7 @@ impl SessionWriter {
             started: at,
             ended: None,
             clock,
+            refresh_hz: None,
         });
         self.touch(at);
         id
@@ -119,14 +135,36 @@ impl SessionWriter {
         id
     }
 
-    /// Stores a frame; its bucket in every level of detail is updated too.
-    pub fn push_frame(&mut self, f: FrameInput) -> EntryId {
-        let end = SessionTime(f.start.0.saturating_add(f.elapsed_us as u64 * 1_000));
+    /// Stores a frame; its bucket in every level of detail is updated too. Returns `None`,
+    /// storing nothing, when the frame does not start after the run's last stored frame.
+    pub fn push_frame(&mut self, f: FrameInput) -> Option<EntryId> {
+        let end = SessionTime(f.start.0.saturating_add(u64::from(f.elapsed_us) * 1_000));
         let start = f.start;
-        let id = self.frames.push(f);
+        let id = self.frames.push(f)?;
         self.touch(start);
         self.touch(end);
-        id
+        Some(id)
+    }
+
+    /// Sets a frame's UI phases, or parks them until the frame arrives.
+    pub fn set_frame_ui(&mut self, run: RunId, number: u64, ui: UiPhases) {
+        self.frames.set_ui(run, number, ui);
+        self.dirty = true;
+    }
+
+    /// Sets a frame's raster phase, or parks it until the frame arrives.
+    pub fn set_frame_raster(&mut self, run: RunId, number: u64, raster: RasterPhase) {
+        self.frames.set_raster(run, number, raster);
+        self.dirty = true;
+    }
+
+    /// Records the display's refresh rate; the run's slow-frame index is rebuilt.
+    pub fn set_refresh_rate(&mut self, run: RunId, hz: f32) {
+        if let Some(r) = self.runs.iter_mut().find(|r| r.id == run) {
+            r.refresh_hz = Some(hz);
+            self.frames.set_budget(run, budget_us(Some(hz)));
+            self.dirty = true;
+        }
     }
 
     /// Inserts or updates a request, keyed by `(run, isolate, vm_id)`.
