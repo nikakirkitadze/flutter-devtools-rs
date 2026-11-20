@@ -101,6 +101,23 @@ impl FlameData {
         }
     }
 
+    /// How many rows deep the deepest stack is.
+    pub fn depth_count(&self) -> usize {
+        self.by_depth.len()
+    }
+
+    /// The span with this depth, start and function, if the data has one. Spans of a depth are
+    /// sorted by start, so this is a binary search.
+    pub fn find(&self, depth: u16, start: u64, function: FunctionId) -> Option<usize> {
+        let row = self.by_depth.get(depth as usize)?;
+        let at = row.partition_point(|&i| self.spans[i as usize].start.0 < start);
+        row[at..]
+            .iter()
+            .map(|&i| i as usize)
+            .take_while(|&i| self.spans[i].start.0 == start)
+            .find(|&i| self.spans[i].function == function)
+    }
+
     /// The span at `depth` that holds time `t_ns`.
     pub fn span_at(&self, depth: usize, t_ns: u64) -> Option<usize> {
         let row = self.by_depth.get(depth)?;
@@ -131,7 +148,8 @@ pub struct FlameLabel {
     pub span: u32,
 }
 
-/// Lays `spans` (sorted by start) out in `width` pixels for `viewport`, `rows` rows deep.
+/// Lays `spans` (sorted by start) out in `width` pixels for `viewport`: `rows` rows, from depth
+/// `first_row`.
 ///
 /// A span narrower than a pixel shares its pixel column with its neighbours at the same depth, so
 /// there are at most `width` boxes a row, and never more than `CANVAS_MAX_QUADS` in all. Labels
@@ -142,6 +160,7 @@ pub fn flame_layout(
     viewport: Viewport,
     width: f32,
     rows: usize,
+    first_row: usize,
 ) -> (Vec<FlameQuad>, Vec<FlameLabel>) {
     let mut quads = Vec::new();
     let mut labels = Vec::new();
@@ -158,10 +177,12 @@ pub fn flame_layout(
         if s.start.0 > end_ns {
             break;
         }
-        let depth = s.depth as usize;
-        if depth >= rows {
+        let Some(depth) = (s.depth as usize)
+            .checked_sub(first_row)
+            .filter(|&d| d < rows)
+        else {
             continue;
-        }
+        };
         let x0 = viewport.x_of(s.start.0, width);
         let x1 = viewport.x_of(s.end.0, width);
         if x1 < 0.0 || x0 > width {
@@ -228,6 +249,12 @@ pub struct FlameChart {
     /// Whether the view fits the data, so new data refits it.
     fitted: bool,
     selected: Option<usize>,
+    /// What the selection is, so it can be found again in new data.
+    selected_key: Option<(u16, u64, FunctionId)>,
+    /// The first row shown, when the stacks are deeper than the canvas.
+    row_offset: usize,
+    /// Scrolling that has not yet added up to a whole row.
+    row_rem: f32,
     hover: Option<usize>,
     /// The canvas size at its last paint.
     size: Rc<Cell<(f32, f32)>>,
@@ -244,6 +271,9 @@ impl FlameChart {
             viewport: Viewport::fit(0, 0),
             fitted: true,
             selected: None,
+            selected_key: None,
+            row_offset: 0,
+            row_rem: 0.0,
             hover: None,
             size: Rc::new(Cell::new((FIRST_WIDTH_PX, FIRST_HEIGHT_PX))),
             focus: cx.focus_handle(),
@@ -275,8 +305,19 @@ impl FlameChart {
         if refit || self.fitted {
             self.fit();
         }
-        self.selected = self.selected.filter(|&i| i < self.data.spans.len());
+        // The selection is a span of the old data: find the same call again, or drop it.
+        let had = self.selected_key.is_some();
+        self.selected = self
+            .selected_key
+            .and_then(|(d, start, f)| self.data.find(d, start, f));
+        if self.selected.is_none() {
+            self.selected_key = None;
+        }
+        self.row_offset = self.row_offset.min(self.max_row_offset());
         self.hover = None;
+        if had {
+            cx.emit(FlameEvent::Select(self.selected));
+        }
         cx.notify();
     }
 
@@ -288,6 +329,8 @@ impl FlameChart {
 
     pub fn zoom_to_fit(&mut self, cx: &mut Context<Self>) {
         self.fit();
+        self.row_offset = 0;
+        self.row_rem = 0.0;
         cx.notify();
     }
 
@@ -306,6 +349,35 @@ impl FlameChart {
         cx.notify();
     }
 
+    /// How many rows fit in the canvas.
+    fn visible_rows(&self) -> usize {
+        (self.size.get().1 / f32::from(layout::FLAME_ROW)).floor() as usize
+    }
+
+    fn max_row_offset(&self) -> usize {
+        self.data
+            .depth_count()
+            .saturating_sub(self.visible_rows().max(1))
+    }
+
+    /// A vertical scroll of `px` pixels: moves the rows when the stacks are deeper than the
+    /// canvas (positive shows deeper rows), else pans time.
+    pub fn scroll_y(&mut self, px: f32, cx: &mut Context<Self>) {
+        let max = self.max_row_offset();
+        if max == 0 {
+            self.pan_px(px, cx);
+            return;
+        }
+        let rows = px / f32::from(layout::FLAME_ROW) + self.row_rem;
+        let whole = rows.trunc();
+        self.row_rem = rows - whole;
+        let target = (self.row_offset as f32 + whole).clamp(0.0, max as f32) as usize;
+        if target != self.row_offset {
+            self.row_offset = target;
+            cx.notify();
+        }
+    }
+
     fn zoom_key(&mut self, factor: f32, cx: &mut Context<Self>) {
         let half = self.size.get().0 / 2.0;
         self.zoom_about(half, factor, cx);
@@ -317,7 +389,7 @@ impl FlameChart {
         if x < 0.0 || y < 0.0 || x > width {
             return None;
         }
-        let depth = (y / f32::from(layout::FLAME_ROW)).floor() as usize;
+        let depth = (y / f32::from(layout::FLAME_ROW)).floor() as usize + self.row_offset;
         self.data.span_at(depth, self.viewport.time_at(x, width))
     }
 
@@ -333,6 +405,10 @@ impl FlameChart {
         let span = self.span_at(x, y);
         if span != self.selected {
             self.selected = span;
+            self.selected_key = span.map(|i| {
+                let s = &self.data.spans[i];
+                (s.depth, s.start.0, s.function)
+            });
             cx.notify();
         }
         cx.emit(FlameEvent::Select(span));
@@ -344,7 +420,7 @@ impl Render for FlameChart {
         let t = *cx.tokens();
         let view = cx.entity();
         let (data, snap) = (self.data.clone(), self.snap.clone());
-        let (viewport, selected) = (self.viewport, self.selected);
+        let (viewport, selected, first_row) = (self.viewport, self.selected, self.row_offset);
         let size_cell = self.size.clone();
         let (accent, muted, faint, ink, border) =
             (t.accent, t.text_muted, t.text_faint, t.bg, t.text);
@@ -364,7 +440,8 @@ impl Render for FlameChart {
                     (f32::from(bounds.size.height) / f32::from(layout::FLAME_ROW)).floor() as usize;
                 let hue =
                     |f: FunctionId| data.hues.get(f.0 as usize).copied().unwrap_or(Hue::Native);
-                let (boxes, labels) = flame_layout(&data.spans, &hue, viewport, width, rows);
+                let (boxes, labels) =
+                    flame_layout(&data.spans, &hue, viewport, width, rows, first_row);
                 let colour = |h: Hue| match h {
                     Hue::User => accent,
                     Hue::Dart => muted,
@@ -448,8 +525,9 @@ impl Render for FlameChart {
                 zoom_pan_listeners(window, &hitbox, row::TABLE, move |action, _, cx| {
                     v.update(cx, |this, cx| match action {
                         ZoomPan::Zoom { x, factor } => this.zoom_about(f32::from(x), factor, cx),
-                        // There is nothing to scroll vertically, so both axes pan in time.
-                        ZoomPan::PanX(d) | ZoomPan::PanY(d) => this.pan_px(f32::from(d), cx),
+                        ZoomPan::PanX(d) => this.pan_px(f32::from(d), cx),
+                        // Deep stacks scroll their rows; shallow ones have nothing to scroll.
+                        ZoomPan::PanY(d) => this.scroll_y(f32::from(d), cx),
                     });
                 });
             },
@@ -502,7 +580,7 @@ mod tests {
         }
         let end = 120_000 * 10;
         let vp = Viewport::fit(0, end * 1_000);
-        let (quads, labels) = flame_layout(&spans, &hues, vp, 1400.0, 60);
+        let (quads, labels) = flame_layout(&spans, &hues, vp, 1400.0, 60, 0);
         assert!(quads.len() <= CANVAS_MAX_QUADS, "{} quads", quads.len());
         assert!(!quads.is_empty());
         assert!(labels.len() <= CANVAS_MAX_LABELS);
@@ -518,7 +596,7 @@ mod tests {
             span(0, 500, 1_000, 3),
         ];
         let vp = Viewport::fit(0, 1_000_000);
-        let (quads, labels) = flame_layout(&spans, &hues, vp, 1000.0, 5);
+        let (quads, labels) = flame_layout(&spans, &hues, vp, 1000.0, 5, 0);
         assert_eq!(quads.len(), 3);
         // Only the 500 px boxes have room for a label.
         assert_eq!(
@@ -530,12 +608,12 @@ mod tests {
             start_ns: 750_000,
             span_ns: 500_000,
         };
-        let (quads, _) = flame_layout(&spans, &hues, vp, 1000.0, 5);
+        let (quads, _) = flame_layout(&spans, &hues, vp, 1000.0, 5, 0);
         assert_eq!(quads.len(), 1);
         assert_eq!(quads[0].span, 2);
         assert!(quads[0].x >= 0.0 && quads[0].x + quads[0].w <= 1000.0);
         // Rows deeper than the canvas are not drawn.
-        let (quads, _) = flame_layout(&spans, &hues, Viewport::fit(0, 1_000_000), 1000.0, 1);
+        let (quads, _) = flame_layout(&spans, &hues, Viewport::fit(0, 1_000_000), 1000.0, 1, 0);
         assert!(quads.iter().all(|q| q.y < f32::from(layout::FLAME_ROW)));
     }
 
@@ -550,5 +628,102 @@ mod tests {
         assert_eq!(data.span_at(1, 25_000), None);
         assert_eq!(data.span_at(1, 35_000), Some(2));
         assert_eq!(data.span_at(2, 15_000), None);
+    }
+
+    fn data_of(spans: Vec<FlameSpan>) -> Arc<FlameData> {
+        let snap = Snapshot::empty();
+        Arc::new(FlameData::new(&snap, spans, false, (0, 100_000_000), 1000))
+    }
+
+    fn chart(cx: &mut gpui_kit::TestAppContext) -> gpui_kit::Entity<FlameChart> {
+        use gpui_kit::AppContext as _;
+        cx.new(FlameChart::new)
+    }
+
+    fn ms_span(depth: u16, start_ms: u64, end_ms: u64, f: u32) -> FlameSpan {
+        FlameSpan {
+            depth,
+            start: SessionTime(start_ms * 1_000_000),
+            end: SessionTime(end_ms * 1_000_000),
+            function: FunctionId(f),
+        }
+    }
+
+    #[gpui_kit::test]
+    fn selection_survives_refresh_or_clears(cx: &mut gpui_kit::TestAppContext) {
+        let chart = chart(cx);
+        let snap = Arc::new(Snapshot::empty());
+        let first = data_of(vec![ms_span(0, 0, 100, 0), ms_span(1, 10, 50, 1)]);
+        chart.update(cx, |c, cx| {
+            c.set_data(snap.clone(), first, true, cx);
+            // Depth 1, 30 ms in (the chart is 800 px for 100 ms).
+            c.clicked(240.0, f32::from(layout::FLAME_ROW) * 1.5, cx);
+            assert_eq!(c.selected(), Some(1));
+        });
+        // New data puts the same call at another index: the selection follows it.
+        let moved = data_of(vec![
+            ms_span(0, 0, 100, 0),
+            ms_span(1, 5, 8, 9),
+            ms_span(1, 10, 55, 1),
+        ]);
+        chart.update(cx, |c, cx| {
+            c.set_data(snap.clone(), moved, false, cx);
+            assert_eq!(c.selected(), Some(2));
+        });
+        // New data without that call clears it.
+        let gone = data_of(vec![ms_span(0, 0, 100, 0), ms_span(1, 12, 20, 1)]);
+        chart.update(cx, |c, cx| {
+            c.set_data(snap, gone, false, cx);
+            assert_eq!(c.selected(), None);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn deep_stack_scrolls_vertically(cx: &mut gpui_kit::TestAppContext) {
+        let chart = chart(cx);
+        let spans: Vec<FlameSpan> = (0..120).map(|d| ms_span(d, 0, 100, d as u32)).collect();
+        let data = data_of(spans);
+        chart.update(cx, |c, cx| {
+            c.set_data(Arc::new(Snapshot::empty()), data.clone(), true, cx);
+            let visible = c.visible_rows();
+            assert!(visible < 120);
+            let (quads, _) = flame_layout(&data.spans, &hues, c.viewport(), 800.0, visible, 0);
+            assert!(quads.iter().all(|q| q.span < visible as u32));
+            let start = c.viewport();
+            c.scroll_y(f32::from(layout::FLAME_ROW) * 500.0, cx);
+            // Clamped to the last full page; time did not move.
+            assert_eq!(c.row_offset, 120 - visible);
+            assert_eq!(c.viewport(), start);
+            let (quads, _) = flame_layout(
+                &data.spans,
+                &hues,
+                c.viewport(),
+                800.0,
+                visible,
+                c.row_offset,
+            );
+            assert!(quads.iter().any(|q| q.span == 119), "the leaf row is drawn");
+            assert!(quads.iter().all(|q| q.span as usize >= c.row_offset));
+            // A click on the bottom row picks the leaf.
+            let y = (visible as f32 - 0.5) * f32::from(layout::FLAME_ROW);
+            c.clicked(400.0, y, cx);
+            assert_eq!(c.selected(), Some(119));
+            c.scroll_y(-f32::from(layout::FLAME_ROW) * 500.0, cx);
+            assert_eq!(c.row_offset, 0);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn shallow_stack_pans_time_on_vertical_scroll(cx: &mut gpui_kit::TestAppContext) {
+        let chart = chart(cx);
+        let data = data_of(vec![ms_span(0, 0, 100, 0), ms_span(1, 10, 50, 1)]);
+        chart.update(cx, |c, cx| {
+            c.set_data(Arc::new(Snapshot::empty()), data, true, cx);
+            c.zoom_about(0.0, 4.0, cx);
+            let before = c.viewport();
+            c.scroll_y(100.0, cx);
+            assert_eq!(c.row_offset, 0);
+            assert!(c.viewport().start_ns > before.start_ns, "later time shows");
+        });
     }
 }
