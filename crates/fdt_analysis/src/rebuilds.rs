@@ -5,7 +5,7 @@ use crate::user_code::is_user_library;
 use fdt_store::Snapshot;
 use fdt_store::cpu::FunctionId;
 use fdt_store::time::{RunId, SessionTime, TimeRange};
-use fdt_store::timeline::{LaneSnapshot, NameId};
+use fdt_store::timeline::{LaneSnapshot, NameId, SliceCat};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -95,7 +95,12 @@ pub fn frame_rebuilds_with(
         let mut p = 0;
         for i in lane.range_indices(span) {
             let s = lane.get(i);
-            if s.start < span.start || s.end() > span.end {
+            // Strict at the end: a slice that starts where BUILD ends (the next phase) is not in it.
+            if s.start < span.start || s.start >= span.end || s.end() > span.end {
+                continue;
+            }
+            // Widget builds are Dart slices; a GC pause inside BUILD is not a rebuild.
+            if s.cat != SliceCat::Dart {
                 continue;
             }
             let parent = if prev.is_empty() {
@@ -105,10 +110,11 @@ pub fn frame_rebuilds_with(
                 while p < prev.len() && nodes[prev[p]].end < s.end().0 {
                     p += 1;
                 }
-                let found = prev
-                    .get(p)
-                    .copied()
-                    .filter(|&n| nodes[n].start <= s.start.0 && nodes[n].end >= s.end().0);
+                let found = prev.get(p).copied().filter(|&n| {
+                    nodes[n].start <= s.start.0
+                        && s.start.0 < nodes[n].end
+                        && nodes[n].end >= s.end().0
+                });
                 if found.is_none() {
                     continue;
                 }
@@ -436,6 +442,15 @@ mod tests {
                 .map_or(tree.len(), |k| i + 1 + k);
             all.push((depth, name, i as u64 * 100, (end - i) as u64 * 100 - 10));
         }
+        put_slices(w, ui, begin, all);
+    }
+
+    fn put_slices(
+        w: &mut SessionWriter,
+        ui: fdt_store::timeline::TrackId,
+        begin: u64,
+        all: Vec<(u16, &str, u64, u64)>,
+    ) {
         for (depth, name, at_us, dur_us) in all {
             let s = Slice {
                 start: SessionTime(begin + at_us * 1000),
@@ -518,6 +533,69 @@ mod tests {
         t.push((5, "AppBar"));
         tree_frame(&mut w, run, &t);
         assert_eq!(child(&w.publish()), Some(("ProductGrid".into(), 12)));
+    }
+
+    #[test]
+    fn slice_starting_at_build_end_is_not_a_rebuild() {
+        let (mut w, run) = writer();
+        frame(&mut w, run, 1, 10, 30_000);
+        let begin = 10 * MS;
+        w.set_frame_ui(
+            run,
+            1,
+            UiPhases {
+                begin: SessionTime(begin),
+                ui_us: 20_000,
+                build_us: 15_000,
+                layout_us: 2000,
+                paint_us: 2000,
+                composite_us: 500,
+                finalize_us: 500,
+                widgets_built: None,
+            },
+        );
+        let ui = w.timeline_track(run, TrackKind::Thread, 1, "io.flutter.ui");
+        w.set_track_order(ui, 0);
+        // BUILD has no widget children; LAYOUT (a zero-length one, one lane down) starts at the
+        // exact microsecond BUILD ends.
+        put_slices(
+            &mut w,
+            ui,
+            begin,
+            vec![
+                (0, "VsyncProcessCallback", 0, 20_000),
+                (1, "Animator::BeginFrame", 0, 20_000),
+                (2, "BUILD", 0, 15_000),
+                (2, "LAYOUT (root)", 15_000, 2_000),
+                (3, "LAYOUT", 15_000, 0),
+            ],
+        );
+        let s = w.publish();
+        assert!(frame_rebuilds(&s, 0).is_none());
+        let e = crate::explain::explain(&s, 0);
+        assert!(
+            !matches!(e.cause, crate::explain::Cause::Rebuilt { .. }),
+            "{:?}",
+            e.cause
+        );
+    }
+
+    #[test]
+    fn a_gc_slice_inside_build_is_not_a_rebuild() {
+        let (mut w, run) = writer();
+        cart_frame(&mut w, run, 1, 10, 0);
+        // A GC pause (not a Dart slice) one lane below BUILD, beside CartScreen.
+        let ui = w.timeline_track(run, TrackKind::Thread, 1, "io.flutter.ui");
+        let s = Slice {
+            start: SessionTime(10 * MS + 14_100_000),
+            dur_ns: 500_000,
+            name: w.intern_name("CollectNewGeneration"),
+            cat: SliceCat::Gc,
+        };
+        assert!(w.push_slice(ui, 3, s, false));
+        let snap = w.publish();
+        let r = frame_rebuilds(&snap, 0).unwrap();
+        assert!(r.roots.iter().all(|r| &*r.name != "CollectNewGeneration"));
     }
 
     #[test]

@@ -287,7 +287,10 @@ async fn perf_checks(cap: &Capture, vm: &VmService, iso: &str) {
     let deadline = Instant::now() + Duration::from_secs(25);
     let mut seen = String::new();
     loop {
-        // The user-widget names come from CPU samples, so keep fetching them.
+        // The window may stop drawing (`list` schedules a frame); frames need CartScreen built.
+        let _ = vm
+            .call_extension("ext.jank_lab.run", iso, json!({"action": "list"}))
+            .await;
         cap.fetch_cpu_samples();
         sleep(Duration::from_millis(700)).await;
         let snap = cap.snapshots().borrow().clone();

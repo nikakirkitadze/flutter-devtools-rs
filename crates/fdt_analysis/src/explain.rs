@@ -183,8 +183,9 @@ fn save_layers(snap: &Snapshot, frame: &FrameRecord) -> u32 {
         for lane in snap.timeline.lanes(t.id) {
             for i in lane.range_indices(window) {
                 let s = lane.get(i);
-                if s.end() >= window.start
-                    && s.start <= window.end
+                // Strict overlap: a saveLayer touching the window's edge belongs to the next frame.
+                if s.end() > window.start
+                    && s.start < window.end
                     && snap.timeline.name(s.name) == SAVE_LAYER
                 {
                     n += 1;
