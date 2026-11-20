@@ -24,7 +24,6 @@ base64 = { workspace = true }
 [dev-dependencies]
 fdt_vm = { path = ".", features = ["testing"] }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

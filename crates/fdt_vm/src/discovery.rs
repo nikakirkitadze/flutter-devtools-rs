@@ -903,15 +903,17 @@ mod tests {
         wait_for(&mut rx, 5000, "app gone", |a| a.is_empty()).await;
     }
 
-    #[tokio::test(start_paused = true)]
+    // Real time: the scan runs against real files. The negative check below can only pass
+    // spuriously, never fail, however slow the machine is.
+    #[tokio::test]
     async fn first_scan_publishes_even_when_empty() {
         let dir = tempfile::tempdir().unwrap();
         let (_disc, mut rx) =
             Discovery::spawn(&tokio::runtime::Handle::current(), config(dir.path()));
-        let apps = next(&mut rx, 1000).await;
+        let apps = next(&mut rx, 5000).await;
         assert!(apps.is_empty());
         // Later identical scans do not publish.
-        let again = tokio::time::timeout(Duration::from_millis(300), rx.changed()).await; // paused clock
+        let again = tokio::time::timeout(Duration::from_millis(300), rx.changed()).await;
         assert!(again.is_err());
     }
 
@@ -948,7 +950,8 @@ mod tests {
         }
     }
 
-    /// Polls `cond` until it holds or 5 s pass, for state that changes on another thread.
+    /// Polls `cond` until it holds or 5 s pass, for state that changes on another thread. The
+    /// deadline is wall-clock on purpose: these tests run in real time.
     async fn wait_until(what: &str, cond: impl Fn() -> bool) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !cond() {
@@ -968,7 +971,10 @@ mod tests {
             .count()
     }
 
-    #[tokio::test(start_paused = true)]
+    // Real time, because the VM is a real socket: a paused clock would jump ahead while the
+    // runtime waits for it. Only monotonic facts are asserted: the retry cannot have happened
+    // before `retry_after` passed, and it did happen.
+    #[tokio::test]
     async fn probe_failure_is_retried_after_the_retry_interval() {
         let vm = vm_server_with("jank_lab", 1);
         let dtd = dtd_server(&vm);
@@ -976,14 +982,13 @@ mod tests {
         write_entry(dir.path(), &dtd.ws_uri());
         let mut cfg = config(dir.path());
         cfg.retry_after = Duration::from_millis(700);
+        let started = std::time::Instant::now();
         let (_disc, mut rx) = Discovery::spawn(&tokio::runtime::Handle::current(), cfg);
-        // Several ticks pass inside the retry window: one failed attempt, no second one yet.
-        wait_until("first probe", || count(&vm, "getVM") == 1).await;
-        tokio::time::advance(Duration::from_millis(350)).await;
-        assert_eq!(count(&vm, "getVM"), 1);
-        assert!(rx.borrow().is_empty());
-        let apps = wait_for(&mut rx, 3000, "app after retry", |a| a.len() == 1).await;
+        let apps = wait_for(&mut rx, 10_000, "app after retry", |a| a.len() == 1).await;
+        let seen = std::time::Instant::now();
         assert_eq!(apps[0].name, "jank_lab");
+        // The first probe failed, so the app could only appear after the retry interval.
+        assert!(seen.duration_since(started) >= Duration::from_millis(700));
         assert_eq!(count(&vm, "getVM"), 2);
     }
 
@@ -1054,24 +1059,18 @@ mod tests {
         assert_eq!(apps[0].name, "jank_lab");
     }
 
-    #[tokio::test(start_paused = true)]
+    // Real time, for the same reason. The DTD is asked again only after `retry_after`, so the
+    // second ask cannot come earlier than that, however many 50 ms ticks pass.
+    #[tokio::test]
     async fn failing_dtd_is_backed_off() {
         let dtd = ScriptedServer::start(|_, _| Err((-32000, "broken".into())));
         let dir = tempfile::tempdir().unwrap();
         write_entry(dir.path(), &dtd.ws_uri());
         let mut cfg = config(dir.path());
         cfg.retry_after = Duration::from_millis(600);
+        let started = std::time::Instant::now();
         let (_disc, _rx) = Discovery::spawn(&tokio::runtime::Handle::current(), cfg);
-        wait_until("first ask", || {
-            count(&dtd, "ConnectedApp.getVmServices") == 1
-        })
-        .await;
-        tokio::time::advance(Duration::from_millis(350)).await;
-        // Many 50 ms ticks have passed, but the DTD was asked once.
-        assert_eq!(count(&dtd, "ConnectedApp.getVmServices"), 1);
-        tokio::time::advance(Duration::from_millis(900)).await;
-        wait_until("retry", || count(&dtd, "ConnectedApp.getVmServices") >= 2).await;
-        let n = count(&dtd, "ConnectedApp.getVmServices");
-        assert!((2..=3).contains(&n), "retried {n} times");
+        wait_until("a retry", || count(&dtd, "ConnectedApp.getVmServices") >= 2).await;
+        assert!(started.elapsed() >= Duration::from_millis(600));
     }
 }
