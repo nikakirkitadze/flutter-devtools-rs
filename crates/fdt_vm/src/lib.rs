@@ -6,9 +6,12 @@ pub mod dart_io;
 pub mod discovery;
 pub mod dtd;
 pub mod events;
+pub mod flutter;
+pub mod perfetto;
 pub mod rpc;
 pub mod service;
 pub mod tap;
+pub mod timeline;
 pub mod types;
 pub mod uri;
 

@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::rpc::Notification;
+use crate::timeline::{TraceEvent, decode_trace_values};
 use crate::types::{InstanceRef, IsolateRef};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +61,14 @@ pub enum StreamEvent {
     ServiceRegistered {
         service: String,
         method: String,
+    },
+    /// A completed block of timeline events (`Timeline` stream).
+    TimelineEvents {
+        events: Vec<TraceEvent>,
+    },
+    /// The recorded timeline streams changed (`TimelineStreamSubscriptionsUpdate`).
+    TimelineSubscriptions {
+        recorded: Vec<String>,
     },
     Other {
         stream: String,
@@ -158,6 +167,22 @@ pub fn decode_notification(n: &Notification) -> Option<StreamEvent> {
                 service: str_of(ev, "service")?.to_string(),
                 method: str_of(ev, "method")?.to_string(),
             },
+            "TimelineEvents" => {
+                let raw = ev.get("timelineEvents")?.as_array()?;
+                let (events, skipped) = decode_trace_values(raw);
+                if skipped > 0 {
+                    log::debug!("skipped {skipped} unreadable timeline events");
+                }
+                StreamEvent::TimelineEvents { events }
+            }
+            "TimelineStreamSubscriptionsUpdate" => StreamEvent::TimelineSubscriptions {
+                recorded: ev
+                    .get("updatedStreams")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect(),
+            },
             _ => return None,
         })
     })();
@@ -182,6 +207,8 @@ const KNOWN_KINDS: &[&str] = &[
     "ServiceExtensionAdded",
     "IsolateReload",
     "ServiceRegistered",
+    "TimelineEvents",
+    "TimelineStreamSubscriptionsUpdate",
 ];
 
 #[cfg(test)]
