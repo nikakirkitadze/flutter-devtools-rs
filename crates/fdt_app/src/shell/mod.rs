@@ -751,8 +751,14 @@ impl Render for MainWindow {
             }
             Page::Settings => {
                 let free = settings(cx).free_app_http_memory;
-                settings_page::render(settings(cx).theme, free, cx.weak_entity(), cx)
-                    .into_any_element()
+                settings_page::render(
+                    settings(cx).theme,
+                    free,
+                    settings(cx).trace_widget_builds,
+                    cx.weak_entity(),
+                    cx,
+                )
+                .into_any_element()
             }
         };
         let nav = |dir| MouseButton::Navigate(dir);

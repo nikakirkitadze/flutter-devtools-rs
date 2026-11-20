@@ -7,6 +7,7 @@ use super::cpu_tab::CpuTab;
 use super::details::DetailsState;
 use super::frame_chart::{ChartEvent, FrameChart};
 use super::frames_table::{FramesList, ListEvent};
+use super::rebuilds_tab::RebuildsTab;
 use crate::nav::{EntryId, Location, Page, Selection, TimeRange, Tool};
 use crate::session_model::SessionModel;
 use crate::shell::sidebar::tool_icon;
@@ -79,6 +80,8 @@ pub struct PerformanceView {
     list: Entity<FramesList>,
     /// The CPU tab.
     cpu: Entity<CpuTab>,
+    /// The Rebuilds tab.
+    rebuilds: Entity<RebuildsTab>,
     /// Where the keyboard focus goes when a tab's own element leaves the screen.
     focus: FocusHandle,
     /// The frame under the pointer and where, for the tooltip.
@@ -106,6 +109,7 @@ impl PerformanceView {
         let chart = cx.new(|cx| FrameChart::new(snap, cx));
         let list = cx.new(|cx| FramesList::new(session.clone(), window, cx));
         let cpu = cx.new(|cx| CpuTab::new(session.clone(), window, cx));
+        let rebuilds = cx.new(|cx| RebuildsTab::new(session.clone(), window, cx));
         let subs = vec![
             cx.subscribe(&chart, |this, _, e: &ChartEvent, cx| {
                 this.chart_event(*e, cx)
@@ -121,6 +125,7 @@ impl PerformanceView {
             chart,
             list,
             cpu,
+            rebuilds,
             focus: cx.focus_handle(),
             hover: None,
             following: true,
@@ -143,6 +148,11 @@ impl PerformanceView {
     #[cfg(test)]
     pub(crate) fn cpu(&self) -> &Entity<CpuTab> {
         &self.cpu
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rebuilds(&self) -> &Entity<RebuildsTab> {
+        &self.rebuilds
     }
 
     #[cfg(test)]
@@ -251,6 +261,9 @@ impl PerformanceView {
         self.list.update(cx, |l, cx| l.set_active(on, cx));
         let cpu_on = self.page_active && self.tab == PerfTab::Cpu;
         self.cpu.update(cx, |c, cx| c.set_active(cpu_on, cx));
+        let rebuilds_on = self.page_active && self.tab == PerfTab::Rebuilds;
+        self.rebuilds
+            .update(cx, |r, cx| r.set_active(rebuilds_on, cx));
     }
 
     /// The shared time range and the selected frame, from the shell's location.
@@ -269,6 +282,10 @@ impl PerformanceView {
                 c.set_selection(seq, cx);
             });
             self.cpu.update(cx, |c, cx| c.set_range(range, cx));
+            self.rebuilds.update(cx, |r, cx| {
+                r.set_range(range, cx);
+                r.set_selection(seq, cx);
+            });
             self.list.update(cx, |l, cx| {
                 l.set_range(range, cx);
                 l.set_selection(seq, cx);
@@ -478,6 +495,13 @@ impl Render for PerformanceView {
                 .min_h_0()
                 .w_full()
                 .child(self.cpu.clone())
+                .into_any_element()
+        } else if self.tab == PerfTab::Rebuilds {
+            div()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .child(self.rebuilds.clone())
                 .into_any_element()
         } else {
             div()

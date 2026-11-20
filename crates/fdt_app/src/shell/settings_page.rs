@@ -4,6 +4,7 @@ use crate::actions::{ShowShortcuts, UseDarkTheme, UseLightTheme, UseSystemTheme}
 use crate::session_model::for_each_control;
 use crate::settings::update_settings;
 use crate::shell::MainWindow;
+use crate::tools::performance::rebuilds_tab::OVERHEAD_NOTE;
 use fdt_ui::theme::{ThemePreference, TokensExt as _};
 use fdt_ui::tokens::{alpha, font, layout, radius, row, space};
 use gpui_kit::component::kbd::Kbd;
@@ -131,9 +132,37 @@ fn free_http_memory_row(on: bool, shell: WeakEntity<MainWindow>, cx: &App) -> An
         .into_any_element()
 }
 
+fn set_trace_by_default(on: bool, shell: &WeakEntity<MainWindow>, cx: &mut App) {
+    update_settings(cx, |s| s.trace_widget_builds = on);
+    let _ = shell.update(cx, |_, cx| cx.notify());
+}
+
+fn trace_by_default_row(on: bool, shell: WeakEntity<MainWindow>, cx: &App) -> AnyElement {
+    let t = cx.tokens();
+    div()
+        .flex()
+        .flex_col()
+        .gap(space::S4)
+        .py(space::S8)
+        .child(
+            Switch::new("settings-trace-widget-builds")
+                .checked(on)
+                .label("Trace widget builds by default")
+                .on_change(move |checked, _, cx| set_trace_by_default(*checked, &shell, cx)),
+        )
+        .child(
+            div()
+                .text_size(font::BODY)
+                .text_color(Hsla::from(t.text_muted))
+                .child(OVERHEAD_NOTE),
+        )
+        .into_any_element()
+}
+
 pub fn render(
     pref: ThemePreference,
     free_http_memory: bool,
+    trace_builds: bool,
     shell: WeakEntity<MainWindow>,
     cx: &App,
 ) -> impl IntoElement {
@@ -216,7 +245,12 @@ pub fn render(
                 ))
                 .child(section(
                     "Network",
-                    vec![free_http_memory_row(free_http_memory, shell, cx)],
+                    vec![free_http_memory_row(free_http_memory, shell.clone(), cx)],
+                    cx,
+                ))
+                .child(section(
+                    "Performance",
+                    vec![trace_by_default_row(trace_builds, shell.clone(), cx)],
                     cx,
                 ))
                 .child(section(

@@ -5,6 +5,7 @@ mod details;
 pub mod flame;
 pub mod frame_chart;
 pub mod frames_table;
+pub mod rebuilds_tab;
 pub mod view;
 
 pub use view::{PerfTab, PerformanceView};
