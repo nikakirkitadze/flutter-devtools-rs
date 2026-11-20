@@ -167,6 +167,21 @@ mod tests {
     }
 
     #[test]
+    fn frame_related_totals_count_beyond_the_limit() {
+        let (mut w, run) = writer();
+        frame(&mut w, run, 1, 100, 40_000);
+        for i in 0..30 {
+            log(&mut w, run, 100 + (i % 30));
+            w.upsert_request(http(run, &format!("r{i}"), 100 + i, Some(101 + i)));
+        }
+        let s = w.publish();
+        let r = related_to_frame(&s, 0);
+        assert_eq!(r.logs.len(), RELATED_LIMIT);
+        assert_eq!(r.requests.len(), RELATED_LIMIT);
+        assert_eq!((r.logs_total, r.requests_total), (30, 30));
+    }
+
+    #[test]
     fn related_windows_and_limits() {
         let (mut w, run) = writer();
         // Frame 0: 100 ms .. 140 ms (elapsed 40 ms > the 16.667 ms budget).

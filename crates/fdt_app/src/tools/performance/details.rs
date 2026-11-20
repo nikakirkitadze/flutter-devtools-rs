@@ -31,6 +31,25 @@ use gpui_kit::{
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// A clickable one-line row of the Related section.
+fn related_row(
+    t: Palette,
+    id: impl Into<SharedString>,
+    text: String,
+) -> impl IntoElement + Styled + ParentElement + StatefulInteractiveElement {
+    div()
+        .id(id.into())
+        .test_support()
+        .aria_label(SharedString::from(text.clone()))
+        .w_full()
+        .truncate()
+        .px(space::S4)
+        .rounded(radius::CONTROL)
+        .cursor_pointer()
+        .hover(|s| s.bg(Hsla::from(t.elevated)))
+        .child(text)
+}
+
 /// Builds the pane for its facet.
 pub(super) fn pane_build(
     view: &mut PerformanceView,
@@ -55,6 +74,7 @@ pub(super) fn pane_key(view: &PerformanceView, cx: &gpui_kit::App) -> String {
         (
             session.snapshot().session,
             session.snapshot().generation,
+            cx.appearance(),
             connected,
             view.selection,
             result,
@@ -807,17 +827,8 @@ impl PerformanceView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let t = *cx.tokens();
-        div()
-            .id(id)
-            .test_support()
-            .aria_label(SharedString::from(text.clone()))
-            .w_full()
-            .truncate()
-            .px(space::S4)
-            .rounded(radius::CONTROL)
-            .cursor_pointer()
+        related_row(t, id, text)
             .text_color(Hsla::from(t.accent))
-            .hover(|s| s.bg(Hsla::from(t.elevated)))
             .on_click(cx.listener(move |_, _, _, cx| {
                 cx.emit(OpenLocation(Location {
                     page: Page::Tool(tool),
@@ -825,7 +836,6 @@ impl PerformanceView {
                     range: window,
                 }));
             }))
-            .child(text)
     }
 
     fn related_section(
@@ -840,19 +850,6 @@ impl PerformanceView {
             "details-section-related",
             "Related",
         ));
-        let row = |id: String, text: String| {
-            div()
-                .id(SharedString::from(id))
-                .test_support()
-                .aria_label(SharedString::from(text.clone()))
-                .w_full()
-                .truncate()
-                .px(space::S4)
-                .rounded(radius::CONTROL)
-                .cursor_pointer()
-                .hover(|s| s.bg(Hsla::from(t.elevated)))
-                .child(text)
-        };
         let mut any = false;
         let frame = self
             .selection
@@ -898,11 +895,13 @@ impl PerformanceView {
                 status_text(r),
                 duration
             );
-            section = section.child(row(format!("details-request-{i}"), text).on_click(
-                cx.listener(move |this, _, _, cx| {
-                    this.open_related(Tool::Network, Selection::Request(id), cx)
-                }),
-            ));
+            section = section.child(
+                related_row(*t, format!("details-request-{i}"), text).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.open_related(Tool::Network, Selection::Request(id), cx)
+                    },
+                )),
+            );
         }
         if e.related.requests_total > requests.len() {
             any = true;
@@ -927,9 +926,11 @@ impl PerformanceView {
                 r.level.label(),
                 line
             );
-            section = section.child(row(format!("details-log-{i}"), text).on_click(cx.listener(
-                move |this, _, _, cx| this.open_related(Tool::Logs, Selection::Log(id), cx),
-            )));
+            section = section.child(related_row(*t, format!("details-log-{i}"), text).on_click(
+                cx.listener(move |this, _, _, cx| {
+                    this.open_related(Tool::Logs, Selection::Log(id), cx)
+                }),
+            ));
         }
         if e.related.logs_total > logs.len() {
             any = true;
@@ -1425,6 +1426,29 @@ mod tests {
             assert_eq!(s.current().selection, None);
             assert_eq!(s.current().range, Some(want));
         });
+    }
+
+    #[gpui_kit::test]
+    fn details_pane_follows_the_theme(cx: &mut TestAppContext) {
+        use crate::perf::Counter::DetailsPane;
+        let (shell, cx) = open_perf(cx, crowded_session());
+        select(&shell, cx, 0);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let now = cx.update(|_, cx| cx.appearance());
+        let to = if now == fdt_ui::tokens::Appearance::Dark {
+            fdt_ui::tokens::Appearance::Light
+        } else {
+            fdt_ui::tokens::Appearance::Dark
+        };
+        let perf = shell.read_with(cx, |s, _| s.performance_view().clone());
+        // Without a window, so nothing refreshes: only the key can tell the pane.
+        let rebuilt = renders_in(cx, |cx| {
+            cx.update(|_, cx| {
+                fdt_ui::theme::apply_with_os(fdt_ui::theme::ThemePreference::System, to, None, cx);
+                perf.update(cx, |_, cx| cx.notify());
+            });
+        });
+        assert_eq!(rebuilt[DetailsPane as usize], 1, "{rebuilt:?}");
     }
 
     #[gpui_kit::test]
