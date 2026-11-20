@@ -1,5 +1,6 @@
 //! Rebuild attribution from widget-build timeline slices.
 
+use crate::framework_widgets::is_framework_widget;
 use crate::user_code::is_user_library;
 use fdt_store::Snapshot;
 use fdt_store::cpu::FunctionId;
@@ -141,6 +142,7 @@ pub fn frame_rebuilds(snap: &Snapshot, frame_seq: usize) -> Option<FrameRebuilds
         }
     }
     let user = user_classes(snap);
+    let is_user = |name: &str| user.contains(name) || !is_framework_widget(name);
     let mut child_count = vec![0u32; nodes.len()];
     let mut depth = vec![0u32; nodes.len()];
     let mut root_of: Vec<usize> = (0..nodes.len()).collect();
@@ -153,19 +155,17 @@ pub fn frame_rebuilds(snap: &Snapshot, frame_seq: usize) -> Option<FrameRebuilds
     }
     // Per root, the user widget below it with the largest subtree; ties go to the shallowest.
     let mut user_best: Vec<Option<usize>> = vec![None; nodes.len()];
-    if !user.is_empty() {
-        for (i, n) in nodes.iter().enumerate().filter(|(_, n)| n.parent.is_some()) {
-            if !user.contains(snap.timeline.name(n.name)) {
-                continue;
-            }
-            let r = root_of[i];
-            let better = user_best[r].is_none_or(|b| {
-                (n.subtree, std::cmp::Reverse(depth[i]))
-                    > (nodes[b].subtree, std::cmp::Reverse(depth[b]))
-            });
-            if better {
-                user_best[r] = Some(i);
-            }
+    for (i, n) in nodes.iter().enumerate().filter(|(_, n)| n.parent.is_some()) {
+        if !is_user(snap.timeline.name(n.name)) {
+            continue;
+        }
+        let r = root_of[i];
+        let better = user_best[r].is_none_or(|b| {
+            (n.subtree, std::cmp::Reverse(depth[i]))
+                > (nodes[b].subtree, std::cmp::Reverse(depth[b]))
+        });
+        if better {
+            user_best[r] = Some(i);
         }
     }
     let mut roots: Vec<RootRebuild> = Vec::new();
@@ -385,8 +385,9 @@ mod tests {
         );
     }
 
-    /// `BUILD > CartScreen > Scaffold > {Body > ProductGrid > 3 x Tile, Bar}`.
-    fn chain_frame(w: &mut SessionWriter, run: RunId) {
+    /// A frame whose BUILD holds `tree` (preorder `(depth, name)`, depth 3 is the root); every
+    /// slice is 100 us per node of its subtree.
+    fn tree_frame(w: &mut SessionWriter, run: RunId, tree: &[(u16, &str)]) {
         frame(w, run, 1, 10, 30_000);
         let begin = 10 * MS;
         w.set_frame_ui(
@@ -400,26 +401,25 @@ mod tests {
                 paint_us: 2000,
                 composite_us: 500,
                 finalize_us: 500,
-                widgets_built: Some(9),
+                widgets_built: Some(tree.len() as u32),
             },
         );
         let ui = w.timeline_track(run, TrackKind::Thread, 1, "io.flutter.ui");
         w.set_track_order(ui, 0);
-        let nodes: [(u16, &str, u64, u64); 12] = [
-            (0, "VsyncProcessCallback", 0, 20_000),
-            (1, "Animator::BeginFrame", 0, 20_000),
-            (2, "BUILD", 0, 15_000),
-            (3, "CartScreen", 0, 14_000),
-            (4, "Scaffold", 0, 13_000),
-            (5, "Body", 0, 10_000),
-            (6, "ProductGrid", 0, 9_000),
-            (7, "Tile", 0, 100),
-            (7, "Tile", 200, 100),
-            (7, "Tile", 400, 100),
-            (5, "Bar", 11_000, 1_000),
-            (5, "Dummy", 12_500, 100),
+        let total = tree.len() as u64 * 100;
+        let mut all: Vec<(u16, &str, u64, u64)> = vec![
+            (0, "VsyncProcessCallback", 0, total + 1000),
+            (1, "Animator::BeginFrame", 0, total + 1000),
+            (2, "BUILD", 0, total + 500),
         ];
-        for (depth, name, at_us, dur_us) in nodes {
+        for (i, &(depth, name)) in tree.iter().enumerate() {
+            let end = tree[i + 1..]
+                .iter()
+                .position(|&(d, _)| d <= depth)
+                .map_or(tree.len(), |k| i + 1 + k);
+            all.push((depth, name, i as u64 * 100, (end - i) as u64 * 100 - 10));
+        }
+        for (depth, name, at_us, dur_us) in all {
             let s = Slice {
                 start: SessionTime(begin + at_us * 1000),
                 dur_ns: dur_us * 1000,
@@ -430,47 +430,77 @@ mod tests {
         }
     }
 
+    /// `CartScreen > Scaffold > {Padding > <grid> > 3 x SizedBox, Center}`.
+    fn chain_frame(w: &mut SessionWriter, run: RunId, grid: &str) {
+        tree_frame(
+            w,
+            run,
+            &[
+                (3, "CartScreen"),
+                (4, "Scaffold"),
+                (5, "Padding"),
+                (6, grid),
+                (7, "SizedBox"),
+                (7, "SizedBox"),
+                (7, "SizedBox"),
+                (5, "Center"),
+            ],
+        );
+    }
+
+    fn child(s: &Snapshot) -> Option<(String, u32)> {
+        let r = frame_rebuilds(s, 0)?;
+        r.roots[0]
+            .largest_child
+            .clone()
+            .map(|(n, m)| (n.to_string(), m))
+    }
+
     #[test]
     fn largest_child_skips_framework_chains() {
         let (mut w, run) = writer();
-        w.intern_function("_ProductGridState.build", Some("package:app/cart.dart"));
-        w.intern_function(
-            "Scaffold.build",
-            Some("package:flutter/src/material/scaffold.dart"),
-        );
-        chain_frame(&mut w, run);
-        let s = w.publish();
-        let r = frame_rebuilds(&s, 0).unwrap();
-        assert_eq!(&*r.roots[0].name, "CartScreen");
-        assert_eq!(
-            r.roots[0]
-                .largest_child
-                .clone()
-                .map(|(n, m)| (n.to_string(), m)),
-            Some(("ProductGrid".to_string(), 4))
-        );
+        chain_frame(&mut w, run, "ProductGrid");
+        assert_eq!(child(&w.publish()), Some(("ProductGrid".into(), 4)));
     }
 
     #[test]
     fn largest_child_falls_back_to_first_branch() {
+        // No user widget below CartScreen: Scaffold branches into Padding and Center.
         let (mut w, run) = writer();
-        chain_frame(&mut w, run);
-        let s = w.publish();
-        let r = frame_rebuilds(&s, 0).unwrap();
-        // No CPU names: CartScreen > Scaffold is a chain; Scaffold branches into Body and Bar.
-        assert_eq!(
-            r.roots[0]
-                .largest_child
-                .clone()
-                .map(|(n, m)| (n.to_string(), m)),
-            Some(("Body".to_string(), 5))
-        );
-        // CPU names without a match behave the same.
+        chain_frame(&mut w, run, "Wrap");
+        assert_eq!(child(&w.publish()), Some(("Padding".into(), 5)));
+    }
+
+    #[test]
+    fn a_cpu_identified_class_overrides_the_framework_list() {
         let (mut w, run) = writer();
-        w.intern_function("Other.build", Some("package:app/other.dart"));
-        chain_frame(&mut w, run);
-        let r = frame_rebuilds(&w.publish(), 0).unwrap();
-        assert_eq!(&*r.roots[0].largest_child.clone().unwrap().0, "Body");
+        w.intern_function("Wrap.build", Some("package:app/wrap.dart"));
+        chain_frame(&mut w, run, "Wrap");
+        assert_eq!(child(&w.publish()), Some(("Wrap".into(), 4)));
+    }
+
+    #[test]
+    fn the_live_jank_lab_tree_names_product_grid() {
+        let (mut w, run) = writer();
+        let mut t = vec![
+            (3, "CartScreen"),
+            (4, "Scaffold"),
+            (5, "Column"),
+            (6, "CartBadge"),
+            (7, "Padding"),
+            (8, "Badge"),
+            (9, "Text"),
+            (6, "Expanded"),
+            (7, "ProductGrid"),
+            (8, "SingleChildScrollView"),
+            (9, "Wrap"),
+        ];
+        for _ in 0..3 {
+            t.extend([(10, "SizedBox"), (11, "ProductTile"), (12, "Card")]);
+        }
+        t.push((5, "AppBar"));
+        tree_frame(&mut w, run, &t);
+        assert_eq!(child(&w.publish()), Some(("ProductGrid".into(), 12)));
     }
 
     #[test]

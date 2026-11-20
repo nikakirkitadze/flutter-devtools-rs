@@ -741,17 +741,29 @@ mod tests {
         // Four widgets, none above half of the build.
         put(&mut w, t.ui, 3, "Cart", start, 0, 4000, SliceCat::Dart);
         put(&mut w, t.ui, 4, "Row", start, 0, 2000, SliceCat::Dart);
-        put(&mut w, t.ui, 4, "Badge", start, 2000, 1000, SliceCat::Dart);
+        put(
+            &mut w,
+            t.ui,
+            4,
+            "CartBadge",
+            start,
+            2000,
+            1000,
+            SliceCat::Dart,
+        );
         put(&mut w, t.ui, 5, "Dot", start, 2000, 500, SliceCat::Dart);
         put(&mut w, t.ui, 3, "Lone", start, 5000, 500, SliceCat::Dart);
         let e = explain_of(&mut w, 0);
-        assert_eq!(e.sentence, "Cart rebuilt 4 widgets, including Badge (2).");
+        assert_eq!(
+            e.sentence,
+            "Cart rebuilt 4 widgets, including CartBadge (2)."
+        );
         assert_eq!(
             e.cause,
             Cause::Rebuilt {
                 root: "Cart".into(),
                 widgets: 4,
-                child: Some(("Badge".into(), 2)),
+                child: Some(("CartBadge".into(), 2)),
             }
         );
 

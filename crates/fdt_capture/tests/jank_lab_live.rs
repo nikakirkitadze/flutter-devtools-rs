@@ -271,17 +271,17 @@ async fn perf_checks(cap: &Capture, vm: &VmService, iso: &str) {
         let hit = (from4..snap.frames.len()).find_map(|i| {
             let r = frame_rebuilds(&snap, i)?;
             let root = r.roots.iter().find(|r| &*r.name == "CartScreen")?;
-            // R12 expects largest_child == "ProductGrid", but live data gives a different child
-            // (see task-25-report.md), so only its presence is asserted. ProductGrid must have
-            // been built, and the root must be CartScreen.
-            let grid =
-                root.largest_child.is_some() && r.widgets.iter().any(|w| &*w.name == "ProductGrid");
+            let grid = matches!(&root.largest_child, Some((n, _)) if &**n == "ProductGrid");
             let tiles = r.widgets.iter().find(|w| &*w.name == "ProductTile")?.builds;
             seen = format!("frame {i}: roots={:?} tiles={tiles}", r.roots);
             (grid && tiles == 64).then_some((i, e_sentence(&snap, i)))
         });
         if let Some((i, sentence)) = hit {
-            println!("rebuilds: frame {i}: {sentence}");
+            let root = &frame_rebuilds(&snap, i).unwrap().roots[0];
+            println!(
+                "rebuilds: frame {i}: {sentence} root={} widgets={} largest_child={:?}",
+                root.name, root.widgets, root.largest_child
+            );
             break;
         }
         if Instant::now() >= deadline {
