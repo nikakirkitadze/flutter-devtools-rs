@@ -1,7 +1,7 @@
 mod common;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use fdt_capture::{Capture, CaptureConfig, CaptureRuntime, ConnStatus, Target};
@@ -30,6 +30,8 @@ struct Sim {
     http: AtomicBool,
     socket: AtomicBool,
     trace: AtomicBool,
+    /// How many enables of widget-build tracing the app still rejects.
+    reject_enables: AtomicUsize,
 }
 
 impl Sim {
@@ -39,6 +41,7 @@ impl Sim {
             http: AtomicBool::new(http_before),
             socket: AtomicBool::new(http_before),
             trace: AtomicBool::new(false),
+            reject_enables: AtomicUsize::new(0),
         })
     }
 
@@ -79,7 +82,18 @@ impl Sim {
                 }
                 HTTP => switch(&sim.http, "HttpTimelineLoggingState"),
                 SOCKET => switch(&sim.socket, "_SocketProfilingState"),
-                TRACE => switch(&sim.trace, "_extensionType"),
+                TRACE => {
+                    let enabling = p["enabled"] == "true";
+                    if enabling
+                        && sim
+                            .reject_enables
+                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                            .is_ok()
+                    {
+                        return Err((-32000, "rejected".into()));
+                    }
+                    switch(&sim.trace, "_extensionType")
+                }
                 _ => Err((-32601, "Method not found".into())),
             }
         })
@@ -436,5 +450,26 @@ fn on_then_off_then_disconnect_sends_no_restore() {
         })
         .await;
         assert_eq!(sets(&server, TRACE, false), offs);
+    });
+}
+
+#[test]
+fn retry_after_rejected_enable_reaches_the_app() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let sim = Sim::new(false);
+        sim.reject_enables.store(1, Ordering::SeqCst);
+        let server = sim.server();
+        let cap = connected(&server, config(), &rt).await;
+        cap.set_trace_widget_builds(true);
+        common::eventually(SECS5, "first enable sent", || {
+            sets(&server, TRACE, true) == 1
+        })
+        .await;
+        // Rejected: the run still reports tracing off.
+        assert!(!tracing(&cap.snapshots().borrow()));
+        cap.set_trace_widget_builds(true);
+        common::wait_for(&cap, SECS5, "tracing on after the retry", tracing_on).await;
+        assert_eq!(sets(&server, TRACE, true), 2);
     });
 }

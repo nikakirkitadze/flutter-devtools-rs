@@ -630,6 +630,11 @@ async fn run(
                     let Some(actual) = apply_tracing(&svc, &cfg, &cpu, on, &mut stream_mode, &mut next).await else {
                         return;
                     };
+                    // The app refused: the wish is not the state, and the next request must
+                    // reach it again.
+                    if on && !actual {
+                        cpu.wanted.store(false, Ordering::Relaxed);
+                    }
                     shared.get().send(Ingest::Tracing(shared.get().run, actual));
                 }
                 Some(Msg::Reapply(isolate)) => {
