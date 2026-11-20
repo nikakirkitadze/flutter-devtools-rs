@@ -292,7 +292,9 @@ impl PerfControl {
     /// Puts tracing back if fdt turned it on. Each call gives up after `timeout`.
     pub(crate) async fn restore(&self, timeout: Duration) {
         self.shared.wanted.store(false, Ordering::Relaxed);
-        if !self.shared.restore_tracing.swap(false, Ordering::Relaxed) {
+        // Back to what the app had before fdt first changed it, if it differs now.
+        let before = *self.shared.tracing_before.lock().unwrap();
+        if before != Some(false) || !self.shared.tracing_now.swap(false, Ordering::Relaxed) {
             return;
         }
         let isolate = self.shared.main.lock().unwrap().clone();
@@ -328,7 +330,8 @@ impl PerfHub {
             main: Mutex::new(main_isolate),
             frames: AtomicU64::new(0),
             wanted: AtomicBool::new(false),
-            restore_tracing: AtomicBool::new(false),
+            tracing_before: Mutex::new(None),
+            tracing_now: AtomicBool::new(false),
         });
         let task = tokio::spawn(run(sink, svc.clone(), cfg, rx, shared.clone()));
         PerfHub {
@@ -386,7 +389,10 @@ struct Cpu {
     /// Widget-build tracing is wanted on.
     wanted: AtomicBool,
     /// fdt turned tracing on, so it turns it off when the user disconnects.
-    restore_tracing: AtomicBool,
+    /// What tracing was before fdt first changed it on this connection (`None`: not read).
+    tracing_before: Mutex<Option<bool>>,
+    /// What fdt last set it to.
+    tracing_now: AtomicBool,
 }
 
 /// The CPU side of the task: where the next window starts and whether a fetch is owed.
@@ -477,17 +483,15 @@ async fn apply_tracing(
     cfg: &PerfConfig,
     cpu: &Cpu,
     on: bool,
-    read_prior: &mut bool,
     stream_mode: &mut bool,
     next: &mut i64,
 ) -> Option<bool> {
     let isolate = cpu.main.lock().unwrap().clone();
     if on {
-        // Tracing someone else already turned on is not ours to turn off.
-        let prior = if *read_prior {
-            None
-        } else {
-            *read_prior = true;
+        // Tracing someone else already turned on is not ours to turn off: the state before
+        // fdt first touched it is kept for the whole connection.
+        let known = cpu.tracing_before.lock().unwrap().is_some();
+        if !known {
             match tokio::time::timeout(
                 cfg.call_timeout,
                 svc.get_bool_extension(PROFILE_WIDGET_BUILDS, &isolate),
@@ -495,19 +499,15 @@ async fn apply_tracing(
             .await
             {
                 Ok(Err(RpcError::Closed)) => return None,
-                Ok(Ok(was)) => Some(was),
-                _ => None,
+                Ok(Ok(was)) => *cpu.tracing_before.lock().unwrap() = Some(was),
+                _ => {}
             }
-        };
+        }
         match svc
             .set_bool_extension(PROFILE_WIDGET_BUILDS, &isolate, true)
             .await
         {
-            Ok(true) => {
-                if prior == Some(false) {
-                    cpu.restore_tracing.store(true, Ordering::Relaxed);
-                }
-            }
+            Ok(true) => cpu.tracing_now.store(true, Ordering::Relaxed),
             Ok(false) => return Some(false),
             Err(RpcError::Closed) => return None,
             Err(e) => {
@@ -529,14 +529,16 @@ async fn apply_tracing(
         .set_bool_extension(PROFILE_WIDGET_BUILDS, &isolate, false)
         .await
     {
-        Ok(on) => on,
+        Ok(on) => {
+            cpu.tracing_now.store(on, Ordering::Relaxed);
+            on
+        }
         Err(RpcError::Closed) => return None,
         Err(e) => {
             log::warn!("turning widget-build tracing off failed: {e}");
             false
         }
     };
-    cpu.restore_tracing.store(false, Ordering::Relaxed);
     if *stream_mode {
         match svc.stream_cancel("Timeline").await {
             Ok(()) => {}
@@ -575,8 +577,6 @@ async fn run(
     let mut pipe = Pipeline::new();
     let mut next = cfg.start_us;
     let mut stream_mode = false;
-    // Whether tracing was already on before fdt switched it, read once per connection.
-    let mut tracing_read = false;
     let mut held: Option<Msg> = None;
     loop {
         tokio::select! {
@@ -627,7 +627,7 @@ async fn run(
             } => match msg {
                 None => return,
                 Some(Msg::SetTracing(on)) => {
-                    let Some(actual) = apply_tracing(&svc, &cfg, &cpu, on, &mut tracing_read, &mut stream_mode, &mut next).await else {
+                    let Some(actual) = apply_tracing(&svc, &cfg, &cpu, on, &mut stream_mode, &mut next).await else {
                         return;
                     };
                     shared.get().send(Ingest::Tracing(shared.get().run, actual));
@@ -637,7 +637,7 @@ async fn run(
                     if cpu.wanted.load(Ordering::Relaxed)
                         && *cpu.main.lock().unwrap() == isolate
                     {
-                        let Some(actual) = apply_tracing(&svc, &cfg, &cpu, true, &mut tracing_read, &mut stream_mode, &mut next).await else {
+                        let Some(actual) = apply_tracing(&svc, &cfg, &cpu, true, &mut stream_mode, &mut next).await else {
                             return;
                         };
                         shared.get().send(Ingest::Tracing(shared.get().run, actual));

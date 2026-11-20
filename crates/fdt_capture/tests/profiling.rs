@@ -395,3 +395,46 @@ fn switching_apps_restores_the_previous_app() {
         }
     });
 }
+
+#[test]
+fn on_off_on_then_disconnect_restores_off() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let sim = Sim::new(false);
+        let server = sim.server();
+        let cap = connected(&server, config(), &rt).await;
+        cap.set_trace_widget_builds(true);
+        common::wait_for(&cap, SECS5, "tracing on", tracing_on).await;
+        cap.set_trace_widget_builds(false);
+        common::wait_for(&cap, SECS5, "tracing off", |s| !tracing(s)).await;
+        cap.set_trace_widget_builds(true);
+        common::wait_for(&cap, SECS5, "tracing on again", tracing_on).await;
+        cap.disconnect();
+        common::eventually(SECS5, "disconnected", || {
+            matches!(&*cap.status().borrow(), ConnStatus::Disconnected { .. })
+        })
+        .await;
+        assert!(!sim.trace.load(Ordering::SeqCst));
+    });
+}
+
+#[test]
+fn on_then_off_then_disconnect_sends_no_restore() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let sim = Sim::new(false);
+        let server = sim.server();
+        let cap = connected(&server, config(), &rt).await;
+        cap.set_trace_widget_builds(true);
+        common::wait_for(&cap, SECS5, "tracing on", tracing_on).await;
+        cap.set_trace_widget_builds(false);
+        common::wait_for(&cap, SECS5, "tracing off", |s| !tracing(s)).await;
+        let offs = sets(&server, TRACE, false);
+        cap.disconnect();
+        common::eventually(SECS5, "disconnected", || {
+            matches!(&*cap.status().borrow(), ConnStatus::Disconnected { .. })
+        })
+        .await;
+        assert_eq!(sets(&server, TRACE, false), offs);
+    });
+}
