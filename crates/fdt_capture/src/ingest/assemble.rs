@@ -7,9 +7,6 @@
 //! `M` (thread name) events carry no timestamp; they only name tracks and are never sorted into
 //! the timeline.
 
-// Nothing outside the benchmark hook uses this until live polling is wired in.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 
 use fdt_store::timeline::{MAX_DEPTH, TrackKind};
@@ -127,7 +124,6 @@ pub(crate) struct Assembler {
     /// Per slice name, the end of the last slice in each row.
     async_rows: HashMap<Box<str>, Vec<i64>>,
     stats: AssemblerStats,
-    names_changed: bool,
 }
 
 fn fnv(bytes: &[u8]) -> u64 {
@@ -202,7 +198,6 @@ impl Assembler {
             async_open: HashMap::new(),
             async_rows: HashMap::new(),
             stats: AssemblerStats::default(),
-            names_changed: false,
         }
     }
 
@@ -215,7 +210,6 @@ impl Assembler {
         self.last_stack = 0;
         self.async_open.clear();
         self.async_rows.clear();
-        self.names_changed = true;
     }
 
     pub(crate) fn stats(&self) -> AssemblerStats {
@@ -231,7 +225,6 @@ impl Assembler {
                     let n: Box<str> = clean_thread_name(n).into();
                     if self.thread_names.get(&e.tid) != Some(&n) {
                         self.thread_names.insert(e.tid, n);
-                        self.names_changed = true;
                     }
                 }
             }
@@ -473,7 +466,6 @@ impl Assembler {
                     .push(((TrackKind::Thread, s.tid as u64), name.into(), s.order));
             }
         }
-        self.names_changed = false;
     }
 }
 

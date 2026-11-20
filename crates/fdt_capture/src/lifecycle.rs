@@ -143,6 +143,7 @@ impl Session {
         };
         self.conn_gen += 1;
         self.life.shared = None;
+        self.perf = None;
         if let Some(w) = &mut self.writer {
             let at = session_time(w);
             w.end_run(run, at);
@@ -353,6 +354,8 @@ impl Session {
         app: AppInfo,
         vm_start_time: Option<i64>,
         calibration: fdt_store::clock::Calibration,
+        refresh_hz: Option<f32>,
+        connect_timeline_us: i64,
         reply: oneshot::Sender<SharedSink>,
     ) {
         let Some(tx) = self.tx.upgrade() else {
@@ -392,6 +395,9 @@ impl Session {
                 (id, clock, app)
             }
         };
+        if let Some(hz) = refresh_hz {
+            w.set_refresh_rate(id, hz);
+        }
         self.life.last_vm = Some(VmIdent {
             run: id,
             pid: app.pid,
@@ -406,7 +412,7 @@ impl Session {
         self.life.app = Some(app.clone());
         self.current_run = Some(id);
         self.net.new_run();
-        let shared = SharedSink::new(Sink::new(id, clock, self.conn_gen, tx));
+        let shared = SharedSink::new(Sink::new(id, clock, self.conn_gen, connect_timeline_us, tx));
         self.life.shared = Some(shared.clone());
         self.status.send_replace(ConnStatus::Connected {
             run: id,
@@ -439,7 +445,13 @@ impl Session {
             let id = w.start_run(app.clone(), clock, session_time(&w));
             // Everything the old session's work still sends is stale from here on.
             self.conn_gen += 1;
-            shared.set(Sink::new(id, clock, self.conn_gen, tx));
+            shared.set(Sink::new(
+                id,
+                clock,
+                self.conn_gen,
+                shared.get().connect_timeline_us,
+                tx,
+            ));
             self.current_run = Some(id);
             self.life.last_vm = Some(VmIdent {
                 run: id,
@@ -460,12 +472,32 @@ impl Session {
     /// An ingest message from a connection that is no longer current. A poller waiting for its
     /// answer must still get one, or it would stop.
     pub(crate) fn on_stale(&mut self, i: Ingest) {
-        if let Ingest::HttpPoll { reply, .. } = i {
-            let _ = reply.send(PollReply {
-                fetch: Vec::new(),
-                incomplete: false,
-                has_websocket: false,
-            });
+        let i = match i {
+            Ingest::HttpPoll { reply, .. } => {
+                let _ = reply.send(PollReply {
+                    fetch: Vec::new(),
+                    incomplete: false,
+                    has_websocket: false,
+                });
+                return;
+            }
+            i => i,
+        };
+        // Everything else from a connection that is no longer current is dropped. Listed so a
+        // new variant makes this match fail to compile.
+        match i {
+            Ingest::Timeline(_) | Ingest::PerfReady(_) => {}
+            Ingest::StartRun { .. }
+            | Ingest::Failed { .. }
+            | Ingest::Closed
+            | Ingest::Log(_)
+            | Ingest::Frame(_)
+            | Ingest::FlutterVersion { .. }
+            | Ingest::NetReady(_)
+            | Ingest::HttpPoll { .. }
+            | Ingest::Body { .. }
+            | Ingest::Sockets(_)
+            | Ingest::IsolateExit { .. } => {}
         }
     }
 }

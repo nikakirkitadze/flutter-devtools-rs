@@ -7,6 +7,7 @@ pub(crate) mod flutter_error;
 pub(crate) mod frames;
 pub(crate) mod http;
 pub(crate) mod logs;
+pub(crate) mod perf;
 pub(crate) mod sockets;
 pub(crate) mod stdout;
 
@@ -36,6 +37,11 @@ pub(crate) enum Ingest {
         /// `getVM.startTime`; with the pid it tells a restarted app from a dropped connection.
         vm_start_time: Option<i64>,
         calibration: Calibration,
+        /// The display's refresh rate, when the app told us (and it is a usable number).
+        refresh_hz: Option<f32>,
+        /// The timeline clock when the connection calibrated; frames and timeline events from
+        /// before it belong to an earlier listener and are not stored.
+        connect_timeline_us: i64,
         reply: oneshot::Sender<SharedSink>,
     },
     /// The connect sequence failed.
@@ -64,6 +70,10 @@ pub(crate) enum Ingest {
         result: http::Fetched,
     },
     Sockets(Vec<SocketUpdate>),
+    /// Slices and frame phases assembled from the VM timeline.
+    Timeline(perf::TimelineBatch),
+    /// The connection's timeline controls, for commands.
+    PerfReady(Arc<perf::PerfControl>),
     /// An isolate exited (a hot restart, or the app ending it): its unfinished requests end.
     IsolateExit {
         isolate: String,
@@ -75,6 +85,8 @@ pub(crate) enum Ingest {
 pub(crate) struct Sink {
     pub(crate) run: RunId,
     pub(crate) clock: RunClock,
+    /// Timeline µs of the connect; earlier frames are dropped.
+    pub(crate) connect_timeline_us: i64,
     conn: u64,
     tx: mpsc::UnboundedSender<SessionMsg>,
 }
@@ -84,11 +96,13 @@ impl Sink {
         run: RunId,
         clock: RunClock,
         conn: u64,
+        connect_timeline_us: i64,
         tx: mpsc::UnboundedSender<SessionMsg>,
     ) -> Sink {
         Sink {
             run,
             clock,
+            connect_timeline_us,
             conn,
             tx,
         }
@@ -142,6 +156,7 @@ pub(crate) struct Router {
     stderr: QuietLines,
     last_ts: [i64; 2],
     net: http::NetHub,
+    perf: perf::PerfHub,
 }
 
 impl Router {
@@ -152,6 +167,7 @@ impl Router {
         stdout_flush: Duration,
         string_fetch_timeout: Duration,
         net: http::NetHub,
+        perf: perf::PerfHub,
     ) -> Router {
         let logging = logs::spawn_worker(sink.clone(), svc.clone(), string_fetch_timeout);
         Router {
@@ -163,6 +179,7 @@ impl Router {
             stderr: QuietLines::new(stdout_flush),
             last_ts: [0; 2],
             net,
+            perf,
         }
     }
 
@@ -244,6 +261,7 @@ impl Router {
             StreamEvent::ServiceExtensionAdded { isolate, rpc } if rpc == http::ENABLE_RPC => {
                 self.net.start(&isolate.id);
             }
+            StreamEvent::TimelineEvents { events } => self.perf.events(events),
             _ => {}
         }
     }

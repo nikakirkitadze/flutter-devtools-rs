@@ -6,6 +6,7 @@ use fdt_vm::dart_io::HTTP_CALIBRATION_SINCE;
 use fdt_vm::events::decode_notification;
 use fdt_vm::rpc::{ConnectOptions, connect};
 use fdt_vm::service::{Mode, VmService, detect_mode};
+use fdt_vm::timeline::wanted_streams;
 use fdt_vm::types::{Isolate, IsolateRef, Vm};
 use fdt_vm::uri::VmServiceUri;
 use std::sync::Arc;
@@ -17,6 +18,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::capture::{SessionMsg, Target};
 use crate::config::CaptureConfig;
 use crate::ingest::http::{BodyFetcher, ENABLE_RPC, NetHub, PollerConfig};
+use crate::ingest::perf::{PerfConfig, PerfHub};
 use crate::ingest::{Ingest, Router};
 
 const STREAMS: [&str; 6] = [
@@ -73,8 +75,9 @@ fn store_mode(m: Mode) -> StoreMode {
 }
 
 /// Pairs the device and host clocks. The extension call waits on the app's main isolate, which
-/// can be paused or busy, so it gets `timeout` and then the fallback below.
-async fn calibrate_clock(svc: &VmService, main: &str, timeout: Duration) -> Calibration {
+/// can be paused or busy, so it gets `timeout` and then the fallback below. Also returns the
+/// timeline clock at the moment of the calibration (0 when it could not be read).
+async fn calibrate_clock(svc: &VmService, main: &str, timeout: Duration) -> (Calibration, i64) {
     let before = host_now_us();
     let timeline = svc.get_vm_timeline_micros().await;
     let profile = svc
@@ -82,14 +85,54 @@ async fn calibrate_clock(svc: &VmService, main: &str, timeout: Duration) -> Cali
         .await;
     let after = host_now_us();
     match (timeline, profile) {
-        (Ok(t), Ok(p)) => calibrate(before, after, p.timestamp, t),
+        (Ok(t), Ok(p)) => (calibrate(before, after, p.timestamp, t), t),
         (timeline, _) => {
             log::warn!("clock calibration failed; assuming the device clock matches the host");
-            Calibration {
+            let cal = Calibration {
                 skew_us: 0,
-                timeline_to_wall_us: timeline.map_or(0, |t| (before + after) / 2 - t),
-            }
+                timeline_to_wall_us: timeline.as_ref().map_or(0, |t| (before + after) / 2 - *t),
+            };
+            (cal, timeline.unwrap_or(0))
         }
+    }
+}
+
+/// The display's refresh rate. Any failure, and any value that is not a positive number, is
+/// "unknown": the frame budget falls back to 60 Hz.
+async fn read_refresh_rate(svc: &VmService, main: &str, timeout: Duration) -> Option<f32> {
+    match tokio::time::timeout(timeout, svc.display_refresh_rate(main)).await {
+        Ok(Ok(Some(hz))) if hz.is_finite() && hz > 0.0 => Some(hz),
+        Ok(Ok(other)) => {
+            log::debug!("no usable refresh rate: {other:?}");
+            None
+        }
+        Ok(Err(e)) => {
+            log::debug!("reading the refresh rate failed: {e}");
+            None
+        }
+        Err(_) => {
+            log::debug!("reading the refresh rate timed out");
+            None
+        }
+    }
+}
+
+/// Makes the VM record the `Dart` and `Embedder` timeline streams, keeping what else is recorded.
+/// Failures are only logged: the timeline is a feature, not a requirement of connecting.
+async fn fix_timeline_flags(svc: &VmService, timeout: Duration) {
+    let flags = match tokio::time::timeout(timeout, svc.get_vm_timeline_flags()).await {
+        Ok(Ok(f)) => f,
+        Ok(Err(e)) => return log::debug!("getVMTimelineFlags failed: {e}"),
+        Err(_) => return log::debug!("getVMTimelineFlags timed out"),
+    };
+    let Some(want) = wanted_streams(&flags) else {
+        return;
+    };
+    let names: Vec<&str> = want.iter().map(String::as_str).collect();
+    match tokio::time::timeout(timeout, svc.set_vm_timeline_flags(&names)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log::warn!("setVMTimelineFlags failed: {e}"),
+        Err(_) => log::warn!("setVMTimelineFlags timed out"),
     }
 }
 
@@ -168,7 +211,7 @@ async fn connect_and_ingest(
             }
             Ok(())
         };
-        let (isolate, listened, calibration) = tokio::join!(
+        let (isolate, listened, (calibration, connect_timeline_us)) = tokio::join!(
             svc.get_isolate(&main),
             listen,
             calibrate_clock(&svc, &main, cfg.calibration_timeout)
@@ -191,10 +234,34 @@ async fn connect_and_ingest(
                 Err(e) => log::debug!("getIsolate {} failed: {e}", other.id),
             }
         }
-        Ok::<_, Fail>((client, notes, svc, vm, main, isolate, calibration, profiled))
+        let refresh_hz = read_refresh_rate(&svc, &main, cfg.refresh_timeout).await;
+        fix_timeline_flags(&svc, cfg.refresh_timeout).await;
+        Ok::<_, Fail>((
+            client,
+            notes,
+            svc,
+            vm,
+            main,
+            isolate,
+            calibration,
+            profiled,
+            refresh_hz,
+            connect_timeline_us,
+        ))
     })
     .await;
-    let (client, mut notes, svc, vm, main, isolate, calibration, profiled) = match first {
+    let (
+        client,
+        mut notes,
+        svc,
+        vm,
+        main,
+        isolate,
+        calibration,
+        profiled,
+        refresh_hz,
+        connect_timeline_us,
+    ) = match first {
         Ok(r) => r?,
         Err(_) => {
             return Err(Fail {
@@ -233,6 +300,8 @@ async fn connect_and_ingest(
             app: Box::new(app),
             vm_start_time: vm.start_time,
             calibration,
+            refresh_hz,
+            connect_timeline_us,
             reply,
         },
     ));
@@ -263,6 +332,16 @@ async fn connect_and_ingest(
     for id in &profiled {
         hub.start(id);
     }
+    let perf = PerfHub::new(
+        sink.clone(),
+        svc.clone(),
+        PerfConfig {
+            poll: cfg.timeline_poll,
+            call_timeout: cfg.timeline_call_timeout,
+            start_us: connect_timeline_us,
+        },
+    );
+    sink.get().send(Ingest::PerfReady(perf.control()));
     let mut router = Router::new(
         sink,
         svc,
@@ -270,6 +349,7 @@ async fn connect_and_ingest(
         cfg.stdout_flush,
         cfg.string_fetch_timeout,
         hub,
+        perf,
     );
     loop {
         let flush = router.next_flush();

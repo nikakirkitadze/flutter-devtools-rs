@@ -13,6 +13,10 @@ fn us(v: &Value, key: &str) -> u32 {
 
 pub(crate) fn frame_input(sink: &Sink, data: &Value) -> Option<FrameInput> {
     let start = data.get("startTime").and_then(Value::as_i64)?;
+    // The app announces recent frames again to a new listener; those are from before the connect.
+    if start < sink.connect_timeline_us {
+        return None;
+    }
     Some(FrameInput {
         run: sink.run,
         number: data.get("number").and_then(Value::as_u64).unwrap_or(0),
@@ -42,7 +46,7 @@ mod tests {
                 timeline_to_wall_us: 1_000_000,
             },
         );
-        let sink = Sink::new(RunId(1), clock, 1, tx);
+        let sink = Sink::new(RunId(1), clock, 1, 0, tx);
         let f = frame_input(
             &sink,
             &json!({"number": 2, "startTime": 500, "elapsed": 48615, "build": 3180, "raster": 15895, "vsyncOverhead": 29501}),
@@ -55,5 +59,21 @@ mod tests {
         );
         assert_eq!(f.vsync_overhead_us, 29501);
         assert!(frame_input(&sink, &json!({"number": 1})).is_none());
+    }
+
+    #[test]
+    fn frames_from_before_the_connect_are_dropped() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let clock = RunClock::new(
+            1_000_000,
+            Calibration {
+                skew_us: 0,
+                timeline_to_wall_us: 1_000_000,
+            },
+        );
+        let sink = Sink::new(RunId(1), clock, 1, 500, tx);
+        let at = |t: i64| frame_input(&sink, &json!({"number": 1, "startTime": t}));
+        assert!(at(499).is_none());
+        assert!(at(500).is_some());
     }
 }

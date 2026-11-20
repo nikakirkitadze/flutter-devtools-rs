@@ -16,6 +16,7 @@ use tokio::time::{Instant, sleep_until};
 use crate::config::CaptureConfig;
 use crate::ingest::Ingest;
 use crate::ingest::http::NetState;
+use crate::ingest::perf::{self, PerfControl};
 use crate::lifecycle::Lifecycle;
 use crate::status::ConnStatus;
 
@@ -147,6 +148,9 @@ pub(crate) struct Session {
     /// Read live by the pollers.
     pub(crate) free_app_memory: Arc<AtomicBool>,
     pub(crate) life: Lifecycle,
+    /// The live connection's timeline task, for commands.
+    #[allow(dead_code)] // Used by the profiling commands that follow.
+    pub(crate) perf: Option<Arc<PerfControl>>,
 }
 
 impl Session {
@@ -172,6 +176,7 @@ impl Session {
             net: NetState::default(),
             free_app_memory,
             life: Lifecycle::new(),
+            perf: None,
         }
     }
 
@@ -285,8 +290,19 @@ impl Session {
                 app,
                 vm_start_time,
                 calibration,
+                refresh_hz,
+                connect_timeline_us,
                 reply,
-            } => return self.start_run(*app, vm_start_time, calibration, reply),
+            } => {
+                return self.start_run(
+                    *app,
+                    vm_start_time,
+                    calibration,
+                    refresh_hz,
+                    connect_timeline_us,
+                    reply,
+                );
+            }
             Ingest::Failed { message, details } => return self.on_failed(message, details),
             Ingest::Closed => return self.on_closed(),
             _ => {}
@@ -308,6 +324,8 @@ impl Session {
                 }
             }
             Ingest::NetReady(f) => self.net.set_fetcher(Some(f)),
+            Ingest::Timeline(b) => perf::store(w, b, recording),
+            Ingest::PerfReady(p) => self.perf = Some(p),
             Ingest::HttpPoll {
                 isolate,
                 updates,
