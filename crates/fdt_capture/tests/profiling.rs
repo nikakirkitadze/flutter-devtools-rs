@@ -87,7 +87,7 @@ impl Sim {
                     if enabling
                         && sim
                             .reject_enables
-                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                             .is_ok()
                     {
                         return Err((-32000, "rejected".into()));
