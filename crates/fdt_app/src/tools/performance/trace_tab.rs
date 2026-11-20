@@ -151,6 +151,9 @@ pub fn overlay_rects(
         },
         Overlay::Border,
     ));
+    // 4 outline + 1 drag + 2 borders + one per tick: the ticks are capped at 200 in
+    // `ruler_ticks`, so this fits `OVERLAY_QUADS`. Raising that cap must raise the budget.
+    debug_assert!(out.len() <= OVERLAY_QUADS, "{} overlay quads", out.len());
     out.truncate(OVERLAY_QUADS);
     out
 }
@@ -557,12 +560,21 @@ impl TraceView {
     }
 
     pub fn set_snapshot(&mut self, snap: Arc<Snapshot>, cx: &mut Context<Self>) {
-        let same = snap.timeline.slice_count() == self.snap.timeline.slice_count()
-            && snap.timeline.tracks().len() == self.snap.timeline.tracks().len();
+        let new_session = snap.session != self.snap.session;
+        let same = !new_session
+            && snap.timeline.slice_count() == self.snap.timeline.slice_count()
+            && tracks_match(&snap, &self.snap);
         self.snap = snap;
         if same {
             // Nothing the canvas shows changed (a log-only snapshot): keep its cache.
             return;
+        }
+        if new_session {
+            // Track ids restart in a new session, so every key of the old one is meaningless.
+            self.selected = None;
+            self.collapsed.clear();
+            self.scroll_y = 0.0;
+            self.fitted = true;
         }
         self.rebuild();
         if self.fitted {
@@ -814,6 +826,15 @@ impl TraceView {
             SessionTime(z),
         ))));
     }
+}
+
+/// Whether both snapshots list the same tracks: id, run, order and name. O(tracks).
+fn tracks_match(a: &Snapshot, b: &Snapshot) -> bool {
+    let (a, b) = (a.timeline.tracks(), b.timeline.tracks());
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| x.id == y.id && x.run == y.run && x.order == y.order && x.name == y.name)
 }
 
 fn hue(t: &fdt_ui::tokens::Palette, cat: SliceCat) -> fdt_ui::tokens::Color {
@@ -1473,6 +1494,74 @@ mod tests {
         // New data arrives: the page is told the tooltip is gone.
         v.update(cx, |v, cx| v.set_snapshot(stress(1, 1, 60), cx));
         assert_eq!(log.borrow().last(), Some(&TraceEvent::Hover(None)));
+    }
+
+    #[gpui_kit::test]
+    fn snapshot_changes_that_keep_counts_still_refresh(cx: &mut gpui_kit::TestAppContext) {
+        use crate::test_support::writer;
+        let names = |v: &Entity<TraceView>, cx: &mut gpui_kit::TestAppContext| {
+            v.read_with(cx, |v, _| {
+                v.snap
+                    .timeline
+                    .tracks()
+                    .iter()
+                    .map(|t| t.name.to_string())
+                    .collect::<Vec<_>>()
+            })
+        };
+        // A renamed track and a re-ordered track, same counts, same session.
+        let (mut w, run) = writer();
+        let name = w.intern_name("x");
+        let a = w.timeline_track(run, TrackKind::Thread, 1, "");
+        let b = w.timeline_track(run, TrackKind::Thread, 2, "b");
+        w.set_track_order(a, 10);
+        w.set_track_order(b, 10);
+        w.push_slice(a, 0, slice(0, 1, name, SliceCat::Dart), false);
+        w.push_slice(b, 0, slice(0, 1, name, SliceCat::Dart), false);
+        let first = w.publish();
+        let v = view(cx, first);
+        v.update(cx, |v, _| v.scroll_y = 0.0);
+        let notified = Rc::new(Cell::new(0));
+        let n = notified.clone();
+        let _obs = cx.update(|cx| cx.observe(&v, move |_, _| n.set(n.get() + 1)));
+        // An unchanged snapshot is not redrawn.
+        let same = v.read_with(cx, |v, _| v.snap.clone());
+        v.update(cx, |v, cx| v.set_snapshot(same, cx));
+        cx.run_until_parked();
+        assert_eq!(notified.get(), 0);
+        w.timeline_track(run, TrackKind::Thread, 1, "late name");
+        let renamed = w.publish();
+        v.update(cx, |v, cx| v.set_snapshot(renamed, cx));
+        cx.run_until_parked();
+        assert_eq!(notified.get(), 1);
+        assert!(names(&v, cx).contains(&"late name".to_string()));
+        w.set_track_order(b, 1);
+        let reordered = w.publish();
+        v.update(cx, |v, cx| v.set_snapshot(reordered.clone(), cx));
+        cx.run_until_parked();
+        assert_eq!(notified.get(), 2);
+        let first_row = v.read_with(cx, |v, _| v.rows[0].track);
+        assert_eq!(first_row, reordered.timeline.tracks()[0].id);
+        assert_eq!(first_row, b);
+        // A different session with equal counts drops the selection, hover and collapse.
+        let other = stress(2, 1, 1);
+        assert_eq!(other.timeline.slice_count(), 2);
+        assert_ne!(other.session, reordered.session);
+        let (log, _sub) = log_events(cx, &v);
+        v.update(cx, |v, cx| {
+            let track = v.rows[0].track;
+            v.collapsed.insert(track);
+            v.selected = Some(SliceKey {
+                track,
+                depth: 0,
+                start: 0,
+            });
+            v.hover = v.selected;
+            v.set_snapshot(other, cx);
+            assert!(v.selected.is_none() && v.hover.is_none() && v.collapsed.is_empty());
+        });
+        assert_eq!(log.borrow().last(), Some(&TraceEvent::Hover(None)));
+        assert_eq!(notified.get(), 3);
     }
 
     #[test]
