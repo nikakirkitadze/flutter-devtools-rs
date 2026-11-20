@@ -149,12 +149,37 @@ fn timeline_cells(c: &mut Criterion) {
     g.finish();
 }
 
+fn cpu_range_450k(c: &mut Criterion) {
+    let mut w = SessionWriter::new(0);
+    let run = start(&mut w);
+    let span = TimeRange::new(SessionTime(0), SessionTime(600_000_000_000));
+    synth::cpu(&mut w, run, 450_000, 7, span);
+    let snap = w.publish();
+    let sub = TimeRange::new(SessionTime(100_000_000_000), SessionTime(110_000_000_000));
+    let mut g = c.benchmark_group("cpu_range_450k");
+    g.bench_function("range_10s", |b| b.iter(|| black_box(snap.cpu.range(sub))));
+    g.bench_function("walk_10s_stacks", |b| {
+        b.iter(|| {
+            let mut n = 0usize;
+            for i in snap.cpu.range(sub) {
+                n += snap
+                    .cpu
+                    .stack(snap.cpu.samples().get(i).unwrap().leaf)
+                    .count();
+            }
+            black_box(n)
+        })
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     log_search_100k,
     log_search_1m,
     net_filter_100k,
     strip_bars_72k,
-    timeline_cells
+    timeline_cells,
+    cpu_range_450k
 );
 criterion_main!(benches);

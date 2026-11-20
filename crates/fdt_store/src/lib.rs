@@ -4,6 +4,7 @@
 pub mod budget;
 pub mod chunked;
 pub mod clock;
+pub mod cpu;
 pub mod frames;
 pub mod log_query;
 pub mod logs;

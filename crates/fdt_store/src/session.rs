@@ -1,6 +1,7 @@
 //! The single writer and the immutable snapshots views read.
 
 use crate::clock::RunClock;
+use crate::cpu::{CpuSample, CpuSnapshot, CpuStatus, CpuStore, FunctionId, NodeId};
 use crate::frames::{
     DEFAULT_BUDGET_US, FrameInput, FrameStore, FramesSnapshot, RasterPhase, UiPhases, budget_us,
 };
@@ -26,6 +27,7 @@ pub struct Snapshot {
     pub net: NetSnapshot,
     pub frames: FramesSnapshot,
     pub timeline: TimelineSnapshot,
+    pub cpu: CpuSnapshot,
     latest: SessionTime,
 }
 
@@ -41,6 +43,7 @@ impl Snapshot {
             net: NetSnapshot::default(),
             frames: FramesSnapshot::default(),
             timeline: TimelineSnapshot::default(),
+            cpu: CpuSnapshot::default(),
             latest: SessionTime(0),
         }
     }
@@ -76,6 +79,7 @@ pub struct SessionWriter {
     net: NetStore,
     frames: FrameStore,
     timeline: TimelineStore,
+    cpu: CpuStore,
     latest: SessionTime,
     generation: u64,
     dirty: bool,
@@ -108,6 +112,7 @@ impl SessionWriter {
             net: NetStore::new(chunk),
             frames: FrameStore::new(chunk),
             timeline: TimelineStore::new(),
+            cpu: CpuStore::new(),
             latest: SessionTime(0),
             generation: 0,
             dirty: false,
@@ -209,6 +214,47 @@ impl SessionWriter {
             self.touch(s.end());
         }
         stored
+    }
+
+    /// Interns a function by `(name, library)`; no library makes it native.
+    pub fn intern_function(&mut self, name: &str, library: Option<&str>) -> FunctionId {
+        let (id, new) = self.cpu.intern_function(name, library);
+        self.dirty |= new;
+        id
+    }
+
+    /// The trie node of a stack given root first. Stacks deeper than
+    /// [`crate::cpu::MAX_STACK_DEPTH`] lose their root end.
+    pub fn intern_stack(&mut self, root_first: &[FunctionId]) -> NodeId {
+        let before = self.cpu.node_count();
+        let id = self.cpu.intern_stack(root_first);
+        self.dirty |= self.cpu.node_count() != before;
+        id
+    }
+
+    /// Stores a batch of samples sorted by time, dropping those at or before the last stored
+    /// sample's time.
+    pub fn push_cpu_samples(&mut self, _run: RunId, batch: Vec<CpuSample>) {
+        if let Some(newest) = self.cpu.push_samples(batch) {
+            self.touch(newest);
+        }
+    }
+
+    /// The end of the time the run's CPU samples cover.
+    pub fn set_cpu_coverage(&mut self, run: RunId, end: SessionTime) {
+        self.cpu.set_coverage(run, end);
+        self.dirty = true;
+    }
+
+    pub fn set_cpu_status(&mut self, run: RunId, status: CpuStatus) {
+        self.cpu.set_status(run, status);
+        self.dirty = true;
+    }
+
+    /// The run's sample period in microseconds, from the VM.
+    pub fn set_cpu_period(&mut self, run: RunId, us: u32) {
+        self.cpu.set_period(run, us);
+        self.dirty = true;
     }
 
     #[cfg(test)]
@@ -314,6 +360,7 @@ impl SessionWriter {
                 net: self.net.snapshot(self.latest),
                 frames: self.frames.snapshot(),
                 timeline: self.timeline.snapshot(),
+                cpu: self.cpu.snapshot(),
                 latest: self.latest,
             });
         }

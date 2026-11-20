@@ -1,10 +1,11 @@
 //! Deterministic synthetic datasets for tests and benches (no `rand`).
 
+use crate::cpu::{CpuSample, FunctionId, NodeId};
 use crate::frames::{FrameInput, RasterPhase, UiPhases};
 use crate::logs::{LogInput, LogLevel, LogSource};
 use crate::net::HttpUpdate;
 use crate::session::SessionWriter;
-use crate::time::{RunId, SessionTime};
+use crate::time::{RunId, SessionTime, TimeRange};
 use crate::timeline::{Slice, SliceCat, TrackId, TrackKind};
 
 struct Rng(u64);
@@ -481,6 +482,52 @@ fn raster_slices(w: &mut SessionWriter, t: TrackId, r: &mut Rng, start: u64, dur
     start + dur
 }
 
+/// Appends `samples` CPU samples spread evenly over `span`, drawn from about 300 functions
+/// (20 % in the app's `screen.dart`, 50 % in the framework, 30 % native) and a call-stack trie
+/// of about 3,000 nodes, at most 40 deep.
+pub fn cpu(w: &mut SessionWriter, run: RunId, samples: usize, seed: u64, span: TimeRange) {
+    const APP: &str = "file:///app/lib/screen.dart";
+    const FRAMEWORK: &str = "file:///sdk/flutter/packages/flutter/lib/src/widgets/framework.dart";
+    const FUNCTIONS: u64 = 300;
+    const NODES: usize = 3_000;
+    const MAX_DEPTH: usize = 40;
+    let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let funcs: Vec<FunctionId> = (0..FUNCTIONS)
+        .map(|i| match i % 10 {
+            0..=1 => w.intern_function(&format!("screenFn{i}"), Some(APP)),
+            2..=6 => w.intern_function(&format!("widgetFn{i}"), Some(FRAMEWORK)),
+            _ => w.intern_function(&format!("native::fn{i}"), None),
+        })
+        .collect();
+    // Grow the trie from random existing stacks; each stack's leaf is a sampling target.
+    let mut stacks: Vec<Vec<FunctionId>> = vec![Vec::new()];
+    let mut leaves: Vec<NodeId> = Vec::new();
+    let mut nodes = 1usize;
+    while nodes < NODES {
+        let mut st = stacks[r.below(stacks.len() as u64) as usize].clone();
+        for _ in 0..1 + r.below(4) {
+            if st.len() < MAX_DEPTH {
+                st.push(funcs[r.below(FUNCTIONS) as usize]);
+            }
+        }
+        let leaf = w.intern_stack(&st);
+        if leaf.0 as usize >= nodes {
+            nodes = leaf.0 as usize + 1;
+            leaves.push(leaf);
+            stacks.push(st);
+        }
+    }
+    let dur = span.duration_ns() as u128;
+    let n = samples.max(1) as u128;
+    let batch = (0..samples)
+        .map(|i| CpuSample {
+            time: SessionTime(span.start.0 + (dur * i as u128 / n) as u64),
+            leaf: leaves[r.below(leaves.len() as u64) as usize],
+        })
+        .collect();
+    w.push_cpu_samples(run, batch);
+}
+
 /// A writer holding one run of synthetic data (`logs_n` log records, `requests_n` requests and
 /// `frames_n` frames at 120 Hz), not yet published.
 pub fn writer(
@@ -527,11 +574,21 @@ pub fn session(
 
 /// The writer behind [`stress_session`], for scenarios that keep appending to it.
 pub fn stress_writer(seed: u64) -> (SessionWriter, RunId) {
-    writer(seed, 1_000_000, 100_000, 72_000)
+    const FRAMES: usize = 72_000;
+    // `perf` pushes the frames itself, so the plain frames of `writer` are left out.
+    let (mut w, run) = writer(seed, 1_000_000, 100_000, 0);
+    perf(&mut w, run, FRAMES, seed, 120);
+    w.set_refresh_rate(run, 120.0);
+    let span = TimeRange::new(
+        SessionTime(0),
+        SessionTime(FRAMES as u64 * (1_000_000_000 / 120)),
+    );
+    cpu(&mut w, run, 450_000, seed, span);
+    (w, run)
 }
 
-/// The `fdt bench-ui` dataset: 1,000,000 logs, 100,000 requests and 72,000 frames (10 minutes
-/// at 120 Hz) in one run.
+/// The `fdt bench-ui` and M3 dataset in one run: 1,000,000 logs, 100,000 requests, 72,000
+/// frames (10 minutes at 120 Hz) with about 5,000,000 timeline slices, and 450,000 CPU samples.
 pub fn stress_session(seed: u64) -> std::sync::Arc<crate::Snapshot> {
     stress_writer(seed).0.publish()
 }
