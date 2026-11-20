@@ -1733,6 +1733,7 @@ dependencies = [
 name = "fdt_analysis"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "fdt_store",
  "rayon",
 ]

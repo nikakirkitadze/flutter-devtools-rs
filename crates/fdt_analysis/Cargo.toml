@@ -9,3 +9,10 @@ publish.workspace = true
 [dependencies]
 fdt_store = { path = "../fdt_store" }
 rayon = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "analysis"
+harness = false
