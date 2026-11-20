@@ -162,6 +162,21 @@ impl LodSeries {
         }
     }
 
+    /// Raises the bucket holding `t` to at least `value` on every level, without counting.
+    pub fn raise(&mut self, t: SessionTime, value: u32) {
+        for (k, level) in self.levels.iter_mut().enumerate() {
+            let idx = (t.0 >> (BASE_SHIFT + k as u32)) as usize;
+            if idx >= self.cap {
+                continue;
+            }
+            while level.len() <= idx {
+                level.push(Bucket::default());
+            }
+            let b = level.get_mut(idx).expect("bucket exists");
+            b.max_us = b.max_us.max(value);
+        }
+    }
+
     pub fn level(&self, k: usize) -> Option<&Chunked<Bucket>> {
         self.levels.get(k)
     }

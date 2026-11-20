@@ -3,6 +3,7 @@
 //! request bodies live under a byte budget with oldest-first eviction.
 
 use crate::chunked::{Chunked, ChunkedSnapshot};
+use crate::frames::{LodSeries, LodSnapshot};
 use crate::time::{EntryId, RunId, SessionTime};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -341,6 +342,7 @@ pub(crate) struct NetStore {
     limits: BodyLimits,
     bodies: VecDeque<(EntryId, BodyKind, usize)>,
     body_bytes: usize,
+    lod: LodSeries,
 }
 
 impl NetStore {
@@ -360,6 +362,7 @@ impl NetStore {
             limits: BodyLimits::default(),
             bodies: VecDeque::new(),
             body_bytes: 0,
+            lod: LodSeries::new(),
         }
     }
 
@@ -384,12 +387,16 @@ impl NetStore {
                 };
                 let rec = HttpRecord::from_update(id, u);
                 let done = rec.end.is_some();
+                self.lod.insert(rec.start, 0);
                 self.requests.push(Arc::new(rec));
                 self.req_index.insert(key, idx);
                 (idx, done)
             }
         };
         let rec = self.requests.get(idx).expect("just stored");
+        if rec.is_error() {
+            self.lod.raise(rec.start, 1);
+        }
         if self.host_set.insert(rec.host.clone()) {
             self.hosts.push(rec.host.clone());
             self.hosts_changed = true;
@@ -558,6 +565,10 @@ impl NetStore {
         rec.end = Some(at.max(rec.start));
         rec.error = Some(error.to_string());
         rec.ended_locally = true;
+        if rec.is_error() {
+            let start = rec.start;
+            self.lod.raise(start, 1);
+        }
     }
 
     pub(crate) fn set_body_state(&mut self, id: EntryId, kind: BodyKind, state: BodyState) {
@@ -636,6 +647,7 @@ impl NetStore {
         NetSnapshot {
             requests: self.requests.snapshot(),
             sockets: self.sockets.snapshot(),
+            lod: self.lod.snapshot(),
             hosts: self.hosts_cache.clone(),
             body_bytes: self.body_bytes,
             latest,
@@ -647,6 +659,7 @@ impl NetStore {
 pub struct NetSnapshot {
     requests: ChunkedSnapshot<Arc<HttpRecord>>,
     sockets: ChunkedSnapshot<SocketRecord>,
+    lod: LodSnapshot,
     hosts: Arc<[String]>,
     body_bytes: usize,
     latest: SessionTime,
@@ -657,6 +670,7 @@ impl Default for NetSnapshot {
         Self {
             requests: ChunkedSnapshot::default(),
             sockets: ChunkedSnapshot::default(),
+            lod: LodSnapshot::default(),
             hosts: Arc::from(Vec::new()),
             body_bytes: 0,
             latest: SessionTime(0),
@@ -665,6 +679,12 @@ impl Default for NetSnapshot {
 }
 
 impl NetSnapshot {
+    /// Level-of-detail summary of the requests by start time. A bucket's `count` is its
+    /// requests; `max_us == 1` marks a bucket holding an error.
+    pub fn lod(&self) -> &LodSnapshot {
+        &self.lod
+    }
+
     pub fn len(&self) -> usize {
         self.requests.len()
     }

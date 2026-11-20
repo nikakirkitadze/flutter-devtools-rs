@@ -6,6 +6,7 @@ pub mod chunked;
 pub mod clock;
 pub mod cpu;
 pub mod frames;
+pub mod lanes;
 pub mod log_query;
 pub mod logs;
 pub mod net;

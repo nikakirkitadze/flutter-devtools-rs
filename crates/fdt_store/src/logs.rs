@@ -2,11 +2,15 @@
 //! chunk. Sealed chunks are shared by `Arc` between snapshots; a snapshot
 //! copies only the tail chunk.
 
+use crate::chunked::{Chunked, ChunkedSnapshot};
+use crate::frames::{LodSeries, LodSnapshot};
 use crate::time::{EntryId, RunId, SessionTime, TimeRange};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
+/// Navigation seqs per chunk.
+const NAV_CHUNK: usize = 1024;
 /// Records per chunk.
 pub const LOG_CHUNK: usize = 1024;
 /// The store keeps at most this many bytes of a record's text.
@@ -165,6 +169,8 @@ pub(crate) struct LogStore {
     logger_ix: HashMap<Arc<str>, u32>,
     loggers_cache: Option<Arc<[Arc<str>]>>,
     len: usize,
+    lod: LodSeries,
+    navigation: Chunked<u32>,
 }
 
 impl LogStore {
@@ -180,6 +186,8 @@ impl LogStore {
             logger_ix: HashMap::new(),
             loggers_cache: None,
             len: 0,
+            lod: LodSeries::new(),
+            navigation: Chunked::with_chunk(NAV_CHUNK),
         }
     }
 
@@ -216,6 +224,10 @@ impl LogStore {
             line_count: count_lines(&text),
             error: input.error.map(Arc::new),
         });
+        self.lod.insert(input.time, input.level as u32);
+        if input.source == LogSource::Navigation {
+            self.navigation.push(seq as u32);
+        }
         self.len += 1;
         if self.tail.metas.len() >= self.chunk_size || self.tail.text.len() >= LOG_TAIL_MAX_BYTES {
             let base = self.len - self.tail.metas.len();
@@ -250,6 +262,8 @@ impl LogStore {
             tail: Arc::new(self.tail.clone()),
             loggers,
             len: self.len,
+            lod: self.lod.snapshot(),
+            navigation: self.navigation.snapshot(),
         }
     }
 }
@@ -278,6 +292,8 @@ pub struct LogsSnapshot {
     /// Index 0 is the empty "no logger" name.
     loggers: Arc<[Arc<str>]>,
     len: usize,
+    lod: LodSnapshot,
+    navigation: ChunkedSnapshot<u32>,
 }
 
 impl Default for LogsSnapshot {
@@ -296,6 +312,17 @@ impl fmt::Debug for LogsSnapshot {
 }
 
 impl LogsSnapshot {
+    /// Level-of-detail summary of the records by time; a bucket's `max_us` is its worst level
+    /// (`Debug=0, Info=1, Warning=2, Error=3`).
+    pub fn lod(&self) -> &LodSnapshot {
+        &self.lod
+    }
+
+    /// The seqs of `LogSource::Navigation` records, ascending.
+    pub fn navigation(&self) -> &ChunkedSnapshot<u32> {
+        &self.navigation
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }
