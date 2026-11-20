@@ -16,6 +16,9 @@ pub struct Related {
     pub frames: Vec<usize>,
     pub requests: Vec<u32>,
     pub logs: Vec<u32>,
+    /// How many requests and log lines the frame's window holds, shown or not (frames only).
+    pub requests_total: usize,
+    pub logs_total: usize,
 }
 
 /// `[start, start + max(elapsed, budget)]`.
@@ -76,10 +79,15 @@ pub fn related_to_frame(snap: &Snapshot, frame_seq: usize) -> Related {
         return Related::default();
     };
     let window = frame_window(frame, snap.frame_budget_us(frame.run));
+    let requests = net_in(snap, window);
+    let logs = logs_in(snap, window);
+    let (requests_total, logs_total) = (requests.len(), logs.len());
     Related {
         frames: Vec::new(),
-        requests: nearest(request_times(snap, net_in(snap, window)), frame.start),
-        logs: nearest(log_times(snap, logs_in(snap, window)), frame.start),
+        requests: nearest(request_times(snap, requests), frame.start),
+        logs: nearest(log_times(snap, logs), frame.start),
+        requests_total,
+        logs_total,
     }
 }
 
@@ -94,6 +102,7 @@ pub fn related_to_log(snap: &Snapshot, log_seq: usize) -> Related {
         frames: frame_for_log(snap, log_seq).into_iter().collect(),
         requests: nearest(request_times(snap, net_in(snap, TimeRange::new(t, t))), t),
         logs: Vec::new(),
+        ..Related::default()
     }
 }
 
@@ -133,6 +142,7 @@ pub fn related_to_request(snap: &Snapshot, req_seq: usize) -> Related {
             log_times(snap, logs_in(snap, TimeRange::new(req.start, end))),
             end,
         ),
+        ..Related::default()
     }
 }
 

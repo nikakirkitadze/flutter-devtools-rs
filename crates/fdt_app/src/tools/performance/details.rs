@@ -65,6 +65,8 @@ pub(super) fn pane_key(view: &PerformanceView, cx: &gpui_kit::App) -> String {
 
 const MAX_NAME_CHARS: usize = 80;
 const TOP: usize = 10;
+/// Requests and log lines the Related section shows, as in the Logs and Network details.
+const RELATED_SHOWN: usize = 5;
 const DASH: &str = "\u{2014}";
 /// The shortest time between two analyses of the same frame, as for the sidebar counts.
 const REFRESH_INTERVAL: Duration = Duration::from_millis(250); // token-check: allow: throttle, not a visual duration
@@ -795,6 +797,37 @@ impl PerformanceView {
         section
     }
 
+    /// A row that opens `tool` on the frame's window, with nothing selected.
+    fn show_all(
+        &self,
+        id: &'static str,
+        text: String,
+        tool: Tool,
+        window: Option<crate::nav::TimeRange>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let t = *cx.tokens();
+        div()
+            .id(id)
+            .test_support()
+            .aria_label(SharedString::from(text.clone()))
+            .w_full()
+            .truncate()
+            .px(space::S4)
+            .rounded(radius::CONTROL)
+            .cursor_pointer()
+            .text_color(Hsla::from(t.accent))
+            .hover(|s| s.bg(Hsla::from(t.elevated)))
+            .on_click(cx.listener(move |_, _, _, cx| {
+                cx.emit(OpenLocation(Location {
+                    page: Page::Tool(tool),
+                    selection: None,
+                    range: window,
+                }));
+            }))
+            .child(text)
+    }
+
     fn related_section(
         &mut self,
         e: &Explanation,
@@ -821,7 +854,37 @@ impl PerformanceView {
                 .child(text)
         };
         let mut any = false;
-        for (i, &seq) in e.related.requests.iter().enumerate() {
+        let frame = self
+            .selection
+            .and_then(|id| snap.frames.get(id.seq as usize))
+            .filter(|f| Some(f.id) == self.selection)
+            .cloned();
+        let start = frame.as_ref().map_or(0, |f| f.start.0);
+        // The nearest the frame start, in time order (the list is already in time order).
+        let nearest = |mut v: Vec<(u64, u32)>| -> Vec<u32> {
+            v.sort_by_key(|&(t, seq)| (t.abs_diff(start), seq));
+            v.truncate(RELATED_SHOWN);
+            v.sort_by_key(|&(t, seq)| (t, seq));
+            v.into_iter().map(|(_, s)| s).collect()
+        };
+        let requests = nearest(
+            e.related
+                .requests
+                .iter()
+                .filter_map(|&s| Some((snap.net.get(s as usize)?.start.0, s)))
+                .collect(),
+        );
+        let logs = nearest(
+            e.related
+                .logs
+                .iter()
+                .filter_map(|&s| Some((snap.logs.get_row(s as usize)?.time.0, s)))
+                .collect(),
+        );
+        let window = frame
+            .as_ref()
+            .map(|f| fdt_analysis::correlate::frame_window(f, snap.frame_budget_us(f.run)));
+        for (i, &seq) in requests.iter().enumerate() {
             let Some(r) = snap.net.get(seq as usize) else {
                 continue;
             };
@@ -841,7 +904,17 @@ impl PerformanceView {
                 }),
             ));
         }
-        for (i, &seq) in e.related.logs.iter().enumerate() {
+        if e.related.requests_total > requests.len() {
+            any = true;
+            section = section.child(self.show_all(
+                "details-requests-all",
+                format!("Show all {} requests in Network", e.related.requests_total),
+                Tool::Network,
+                window,
+                cx,
+            ));
+        }
+        for (i, &seq) in logs.iter().enumerate() {
             let Some(r) = snap.logs.get_row(seq as usize) else {
                 continue;
             };
@@ -857,6 +930,16 @@ impl PerformanceView {
             section = section.child(row(format!("details-log-{i}"), text).on_click(cx.listener(
                 move |this, _, _, cx| this.open_related(Tool::Logs, Selection::Log(id), cx),
             )));
+        }
+        if e.related.logs_total > logs.len() {
+            any = true;
+            section = section.child(self.show_all(
+                "details-logs-all",
+                format!("Show all {} log lines in Logs", e.related.logs_total),
+                Tool::Logs,
+                window,
+                cx,
+            ));
         }
         if !any {
             section = section.child(note(
@@ -1274,6 +1357,73 @@ mod tests {
             assert_eq!(s.current().page, Page::Tool(Tool::Logs));
             assert_eq!(s.current().selection, Some(Selection::Log(id)));
             assert_eq!(s.current().range, range);
+        });
+    }
+
+    fn crowded_session() -> Arc<fdt_store::Snapshot> {
+        snapshot(|w, run| {
+            phased_frame(w, run, 0, 1_000, 2);
+            for i in 0..8 {
+                let at = 1_001 + i;
+                request(
+                    w,
+                    run,
+                    "GET",
+                    &format!("http://h/r{i}"),
+                    Some(200),
+                    at,
+                    Some(at + 1),
+                );
+                w.push_log(log_at(run, 1_010 + i, LogLevel::Info));
+            }
+        })
+    }
+
+    #[gpui_kit::test]
+    fn related_is_capped_at_five_with_show_all(cx: &mut TestAppContext) {
+        let (shell, cx) = open_perf(cx, crowded_session());
+        select(&shell, cx, 0);
+        // The five nearest the frame start, in time order.
+        for i in 0..5 {
+            let req = label(
+                cx,
+                Box::leak(format!("details-request-{i}").into_boxed_str()),
+            );
+            assert!(req.unwrap().starts_with(&format!("GET /r{i}")));
+            let log = label(cx, Box::leak(format!("details-log-{i}").into_boxed_str()));
+            assert!(log.unwrap().contains(&format!("line at {}", 1_010 + i)));
+        }
+        assert!(!exists(cx, "details-request-5"));
+        assert!(!exists(cx, "details-log-5"));
+        assert_eq!(
+            label(cx, "details-requests-all").as_deref(),
+            Some("Show all 8 requests in Network")
+        );
+        assert_eq!(
+            label(cx, "details-logs-all").as_deref(),
+            Some("Show all 8 log lines in Logs")
+        );
+    }
+
+    #[gpui_kit::test]
+    fn show_all_opens_the_tool_with_the_frame_window_as_range(cx: &mut TestAppContext) {
+        let snap = crowded_session();
+        let frame = snap.frames.get(0).unwrap().clone();
+        let want = fdt_analysis::correlate::frame_window(&frame, snap.frame_budget_us(frame.run));
+        let (shell, cx) = open_perf(cx, snap);
+        select(&shell, cx, 0);
+        click(cx, "details-requests-all");
+        shell.read_with(cx, |s, _| {
+            assert_eq!(s.current().page, Page::Tool(Tool::Network));
+            assert_eq!(s.current().selection, None);
+            assert_eq!(s.current().range, Some(want));
+        });
+        select(&shell, cx, 0);
+        click(cx, "details-logs-all");
+        shell.read_with(cx, |s, _| {
+            assert_eq!(s.current().page, Page::Tool(Tool::Logs));
+            assert_eq!(s.current().selection, None);
+            assert_eq!(s.current().range, Some(want));
         });
     }
 
