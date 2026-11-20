@@ -526,7 +526,9 @@ impl Render for FrameChart {
                     bounds: Bounds::new(point(ox, line_y), size(w, layout::BORDER)),
                     color: Hsla::from(faint),
                 });
-                if let Some(row) = selected.filter(|&r| r >= first) {
+                if let Some(row) =
+                    selected.filter(|&r| r >= first && (r - first) as f32 * bar_px < f32::from(w))
+                {
                     let (x, bw) = column(row);
                     let b = layout::BORDER;
                     let rect = Bounds::new(point(ox + x, oy), size(bw.max(b * 2.0), h));

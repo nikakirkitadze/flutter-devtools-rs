@@ -77,6 +77,8 @@ pub struct PerformanceView {
     hover: Option<(usize, Point<Pixels>)>,
     /// Whether the chart follows the newest frame; "Latest" shows while it does not.
     following: bool,
+    /// Whether the Performance page is the current one.
+    page_active: bool,
     _observe: Subscription,
     _subs: Vec<Subscription>,
 }
@@ -109,6 +111,7 @@ impl PerformanceView {
             list,
             hover: None,
             following: true,
+            page_active: false,
             _observe: observe,
             _subs: subs,
         }
@@ -212,8 +215,22 @@ impl PerformanceView {
     pub fn set_tab(&mut self, tab: PerfTab, cx: &mut Context<Self>) {
         if self.tab != tab {
             self.tab = tab;
+            self.refresh_active(cx);
             cx.notify();
         }
+    }
+
+    /// Whether the Performance page is on screen. The frames table only works while its tab is.
+    pub fn set_page_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        if self.page_active != active {
+            self.page_active = active;
+            self.refresh_active(cx);
+        }
+    }
+
+    fn refresh_active(&mut self, cx: &mut Context<Self>) {
+        let on = self.page_active && self.tab == PerfTab::Frames;
+        self.list.update(cx, |l, cx| l.set_active(on, cx));
     }
 
     /// The shared time range and the selected frame, from the shell's location.

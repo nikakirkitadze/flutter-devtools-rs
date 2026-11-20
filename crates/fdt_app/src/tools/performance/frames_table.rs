@@ -23,6 +23,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, TestSupportExt as _, Window,
     div,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const DASH: &str = "\u{2013}";
@@ -37,8 +38,22 @@ pub fn frame_rows(
     slowest_first: bool,
     query: &str,
 ) -> Vec<u32> {
+    frame_rows_from(snap, range, slow_only, slowest_first, query, 0)
+}
+
+/// [`frame_rows`] for the frames with seq `from` and later only: the tail an incremental job
+/// appends to the rows it already has.
+pub fn frame_rows_from(
+    snap: &Snapshot,
+    range: Option<TimeRange>,
+    slow_only: bool,
+    slowest_first: bool,
+    query: &str,
+    from: usize,
+) -> Vec<u32> {
     let frames = &snap.frames;
-    let window = range.map_or(0..frames.len(), |r| frames.range(r));
+    let mut window = range.map_or(0..frames.len(), |r| frames.range(r));
+    window.start = window.start.max(from).min(window.end);
     let query = query.trim().trim_start_matches('#');
     let wanted = |seq: u32| {
         query.is_empty()
@@ -70,6 +85,93 @@ pub fn frame_rows(
         rows.sort_by(|&a, &b| time(b).cmp(&time(a)).then(a.cmp(&b)));
     }
     rows
+}
+
+/// The rows a finished job hands the UI thread, ready to swap in.
+struct JobResult {
+    rows: Arc<[u32]>,
+    /// The row of the frame that was selected when the job started.
+    selected_row: Option<usize>,
+    /// Seq to row, built only when the rows are not in frame order (Slowest first).
+    index: Option<Arc<HashMap<u32, usize>>>,
+    /// Whether the rows extend the previous ones (read by tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    incremental: bool,
+}
+
+/// Rows a job may extend instead of recomputing.
+struct Prev {
+    rows: Arc<[u32]>,
+    frames: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Jobs started, jobs that appended, and probes made by `row_of` on the UI thread.
+    pub(super) static JOBS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static INCREMENTAL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Builds the final rows off the UI thread. With `prev` (no sort, rows of the same inputs, only
+/// frames added) only the new tail is filtered and appended.
+fn run_job(
+    snap: &Snapshot,
+    range: Option<TimeRange>,
+    slow_only: bool,
+    slowest_first: bool,
+    query: &str,
+    selected: Option<usize>,
+    prev: Option<Prev>,
+) -> JobResult {
+    let (rows, incremental): (Arc<[u32]>, bool) = match prev {
+        Some(p) if !slowest_first && range.is_none() && p.frames <= snap.frames.len() => {
+            let tail = frame_rows_from(snap, range, slow_only, false, query, p.frames);
+            (p.rows.iter().copied().chain(tail).collect(), true)
+        }
+        _ => (
+            frame_rows(snap, range, slow_only, slowest_first, query).into(),
+            false,
+        ),
+    };
+    let index = slowest_first.then(|| {
+        Arc::new(
+            rows.iter()
+                .enumerate()
+                .map(|(row, &seq)| (seq, row))
+                .collect::<HashMap<_, _>>(),
+        )
+    });
+    let selected_row = selected.and_then(|s| lookup(&rows, index.as_deref(), s));
+    JobResult {
+        rows,
+        selected_row,
+        index,
+        incremental,
+    }
+}
+
+/// The row of frame `seq`: a hash lookup when the rows are sorted by time, else a binary search
+/// (they are in frame order).
+fn lookup(rows: &[u32], index: Option<&HashMap<u32, usize>>, seq: usize) -> Option<usize> {
+    let seq = u32::try_from(seq).ok()?;
+    match index {
+        Some(map) => map.get(&seq).copied(),
+        None => {
+            let (mut lo, mut hi) = (0, rows.len());
+            while lo < hi {
+                #[cfg(test)]
+                PROBES.with(|c| c.set(c.get() + 1));
+                let mid = lo + (hi - lo) / 2;
+                match rows[mid].cmp(&seq) {
+                    std::cmp::Ordering::Less => lo = mid + 1,
+                    std::cmp::Ordering::Greater => hi = mid,
+                    std::cmp::Ordering::Equal => return Some(mid),
+                }
+            }
+            None
+        }
+    }
 }
 
 pub(super) struct FramesTable {
@@ -213,6 +315,11 @@ pub struct FramesList {
     running: bool,
     task: Option<Task<()>>,
     rows: Arc<[u32]>,
+    /// Seq to row while the rows are sorted by time.
+    index: Option<Arc<HashMap<u32, usize>>>,
+    /// Whether the Frames tab is on screen. Nothing is recomputed while it is not; the list goes
+    /// stale and catches up when it is shown.
+    active: bool,
     /// The selected frame's seq, whether or not it is in the rows.
     selected: Option<usize>,
     _table_sub: Subscription,
@@ -282,6 +389,8 @@ impl FramesList {
             running: false,
             task: None,
             rows: Arc::from(Vec::new()),
+            index: None,
+            active: false,
             selected: None,
             _table_sub: table_sub,
             _input_sub: input_sub,
@@ -326,49 +435,102 @@ impl FramesList {
         cx.notify();
     }
 
-    /// Starts a job for the newest snapshot and inputs unless one is current or running; a
-    /// running job starts the next one when it finishes.
+    /// Whether the Frames tab is showing. Hidden, the list does no work; shown again, it catches
+    /// up in one job.
+    pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        if self.active != active {
+            self.active = active;
+            if active {
+                self.request(cx);
+            }
+        }
+    }
+
+    /// Starts a job for the newest snapshot and inputs unless one is current or running (or the
+    /// tab is hidden); a running job starts the next one when it finishes.
     fn request(&mut self, cx: &mut Context<Self>) {
+        if !self.active {
+            return;
+        }
         let key = self.key(cx);
         if self.running || self.applied == Some(key) {
             return;
         }
         self.running = true;
+        #[cfg(test)]
+        JOBS.with(|c| c.set(c.get() + 1));
         let snap = self.session.read(cx).snapshot().clone();
         let (range, slow, slowest) = (self.range, self.slow_only, self.slowest_first);
         let query = self.query.to_string();
+        let selected = self.selected;
+        // Only the frames changed since the rows were built: append instead of recomputing.
+        let prev = self
+            .applied
+            .filter(|a| a.session == key.session && a.version == key.version)
+            .map(|a| Prev {
+                rows: self.rows.clone(),
+                frames: a.frames,
+            });
         self.task = Some(cx.spawn(async move |this, cx| {
             let job = snap.clone();
-            let rows = cx
-                .background_spawn(async move { frame_rows(&job, range, slow, slowest, &query) })
+            let result = cx
+                .background_spawn(async move {
+                    run_job(&job, range, slow, slowest, &query, selected, prev)
+                })
                 .await;
             this.update(cx, |this, cx| {
                 this.running = false;
-                this.apply(key, snap, rows.into(), cx);
+                this.apply(key, snap, selected, result, cx);
                 this.request(cx);
             })
             .ok();
         }));
     }
 
-    fn apply(&mut self, key: Key, snap: Arc<Snapshot>, rows: Arc<[u32]>, cx: &mut Context<Self>) {
+    /// Swaps a finished job's rows in. No work here grows with the number of rows.
+    fn apply(
+        &mut self,
+        key: Key,
+        snap: Arc<Snapshot>,
+        job_selected: Option<usize>,
+        result: JobResult,
+        cx: &mut Context<Self>,
+    ) {
+        #[cfg(test)]
+        if result.incremental {
+            INCREMENTAL.with(|c| c.set(c.get() + 1));
+        }
         self.applied = Some(key);
-        self.rows = rows.clone();
+        self.rows = result.rows.clone();
+        self.index = result.index;
+        let rows = result.rows;
         self.table.update(cx, |table, cx| {
             let d = table.delegate_mut();
             d.snap = snap;
             d.rows = rows;
             cx.notify();
         });
-        self.sync_table(cx);
+        // The job looked the selection up; if it changed since, look it up again (cheap).
+        let row = if self.selected == job_selected {
+            result.selected_row
+        } else {
+            self.row_of(self.selected)
+        };
+        self.show_row(row, cx);
         cx.notify();
+    }
+
+    fn row_of(&self, seq: Option<usize>) -> Option<usize> {
+        lookup(&self.rows, self.index.as_deref(), seq?)
     }
 
     /// Shows the selected frame's row, if it is listed.
     fn sync_table(&mut self, cx: &mut Context<Self>) {
-        let row = self
-            .selected
-            .and_then(|s| self.rows.iter().position(|&r| r as usize == s));
+        let row = self.row_of(self.selected);
+        self.show_row(row, cx);
+    }
+
+    fn show_row(&mut self, row: Option<usize>, cx: &mut Context<Self>) {
         match row {
             Some(row) => {
                 if self.table.read(cx).selected_row() != Some(row) {
@@ -469,6 +631,11 @@ impl FramesList {
                 .scroll_to_item_strict(row, ScrollStrategy::Top);
             cx.notify();
         });
+    }
+
+    #[cfg(test)]
+    pub fn shares_rows_with_table(&self, cx: &App) -> bool {
+        Arc::ptr_eq(&self.rows, &self.table.read(cx).delegate().rows)
     }
 
     #[cfg(test)]
@@ -804,5 +971,121 @@ mod tests {
         assert_eq!(seq(&shell, cx), Some(3));
         // The location already is this frame, so opening it adds no step.
         assert_eq!(shell.read_with(cx, |s, _| s.history().back_len()), back);
+    }
+
+    #[test]
+    fn appended_frames_filter_incrementally() {
+        use crate::tools::performance::fixtures::push_frames;
+        for (slow, query) in [(false, ""), (true, ""), (false, "1"), (true, "2")] {
+            let (mut w, run) = crate::test_support::writer();
+            push_frames(&mut w, run, 0, 50);
+            let first = w.publish();
+            let r1 = run_job(&first, None, slow, false, query, None, None);
+            assert!(!r1.incremental);
+            push_frames(&mut w, run, 50, 130);
+            let second = w.publish();
+            let prev = Prev {
+                rows: r1.rows.clone(),
+                frames: 50,
+            };
+            let inc = run_job(&second, None, slow, false, query, None, Some(prev));
+            let full = run_job(&second, None, slow, false, query, None, None);
+            assert!(inc.incremental && !full.incremental);
+            assert_eq!(inc.rows, full.rows, "slow {slow} query {query:?}");
+        }
+        // A sort or a range end cannot append.
+        let (mut w, run) = crate::test_support::writer();
+        push_frames(&mut w, run, 0, 20);
+        let snap = w.publish();
+        let r = run_job(&snap, None, false, true, "", None, None);
+        let prev = Prev {
+            rows: r.rows,
+            frames: 20,
+        };
+        assert!(!run_job(&snap, None, false, true, "", None, Some(prev)).incremental);
+    }
+
+    #[gpui_kit::test]
+    fn the_list_appends_new_frames_incrementally(cx: &mut TestAppContext) {
+        use crate::tools::performance::fixtures::push_frames;
+        let (mut w, run) = crate::test_support::writer();
+        push_frames(&mut w, run, 0, 40);
+        let (shell, cx, fake) = crate::test_support::open_shell_fake(cx);
+        fake.snaps.send(w.publish()).unwrap();
+        fake.status
+            .send(crate::test_support::connected("demo", true))
+            .unwrap();
+        cx.run_until_parked();
+        cx.dispatch_action(ShowPerformance);
+        cx.run_until_parked();
+        let list = shell.read_with(cx, |s, cx| s.performance_view().read(cx).list().clone());
+        assert_eq!(rows(&list, cx).len(), 40);
+        INCREMENTAL.with(|c| c.set(0));
+        push_frames(&mut w, run, 40, 70);
+        fake.snaps.send(w.publish()).unwrap();
+        cx.run_until_parked();
+        assert_eq!(rows(&list, cx), (0..70).collect::<Vec<u32>>());
+        assert_eq!(INCREMENTAL.with(|c| c.get()), 1);
+    }
+
+    #[gpui_kit::test]
+    fn hidden_tab_does_not_recompute(cx: &mut TestAppContext) {
+        let (shell, list, cx) = open(cx, 40);
+        let perf = shell.read_with(cx, |s, _| s.performance_view().clone());
+        perf.update(cx, |p, cx| {
+            p.set_tab(crate::tools::performance::PerfTab::Cpu, cx)
+        });
+        let jobs = JOBS.with(|c| c.get());
+        list.update_in(cx, |l, _, cx| l.set_slow_only(true, cx));
+        list.update_in(cx, |l, w, cx| l.set_filter_text("1", w, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            JOBS.with(|c| c.get()),
+            jobs,
+            "no job while the tab is hidden"
+        );
+        assert_eq!(rows(&list, cx).len(), 40, "the old rows stay");
+        perf.update(cx, |p, cx| {
+            p.set_tab(crate::tools::performance::PerfTab::Frames, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(JOBS.with(|c| c.get()), jobs + 1, "one job catches up");
+        assert!(rows(&list, cx).len() < 40);
+        assert!(list.read_with(cx, |l, cx| l.is_settled(cx)));
+    }
+
+    #[gpui_kit::test]
+    fn apply_does_not_scan_rows(cx: &mut TestAppContext) {
+        let (shell, list, cx) = open(cx, 5_000);
+        assert!(list.read_with(cx, |l, cx| l.shares_rows_with_table(cx)));
+        PROBES.with(|c| c.set(0));
+        let mut to = shell.read_with(cx, |s, _| s.current().clone());
+        to.selection = Some(Selection::Frame(frame_id(&shell, cx, 4_321)));
+        shell.update_in(cx, |s, w, cx| s.navigate(to.clone(), w, cx));
+        cx.run_until_parked();
+        // The job found the row; a later selection costs one binary search.
+        let mut to2 = to;
+        to2.selection = Some(Selection::Frame(frame_id(&shell, cx, 17)));
+        shell.update_in(cx, |s, w, cx| s.navigate(to2, w, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            list.read_with(cx, |l, cx| l.table_selected_row(cx)),
+            Some(17)
+        );
+        let probes = PROBES.with(|c| c.get());
+        assert!(probes <= 32, "{probes} probes for 5000 rows");
+        list.update_in(cx, |l, _, cx| l.set_slowest_first(true, cx));
+        cx.run_until_parked();
+        PROBES.with(|c| c.set(0));
+        let mut to3 = shell.read_with(cx, |s, _| s.current().clone());
+        to3.selection = Some(Selection::Frame(frame_id(&shell, cx, 99)));
+        shell.update_in(cx, |s, w, cx| s.navigate(to3, w, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            PROBES.with(|c| c.get()),
+            0,
+            "sorted rows use the hash index"
+        );
+        assert!(list.read_with(cx, |l, cx| l.shares_rows_with_table(cx)));
     }
 }

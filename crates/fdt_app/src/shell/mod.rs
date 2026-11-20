@@ -357,8 +357,11 @@ impl MainWindow {
             Some(Selection::Frame(id)) => Some(id),
             _ => None,
         };
-        self.performance
-            .update(cx, |perf, cx| perf.set_location(loc.range, frame, cx));
+        let on_page = loc.page == Page::Tool(Tool::Performance);
+        self.performance.update(cx, |perf, cx| {
+            perf.set_page_active(on_page, cx);
+            perf.set_location(loc.range, frame, cx);
+        });
         self.timeline
             .update(cx, |timeline, cx| timeline.set_location(loc.range, cx));
     }
