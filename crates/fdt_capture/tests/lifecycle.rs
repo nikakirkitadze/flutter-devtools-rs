@@ -382,9 +382,11 @@ fn a_request_that_finishes_while_disconnected_is_body_fetched_after_the_reconnec
     let rt = CaptureRuntime::new().unwrap();
     rt.handle().block_on(async {
         let app = fake(1, 100);
-        app.profile.add(json!({"id": "7", "isolateId": "isolates/1", "method": "GET",
+        app.profile.add(
+            json!({"id": "7", "isolateId": "isolates/1", "method": "GET",
             "uri": "http://h:1/slow", "startTime": T + 5_000_000, "events": [],
-            "request": {"headers": {}, "contentLength": 0}}));
+            "request": {"headers": {}, "contentLength": 0}}),
+        );
         let (cap, apps) = start_discovered(&rt, cfg());
         cap.connect(Target::Discovered(disc(&app.server)));
         common::wait_for(&cap, Duration::from_secs(5), "a pending request", |s| {

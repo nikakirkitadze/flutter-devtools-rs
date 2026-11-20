@@ -612,6 +612,13 @@ impl LogsView {
             .then(|| self.rows.filtered().len())
     }
 
+    /// Whether the rows on screen are for an older filter than the one in the field, with search
+    /// text, so an empty list does not yet mean "no matches". A job that only brings in new
+    /// records (or a level or range change with no text) does not count.
+    pub(super) fn search_pending(&self) -> bool {
+        self.filter.text.is_some() && !self.applied.is_some_and(|a| a.key.version == self.version)
+    }
+
     /// Whether a text search is scanning and has been for longer than the loading delay.
     pub(super) fn searching(&self) -> bool {
         self.show_skeleton && self.filter.text.is_some()
@@ -1308,10 +1315,10 @@ impl Render for LogsView {
                 .into_any_element();
         }
         let empty = self.applied.is_some() && self.rows.filtered().is_empty();
-        let body = if empty && self.settled() {
-            self.no_match(cx)
-        } else if empty {
+        let body = if empty && self.search_pending() {
             self.searching_empty(cx)
+        } else if empty {
+            self.no_match(cx)
         } else {
             self.rows_list(cx)
         };
@@ -1970,6 +1977,31 @@ mod tests {
         cx.run_until_parked();
         assert!(!present(cx, "logs-searching"));
         assert!(present(cx, "logs-match-count"));
+    }
+
+    #[gpui_kit::test]
+    fn an_empty_list_says_no_match_while_only_new_logs_are_being_scanned(cx: &mut TestAppContext) {
+        let (_shell, view, cx) = open_search(cx, 40);
+        type_query(cx, "zzz-nothing");
+        assert_eq!(view.read_with(cx, |v, _| v.filtered_len()), 0);
+        assert!(view.read_with(cx, |v, _| v.is_settled()));
+        assert!(!present(cx, "logs-searching-empty"));
+        assert!(present(cx, "logs-clear-filters"));
+        // An incremental job for new records is running; the filter has not changed.
+        view.update(cx, |v, cx| {
+            v.running = true;
+            cx.notify();
+        });
+        assert!(!view.read_with(cx, |v, _| v.search_pending()));
+        assert!(!present(cx, "logs-searching-empty"));
+        assert!(present(cx, "logs-clear-filters"));
+        // A changed filter that has not finished does show it.
+        view.update(cx, |v, cx| {
+            v.version += 1;
+            cx.notify();
+        });
+        assert!(view.read_with(cx, |v, _| v.search_pending()));
+        assert!(present(cx, "logs-searching-empty"));
     }
 
     #[gpui_kit::test]
