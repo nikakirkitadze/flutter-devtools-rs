@@ -163,6 +163,8 @@ pub(super) struct DetailsState {
     loads: HashMap<(EntryId, BodyKind), Load>,
     scroll: [UniformListScrollHandle; 2],
     shown: Option<EntryId>,
+    /// The session the waits and `shown` belong to: ids repeat across sessions.
+    session: u64,
 }
 
 impl DetailsState {
@@ -182,6 +184,7 @@ impl DetailsState {
                 UniformListScrollHandle::new(),
             ],
             shown: None,
+            session: 0,
         }
     }
 
@@ -347,10 +350,19 @@ impl NetworkView {
 
     /// Ends waits that are over: the body arrived whole, or the run is no longer connected.
     pub(super) fn details_session_changed(&mut self, cx: &mut Context<Self>) {
+        let snap = self.session.read(cx).snapshot().clone();
+        if self.details.session != snap.session {
+            // Another session: its requests reuse the ids of the old one's, so no wait or
+            // scroll position carries over.
+            self.details.session = snap.session;
+            self.details.loads.clear();
+            self.details.pending.clear();
+            self.details.shown = None;
+            cx.notify();
+        }
         if self.details.loads.is_empty() {
             return;
         }
-        let snap = self.session.read(cx).snapshot().clone();
         let before = self.details.loads.len();
         let keys: Vec<(EntryId, BodyKind)> = self.details.loads.keys().copied().collect();
         for (id, kind) in keys {

@@ -209,8 +209,10 @@ impl MainWindow {
             return;
         }
         self.history = NavHistory::new(Location::at(self.current().page));
-        // Each view notices the new session id on its next result and drops its selection,
-        // expansion and caches, whatever its filter or the range did.
+        // The location reset below clears the range and selection in both views. Each view then
+        // notices the new session id in its own data (Logs on its first result, full or
+        // first-phase; Network on its next job and snapshot) and drops its expansion, details
+        // index and waits, whatever its filter or the range did.
         self.sync_logs(cx);
         self.refresh_counts(cx);
         cx.notify();

@@ -384,6 +384,23 @@ impl LogsView {
         }
     }
 
+    /// Whether `snap` is another session than the one the rows on screen index. Nothing on
+    /// screen before the first result, so that is not a replacement.
+    fn is_new_session(&self, snap: &Snapshot) -> bool {
+        self.applied.is_some() && self.snap.session != snap.session
+    }
+
+    /// The store under the rows was replaced: nothing expanded, selected or indexed before refers
+    /// to these records.
+    fn reset_for_replaced_store(&mut self, cx: &mut Context<Self>) {
+        self.rows.clear_expanded();
+        self.pending = None;
+        if self.selected.take().is_some() {
+            cx.emit(LogsEvent::Moved(None));
+        }
+        self.details.reset();
+    }
+
     /// Takes a finished job's result.
     fn apply(&mut self, key: Key, snap: Arc<Snapshot>, result: JobResult, cx: &mut Context<Self>) {
         let at_end = self.scroll.is_scrolled_to_end();
@@ -391,16 +408,8 @@ impl LogsView {
         let old_rows = self.rows.row_count();
         // A different session replaced the store whatever the filter did meanwhile (clearing the
         // range bumps its version, which makes the result look like a fresh filter).
-        let new_session = self.applied.is_some_and(|a| a.key.session != key.session);
-        if result.replaced || new_session {
-            // A new session or run replaced the store: nothing expanded or selected before
-            // refers to these records.
-            self.rows.clear_expanded();
-            self.pending = None;
-            if self.selected.take().is_some() {
-                cx.emit(LogsEvent::Moved(None));
-            }
-            self.details.reset();
+        if result.replaced || self.is_new_session(&snap) {
+            self.reset_for_replaced_store(cx);
         }
         self.rows.set_filtered(result.filtered);
         self.counts = result.counts;
@@ -444,6 +453,9 @@ impl LogsView {
     ) {
         if self.version != key.version || self.applied.is_some_and(|a| a.key == key) {
             return;
+        }
+        if self.is_new_session(&snap) {
+            self.reset_for_replaced_store(cx);
         }
         // The rows index the job's snapshot, so the two change together.
         self.snap = snap;
@@ -909,6 +921,21 @@ impl LogsView {
     #[cfg(test)]
     pub fn details_lines(&self) -> usize {
         self.details.line_count()
+    }
+
+    #[cfg(test)]
+    pub fn apply_first_in_for_test(
+        &mut self,
+        rows: Vec<u32>,
+        snap: Arc<Snapshot>,
+        cx: &mut Context<Self>,
+    ) {
+        let key = Key {
+            session: snap.session,
+            generation: snap.generation,
+            version: self.version,
+        };
+        self.apply_first(key, rows, snap, cx);
     }
 
     #[cfg(test)]
@@ -2374,6 +2401,44 @@ mod tests {
         assert_eq!(view.read_with(cx, |v, _| v.selected()), Some(5));
         assert!(!view.read_with(cx, |v, _| v.is_expanded(5)));
         assert_eq!(label_of(cx, "details-line-0").as_deref(), Some("short-rec"));
+    }
+
+    #[gpui_kit::test]
+    fn a_new_sessions_first_phase_rows_reset_expansion_and_details(cx: &mut TestAppContext) {
+        let (shell, cx, h) = open_shell_fake(cx);
+        let (mut w, run) = writer();
+        let long = format!("line {}\nsecond\nthird", "x".repeat(200));
+        feed_with_record_5(&mut w, run, 12, &long);
+        h.status.send(connected("demo", true)).unwrap();
+        h.snaps.send(w.publish()).unwrap();
+        cx.run_until_parked();
+        frame(cx);
+        let view = view_of(&shell, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| v.set_search("line", false, window, cx));
+        });
+        cx.run_until_parked();
+        frame(cx);
+        click(cx, "log-row-5");
+        cx.simulate_keystrokes("space enter");
+        cx.run_until_parked();
+        frame(cx);
+        assert!(view.read_with(cx, |v, _| v.is_expanded(5)));
+        assert!(view.read_with(cx, |v, _| v.details_open()));
+        // A new session's first-phase rows arrive (its full result has not).
+        let (mut w2, run2) = writer();
+        feed_with_record_5(&mut w2, run2, 12, "line-5xyz");
+        let snap2 = w2.publish();
+        view.update(cx, |v, cx| {
+            v.apply_first_in_for_test((0..12).collect(), snap2, cx)
+        });
+        frame(cx);
+        assert!(!view.read_with(cx, |v, _| v.is_expanded(5)));
+        assert_eq!(view.read_with(cx, |v, _| v.selected()), None);
+        click(cx, "log-row-5");
+        frame(cx);
+        assert_eq!(view.read_with(cx, |v, _| v.selected()), Some(5));
+        assert_eq!(label_of(cx, "details-line-0").as_deref(), Some("line-5xyz"));
     }
 
     #[gpui_kit::test]

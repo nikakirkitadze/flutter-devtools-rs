@@ -66,6 +66,8 @@ const TABS: [NetTab; 3] = [NetTab::Requests, NetTab::WebSockets, NetTab::Errors]
 /// What a filter job was computed for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Key {
+    /// The store the job read: generations restart with every session.
+    session: u64,
     generation: u64,
     /// Bumped on every filter, tab or range change.
     version: u64,
@@ -245,8 +247,10 @@ impl NetworkView {
         if !self.active {
             return;
         }
+        let snap = self.session.read(cx).snapshot();
         let key = Key {
-            generation: self.session.read(cx).snapshot().generation,
+            session: snap.session,
+            generation: snap.generation,
             version: self.version,
         };
         // A running job re-reads the newest snapshot and filter when it finishes a round.
@@ -268,6 +272,7 @@ impl NetworkView {
                 let next = this.update(cx, |this, cx| {
                     let snap = this.session.read(cx).snapshot().clone();
                     let key = Key {
+                        session: snap.session,
                         generation: snap.generation,
                         version: this.version,
                     };
@@ -1300,6 +1305,65 @@ mod tests {
         assert_eq!(view.read_with(cx, |v, cx| v.cell_text(0, 3, cx)), "500");
         assert_eq!(view.read_with(cx, |v, _| v.error_count()), 1);
         let _ = app_info;
+    }
+
+    #[gpui_kit::test]
+    fn a_new_session_with_the_same_generation_replaces_the_rows(cx: &mut TestAppContext) {
+        let (shell, cx, h) = open_shell_fake(cx);
+        let (mut w, run) = writer();
+        for i in 0..30 {
+            put(&mut w, run, i, |_| {});
+        }
+        let first = w.publish();
+        h.status.send(connected("demo", true)).unwrap();
+        h.snaps.send(first.clone()).unwrap();
+        cx.run_until_parked();
+        press(cx, "cmd-4", "ctrl-4");
+        cx.run_until_parked();
+        frame(cx);
+        let view = shell.read_with(cx, |s, _| s.network_view().clone());
+        assert_eq!(filtered(&view, cx), 30);
+        let (mut w2, run2) = writer();
+        for i in 0..12 {
+            put(&mut w2, run2, i, |_| {});
+        }
+        let second = w2.publish();
+        assert_eq!(first.generation, second.generation);
+        assert_ne!(first.session, second.session);
+        h.snaps.send(second).unwrap();
+        cx.run_until_parked();
+        assert_eq!(filtered(&view, cx), 12);
+    }
+
+    #[gpui_kit::test]
+    fn a_full_body_wait_does_not_survive_a_new_session(cx: &mut TestAppContext) {
+        let truncated = |w: &mut fdt_store::SessionWriter, run: RunId| {
+            let id = put(w, run, 0, |_| {});
+            w.set_body_state(id, BodyKind::Response, body(&[b'a'; 1024], 4096));
+        };
+        let (shell, view, cx, h, _w, _run) = connected_with(cx, truncated);
+        click(cx, "net-load-full");
+        let loads = |h: &crate::test_support::FakeHandle| {
+            h.commands()
+                .iter()
+                .filter(|c| c.starts_with("load_full_body"))
+                .count()
+        };
+        assert_eq!(loads(&h), 1);
+        // A new session (a later generation, so only the session differs from the old one).
+        let (mut w2, run2) = writer();
+        truncated(&mut w2, run2);
+        let _ = w2.publish();
+        put(&mut w2, run2, 1, |_| {});
+        h.snaps.send(w2.publish()).unwrap();
+        cx.run_until_parked();
+        frame(cx);
+        let _ = shell;
+        click_row(cx, 0);
+        assert_eq!(view.read_with(cx, |v, _| v.selected()), Some(0));
+        assert!(present(cx, "net-load-full"), "no spinner from the old wait");
+        click(cx, "net-load-full");
+        assert_eq!(loads(&h), 2, "the new session's request can be loaded");
     }
 
     // ---- details (Task 19) and the Task 18 carry-overs ----

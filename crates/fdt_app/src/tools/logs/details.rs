@@ -16,10 +16,13 @@ use serde::Serialize;
 use std::ops::Range;
 use std::sync::Arc;
 
+/// A record across sessions: run ids restart at 1 in every session, so an id alone is not unique.
+pub(super) type RecordKey = (u64, EntryId);
+
 /// The details pane's per-record caches and scroll positions.
 pub(super) struct DetailsState {
     /// The record the line index is for, and where each of its lines starts.
-    lines: Option<(EntryId, Arc<Vec<u32>>)>,
+    lines: Option<(RecordKey, Arc<Vec<u32>>)>,
     message_scroll: UniformListScrollHandle,
     stack_scroll: UniformListScrollHandle,
 }
@@ -136,8 +139,9 @@ impl LogsView {
                 )
                 .into_any_element();
         };
-        if self.details.lines.as_ref().map(|l| l.0) != Some(rec.id) {
-            self.details.lines = Some((rec.id, Arc::new(line_starts(rec.text))));
+        if self.details.lines.as_ref().map(|l| l.0) != Some((self.snap.session, rec.id)) {
+            self.details.lines =
+                Some(((self.snap.session, rec.id), Arc::new(line_starts(rec.text))));
             self.details.message_scroll = UniformListScrollHandle::new();
             self.details.stack_scroll = UniformListScrollHandle::new();
         }
@@ -354,7 +358,7 @@ impl LogsView {
         let Some((id, starts)) = self.details.lines.clone() else {
             return Vec::new();
         };
-        if id != rec.id {
+        if id != (self.snap.session, rec.id) {
             return Vec::new();
         }
         let bg = t.accent.with_alpha(alpha::SELECTION);
