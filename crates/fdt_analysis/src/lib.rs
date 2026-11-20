@@ -4,6 +4,7 @@
 pub mod breakdown;
 pub mod correlate;
 pub mod cpu_tree;
+pub mod explain;
 pub mod rebuilds;
 pub mod user_code;
 

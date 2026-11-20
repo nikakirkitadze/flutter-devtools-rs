@@ -129,18 +129,22 @@ pub fn frame_rebuilds(snap: &Snapshot, frame_seq: usize) -> Option<FrameRebuilds
     }
 
     let name = |id: NameId| -> Arc<str> { Arc::from(snap.timeline.name(id)) };
+    // The child with the largest subtree per parent, in one pass (the last of equals wins).
+    let mut largest_of: Vec<Option<usize>> = vec![None; nodes.len()];
+    for (c, n) in nodes.iter().enumerate() {
+        if let Some(p) = n.parent
+            && largest_of[p].is_none_or(|b| nodes[b].subtree <= n.subtree)
+        {
+            largest_of[p] = Some(c);
+        }
+    }
     let mut roots: Vec<RootRebuild> = Vec::new();
     for (i, n) in nodes.iter().enumerate().filter(|(_, n)| n.parent.is_none()) {
-        let largest = nodes
-            .iter()
-            .filter(|c| c.parent == Some(i))
-            .max_by_key(|c| c.subtree)
-            .map(|c| (name(c.name), c.subtree));
         roots.push(RootRebuild {
             name: name(n.name),
             widgets: n.subtree,
             total_ns: n.end - n.start,
-            largest_child: largest,
+            largest_child: largest_of[i].map(|c| (name(nodes[c].name), nodes[c].subtree)),
         });
     }
     roots.sort_by(|a, b| b.widgets.cmp(&a.widgets).then(b.total_ns.cmp(&a.total_ns)));

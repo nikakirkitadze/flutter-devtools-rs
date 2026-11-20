@@ -52,7 +52,7 @@ pub struct FlameSpan {
 }
 
 /// Counts the samples of `range` per trie node. `None` when cancelled.
-fn leaf_counts(
+pub(crate) fn leaf_counts(
     cpu: &CpuSnapshot,
     range: Option<TimeRange>,
     cancel: &AtomicBool,
