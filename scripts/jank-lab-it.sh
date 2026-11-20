@@ -17,6 +17,8 @@ case "$mode" in
 esac
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
+# Keep the macOS window above others: a covered window draws no frames.
+export JANK_LAB_FLOAT=1
 case "$(uname -s)" in
   Darwin) device=macos ;;
   Linux) device=linux ;;

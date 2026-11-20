@@ -270,6 +270,22 @@ fn key_param(method: &str) -> Option<&'static str> {
     }
 }
 
+/// What a polling method answers once its recorded answers run out: nothing new, never a repeat
+/// of the last answer (a repeat would look like fresh data).
+fn empty_when_exhausted(method: &str) -> Option<Value> {
+    match method {
+        "getVMTimeline" => Some(json!({
+            "type": "Timeline", "traceEvents": [], "timeOriginMicros": 0, "timeExtentMicros": 0
+        })),
+        "getPerfettoCpuSamples" => Some(json!({
+            "type": "PerfettoCpuSamples", "samplePeriod": 1000, "maxStackDepth": 128,
+            "sampleCount": 0, "pid": 0, "timeOriginMicros": 0, "timeExtentMicros": 0,
+            "samples": ""
+        })),
+        _ => None,
+    }
+}
+
 #[derive(Default)]
 struct Transcript {
     /// Answers per method (and per key for keyed methods), in recorded order.
@@ -361,6 +377,11 @@ impl ReplayShared {
         };
         let mut served = self.served.lock().unwrap();
         let n = served.entry(slot).or_insert(0);
+        if *n >= list.len()
+            && let Some(empty) = empty_when_exhausted(method)
+        {
+            return Ok(empty);
+        }
         let rec = list[(*n).min(list.len() - 1)].clone();
         *n += 1;
         rec
@@ -372,6 +393,8 @@ impl ReplayShared {
 /// Matching rules:
 /// - `getObject` is matched by `objectId`, `getHttpProfileRequest` by `id` and
 ///   `ext.jank_lab.run` by `action`. A key that was never recorded is `-32602 "Invalid params"`.
+/// - `getVMTimeline` and `getPerfettoCpuSamples` are answered with their recorded responses in
+///   recorded order, then with an empty timeline or an empty sample set (never a repeat).
 /// - Every other method is answered with its recorded responses in recorded order, then the
 ///   last one again. `isolateId` and all other parameters are ignored.
 /// - A method that was never recorded is `-32601 "Method not found"`.

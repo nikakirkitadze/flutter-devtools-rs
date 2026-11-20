@@ -57,7 +57,7 @@ pub struct TimelineFlags {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TimelineChunk {
     pub events: Vec<TraceEvent>,
-    /// Events that were not objects or lacked `ph` or `ts`.
+    /// Events that were not objects or lacked `ph`, or `ts` (other than `M` events, which have none).
     pub skipped: u32,
 }
 
@@ -117,7 +117,12 @@ fn decode_event(v: &Value) -> Option<TraceEvent> {
         "M" => Phase::Metadata,
         _ => Phase::Other,
     };
-    let ts_us = micros(o.get("ts")?)?;
+    // Real `M` (metadata) events carry no `ts`; every other kind needs one.
+    let ts_us = match o.get("ts") {
+        Some(v) => micros(v)?,
+        None if ph == Phase::Metadata => 0,
+        None => return None,
+    };
     let name = o.get("name").and_then(Value::as_str).unwrap_or("");
     let args = o.get("args");
     let thread_name = (ph == Phase::Metadata && name == "thread_name")
@@ -356,6 +361,18 @@ mod tests {
         assert_eq!(e[0].frame_number, Some(2778));
         assert_eq!(e[1].frame_number, Some(12));
         assert_eq!(e[2].frame_number, None);
+    }
+
+    #[test]
+    fn metadata_events_need_no_timestamp() {
+        let (e, skipped) = decode_trace_events(
+            r#"[{"name":"thread_name","ph":"M","pid":1,"tid":7,"args":{"name":"DartWorker (7)"}},
+                {"name":"x","ph":"B","pid":1,"tid":7}]"#,
+        );
+        assert_eq!(skipped, 1, "only the B event without ts is skipped");
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].thread_name.as_deref(), Some("DartWorker (7)"));
+        assert_eq!(e[0].ts_us, 0);
     }
 
     #[test]

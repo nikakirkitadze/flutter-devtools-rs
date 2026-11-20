@@ -2,8 +2,11 @@
 //! JSONL transcript.
 //!
 //! ```text
-//! cargo run -p fdt_vm --example record_jank_lab -- --uri ws://127.0.0.1:PORT/TOKEN/ws --out file.jsonl
+//! cargo run -p fdt_vm --example record_jank_lab -- --uri ws://127.0.0.1:PORT/TOKEN/ws --out file.jsonl [--mode perf]
 //! ```
+//!
+//! `--mode perf` (profile builds only) records timeline, tracing-stream and CPU-sample traffic
+//! instead of the logs and network session.
 //!
 //! Everything written goes through `Tap`, so tokens and home-directory paths are redacted.
 
@@ -11,7 +14,9 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use fdt_vm::flutter::PROFILE_WIDGET_BUILDS;
 use fdt_vm::rpc::{ConnectOptions, RpcClient, RpcError, connect};
+use fdt_vm::service::VmService;
 use fdt_vm::tap::Tap;
 use serde_json::{Value, json};
 use tokio::time::sleep;
@@ -30,6 +35,14 @@ const STREAMS: [&str; 7] = [
 struct Seen {
     flutter_version_method: Option<String>,
     truncated_ids: BTreeSet<String>,
+    frames: u32,
+    timeline_blocks: u32,
+}
+
+fn opt_arg(name: &str) -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    let i = args.iter().position(|a| a == name)?;
+    args.get(i + 1).cloned()
 }
 
 fn arg(name: &str) -> String {
@@ -80,6 +93,10 @@ async fn main() {
                         seen.flutter_version_method = Some(m.to_string());
                     }
                 }
+                Some("Extension") if event["extensionKind"] == "Flutter.Frame" => {
+                    seen.frames += 1;
+                }
+                Some("TimelineEvents") => seen.timeline_blocks += 1,
                 Some("Logging") => {
                     let msg = &event["logRecord"]["message"];
                     if msg["valueAsStringIsTruncated"] == json!(true)
@@ -110,6 +127,17 @@ async fn main() {
         .as_array()
         .is_some_and(|a| a.iter().any(|e| e == "ext.flutter.reassemble"));
     call(&client, "getFlagList", json!({})).await;
+
+    if opt_arg("--mode").as_deref() == Some("perf") {
+        assert!(!is_debug, "--mode perf needs a profile build");
+        record_perf(&client, &main_id, &seen).await;
+        sleep(Duration::from_millis(300)).await;
+        client.close();
+        drop(client);
+        reader.abort();
+        eprintln!("recorded {out} (perf)");
+        return;
+    }
 
     // 2. Streams.
     for stream in STREAMS {
@@ -250,4 +278,132 @@ async fn main() {
         out,
         if is_debug { "debug" } else { "profile" }
     );
+}
+
+/// Calls the extension `ext.jank_lab.run` and waits for the app to react.
+async fn act(client: &RpcClient, main_id: &str, action: &str, settle: Duration) {
+    call(
+        client,
+        "ext.jank_lab.run",
+        json!({"isolateId": main_id, "action": action}),
+    )
+    .await;
+    sleep(settle).await;
+}
+
+/// Two timeline polls of about 500 ms each, then nothing else: `[origin, now]` windows.
+async fn poll_timeline(svc: &VmService, client: &RpcClient, origin: &mut i64) {
+    sleep(Duration::from_millis(500)).await;
+    let now = micros(client).await;
+    let extent = now - *origin;
+    match svc
+        .get_vm_timeline(*origin, extent, Duration::from_secs(30))
+        .await
+    {
+        Ok(chunk) => eprintln!(
+            "  timeline poll: {} events, {} skipped",
+            chunk.events.len(),
+            chunk.skipped
+        ),
+        Err(e) => eprintln!("getVMTimeline: {e}"),
+    }
+    *origin = now + 1;
+}
+
+async fn micros(client: &RpcClient) -> i64 {
+    call(client, "getVMTimelineMicros", json!({}))
+        .await
+        .and_then(|v| v["timestamp"].as_i64())
+        .expect("getVMTimelineMicros")
+}
+
+/// The `--mode perf` session: jank, raster jank, then widget-build tracing on the rebuilds screen.
+async fn record_perf(client: &RpcClient, main_id: &str, seen: &Arc<Mutex<Seen>>) {
+    let svc = VmService::new(client.clone());
+
+    // 1. Setup: flags, views, refresh rate, then the streams the app's events arrive on.
+    if let Err(e) = svc.get_vm_timeline_flags().await {
+        eprintln!("getVMTimelineFlags: {e}");
+    }
+    match svc.display_refresh_rate(main_id).await {
+        Ok(hz) => eprintln!("refresh rate: {hz:?}"),
+        Err(e) => eprintln!("refresh rate: {e}"),
+    }
+    for stream in ["Extension", "Isolate"] {
+        call(client, "streamListen", json!({"streamId": stream})).await;
+    }
+    sleep(Duration::from_millis(500)).await;
+
+    // 2. UI-thread jank: two polls and the CPU samples of the same window.
+    act(client, main_id, "goto_jank", Duration::from_secs(1)).await;
+    let jank_origin = micros(client).await;
+    let mut origin = jank_origin;
+    poll_timeline(&svc, client, &mut origin).await;
+    poll_timeline(&svc, client, &mut origin).await;
+    match svc
+        .get_perfetto_cpu_samples(
+            main_id,
+            jank_origin,
+            origin - jank_origin,
+            Duration::from_secs(30),
+        )
+        .await
+    {
+        Ok((profile, _)) => eprintln!("  cpu: {} samples", profile.samples.len()),
+        Err(e) => eprintln!("getPerfettoCpuSamples: {e}"),
+    }
+
+    // 3. Raster jank.
+    act(client, main_id, "raster_on", Duration::from_secs(1)).await;
+    origin = micros(client).await;
+    poll_timeline(&svc, client, &mut origin).await;
+    poll_timeline(&svc, client, &mut origin).await;
+    act(client, main_id, "raster_off", Duration::from_millis(300)).await;
+
+    // 4. Widget-build tracing on the rebuilds screen, pushed over the Timeline stream.
+    act(client, main_id, "home", Duration::from_millis(300)).await;
+    act(client, main_id, "goto_rebuilds", Duration::from_secs(1)).await;
+    if let Err(e) = svc
+        .set_bool_extension(PROFILE_WIDGET_BUILDS, main_id, true)
+        .await
+    {
+        eprintln!("{PROFILE_WIDGET_BUILDS}: {e}");
+    }
+    let window = opt_arg("--stream-ms")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120);
+    let window: u64 = window;
+    // The listen reply queues behind the first blocks, which the recorder reads and redacts more
+    // slowly than the app produces them, so the window is timed from sending, not from the reply.
+    let listen = {
+        let client = client.clone();
+        tokio::spawn(
+            async move { call(&client, "streamListen", json!({"streamId": "Timeline"})).await },
+        )
+    };
+    let t0 = Instant::now();
+    sleep(Duration::from_millis(window)).await;
+    eprintln!("  stream window slept {:?}", t0.elapsed());
+    // Cancel first: with widget builds on the stream carries about 400 k events a second.
+    if let Err(e) = svc.stream_cancel("Timeline").await {
+        eprintln!("streamCancel: {e}");
+    }
+    if let Err(e) = svc
+        .set_bool_extension(PROFILE_WIDGET_BUILDS, main_id, false)
+        .await
+    {
+        eprintln!("{PROFILE_WIDGET_BUILDS}: {e}");
+    }
+    let _ = listen.await;
+    act(client, main_id, "home", Duration::from_millis(300)).await;
+
+    let (frames, blocks) = {
+        let s = seen.lock().unwrap();
+        (s.frames, s.timeline_blocks)
+    };
+    eprintln!("Flutter.Frame events: {frames}; TimelineEvents blocks: {blocks}");
+    if frames == 0 {
+        eprintln!("no Flutter.Frame events arrived: the window is probably covered or locked");
+        std::process::exit(3);
+    }
 }

@@ -1,23 +1,26 @@
 #!/usr/bin/env bash
 # Records a redacted VM service transcript of fixtures/jank_lab.
 #
-#   scripts/record-jank-lab.sh <debug|profile>
+#   scripts/record-jank-lab.sh <debug|profile|perf>
 #
 # Runs `flutter run --machine` for the fixture, reads the VM service URL from the daemon's
 # `app.debugPort` event, runs the recorder against it, then stops only the app it started
 # (daemon `app.stop`, then that process group on timeout). Output goes to
-# fixtures/recordings/jank_lab-<mode>.jsonl.
+# fixtures/recordings/jank_lab-<mode>.jsonl. `perf` runs the app in profile mode and records
+# timeline, tracing-stream and CPU-sample traffic.
 set -euo pipefail
 
 mode="${1:-}"
 case "$mode" in
   debug) mode_flags=() ;;
-  profile) mode_flags=(--profile) ;;
-  *) echo "usage: $0 <debug|profile>" >&2; exit 2 ;;
+  profile|perf) mode_flags=(--profile) ;;
+  *) echo "usage: $0 <debug|profile|perf>" >&2; exit 2 ;;
 esac
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 out="$root/fixtures/recordings/jank_lab-$mode.jsonl"
+# Keep the macOS window above others: a covered window draws no frames.
+export JANK_LAB_FLOAT=1
 case "$(uname -s)" in
   Darwin) device=macos ;;
   Linux) device=linux ;;
@@ -73,5 +76,5 @@ done
 [ -n "$uri" ] || { echo "timed out waiting for the VM service" >&2; exit 1; }
 sleep 2 # let the first frame and main() settle
 
-cargo run -q -p fdt_vm --example record_jank_lab -- --uri "$uri" --out "$out"
+cargo run -q --release -p fdt_vm --example record_jank_lab -- --uri "$uri" --out "$out" --mode "$mode"
 echo "wrote $out"

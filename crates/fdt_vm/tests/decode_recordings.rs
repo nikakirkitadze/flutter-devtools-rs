@@ -381,3 +381,117 @@ async fn http_calls_pass_the_isolate_and_updated_since() {
     assert_eq!(params["isolateId"], "isolates/1");
     assert_eq!(params["updatedSince"], 9_000_000_000_000_000i64);
 }
+
+// ---- perf recording ----
+
+/// Every `getVMTimeline` result as (JSON text of the result), in recorded order.
+fn timeline_results(f: &Frames) -> Vec<String> {
+    f.results
+        .iter()
+        .filter(|(req, _)| req["method"] == "getVMTimeline")
+        .map(|(_, res)| res.to_string())
+        .collect()
+}
+
+/// Each `TimelineEvents` notification's event array as JSON text.
+fn timeline_blocks(f: &Frames) -> Vec<String> {
+    f.notes
+        .iter()
+        .filter(|n| n.params["event"]["kind"] == "TimelineEvents")
+        .map(|n| n.params["event"]["timelineEvents"].to_string())
+        .collect()
+}
+
+#[test]
+fn perf_recording_decodes() {
+    use fdt_vm::perfetto::decode_cpu_samples;
+    use fdt_vm::timeline::{Phase, decode_trace_events};
+
+    let f = load("jank_lab-perf.jsonl");
+    let polls = timeline_results(&f);
+    let blocks = timeline_blocks(&f);
+    assert!(polls.len() >= 4, "expected at least 4 polls");
+    assert!(!blocks.is_empty(), "expected TimelineEvents blocks");
+
+    let mut events = Vec::new();
+    for text in polls.iter().chain(blocks.iter()) {
+        let (e, skipped) = decode_trace_events(text);
+        assert_eq!(skipped, 0, "events skipped while decoding");
+        events.extend(e);
+    }
+
+    // Frames in the timeline match the Flutter.Frame events.
+    let frames: std::collections::HashSet<u64> = f
+        .notes
+        .iter()
+        .filter(|n| n.params["event"]["extensionKind"] == "Flutter.Frame")
+        .filter_map(|n| n.params["event"]["extensionData"]["number"].as_u64())
+        .collect();
+    assert!(!frames.is_empty(), "no Flutter.Frame events recorded");
+    assert!(
+        events.iter().any(|e| &*e.name == "Animator::BeginFrame"
+            && e.frame_number.is_some_and(|n| frames.contains(&n))),
+        "no Animator::BeginFrame matches a recorded frame number"
+    );
+
+    // Thread names come from metadata events.
+    assert!(
+        events
+            .iter()
+            .any(|e| e.ph == Phase::Metadata && e.thread_name.is_some()),
+        "no thread names"
+    );
+
+    // Widget tracing shows up in the pushed blocks.
+    let pushed: Vec<_> = blocks
+        .iter()
+        .flat_map(|b| decode_trace_events(b).0)
+        .collect();
+    assert!(
+        pushed.iter().any(|e| &*e.name == "ProductTile"),
+        "no ProductTile slice in the TimelineEvents blocks"
+    );
+
+    // CPU samples.
+    let cpu = f
+        .results
+        .iter()
+        .find(|(req, _)| req["method"] == "getPerfettoCpuSamples")
+        .expect("a getPerfettoCpuSamples call")
+        .1
+        .clone();
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(cpu["samples"].as_str().unwrap())
+        .unwrap();
+    let profile = decode_cpu_samples(&bytes).unwrap();
+    assert!(
+        profile.samples.len() >= 100,
+        "{} samples",
+        profile.samples.len()
+    );
+    assert_eq!(
+        cpu["sampleCount"].as_u64(),
+        Some(profile.samples.len() as u64)
+    );
+    let heavy = profile
+        .functions
+        .iter()
+        .position(|f| f.name == "_HeavyBuildPanelState.build");
+    let heavy = heavy.expect("_HeavyBuildPanelState.build among the functions") as u32;
+    assert!(
+        profile
+            .samples
+            .iter()
+            .any(|s| profile.stacks[s.stack as usize].contains(&heavy)),
+        "no sample has _HeavyBuildPanelState.build on its stack"
+    );
+}
+
+#[test]
+fn perf_recording_is_small() {
+    let len = std::fs::metadata(path("jank_lab-perf.jsonl"))
+        .unwrap()
+        .len();
+    assert!(len <= 12 * 1024 * 1024, "{len} bytes");
+}

@@ -141,3 +141,50 @@ async fn keyed_methods_match_by_their_key() {
         .await;
     assert!(matches!(miss, Err(RpcError::Server { code: -32602, .. })));
 }
+
+#[tokio::test]
+async fn replay_exhausts_to_empty_timeline() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.jsonl");
+    let mut f = std::fs::File::create(&path).unwrap();
+    let lines = [
+        json!({"t_us":1,"dir":"send","msg":{"jsonrpc":"2.0","id":"1","method":"getVMTimeline","params":{}}}),
+        json!({"t_us":2,"dir":"recv","msg":{"jsonrpc":"2.0","id":"1","result":{"type":"Timeline","traceEvents":[{"ph":"B","name":"x","ts":5}],"timeOriginMicros":5,"timeExtentMicros":9}}}),
+        json!({"t_us":3,"dir":"send","msg":{"jsonrpc":"2.0","id":"2","method":"getPerfettoCpuSamples","params":{}}}),
+        json!({"t_us":4,"dir":"recv","msg":{"jsonrpc":"2.0","id":"2","result":{"type":"PerfettoCpuSamples","sampleCount":3,"samples":"AAAA","timeOriginMicros":1,"timeExtentMicros":2}}}),
+        json!({"t_us":5,"dir":"send","msg":{"jsonrpc":"2.0","id":"3","method":"getVM","params":{}}}),
+        json!({"t_us":6,"dir":"recv","msg":{"jsonrpc":"2.0","id":"3","result":{"type":"VM","pid":7}}}),
+    ];
+    for l in lines {
+        writeln!(f, "{l}").unwrap();
+    }
+    drop(f);
+    let server = ReplayServer::start(&path);
+    let (client, _notes) = connect(&server.ws_uri(), ConnectOptions::default())
+        .await
+        .unwrap();
+    let first = client.call("getVMTimeline", json!({})).await.unwrap();
+    assert_eq!(first["traceEvents"].as_array().unwrap().len(), 1);
+    let again = client.call("getVMTimeline", json!({})).await.unwrap();
+    assert_eq!(
+        again,
+        json!({"type":"Timeline","traceEvents":[],"timeOriginMicros":0,"timeExtentMicros":0})
+    );
+    let cpu = client
+        .call("getPerfettoCpuSamples", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(cpu["sampleCount"], 3);
+    let cpu = client
+        .call("getPerfettoCpuSamples", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(cpu["sampleCount"], 0);
+    assert_eq!(cpu["samples"], "");
+    assert_eq!(cpu["type"], "PerfettoCpuSamples");
+    // Other methods still repeat the last answer.
+    for _ in 0..2 {
+        assert_eq!(client.call("getVM", json!({})).await.unwrap()["pid"], 7);
+    }
+}

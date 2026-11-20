@@ -2,9 +2,18 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:jank_lab/ext.dart';
 import 'package:jank_lab/main.dart';
+import 'package:jank_lab/scenarios/rebuilds.dart';
 
 void main() {
-  const builtins = ['goto_logs', 'goto_network', 'pop', 'list'];
+  const builtins = [
+    'goto_logs',
+    'goto_network',
+    'goto_jank',
+    'goto_rebuilds',
+    'home',
+    'pop',
+    'list',
+  ];
 
   testWidgets('list returns the built-in actions', (tester) async {
     await tester.pumpWidget(const JankLabApp());
@@ -68,5 +77,46 @@ void main() {
     );
     await tester.pumpWidget(const SizedBox());
     expect(jankLabAvailable(), isNot(contains('load_products')));
+  });
+
+  testWidgets('goto_jank, raster_on and raster_off drive the Jank screen', (
+    tester,
+  ) async {
+    await tester.pumpWidget(const JankLabApp());
+    expect(jankLabAvailable(), isNot(contains('raster_on')));
+
+    expect((await handleJankLabRun('goto_jank')).isError(), isFalse);
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 1));
+    expect(find.text('Jank'), findsOneWidget);
+    expect(jankLabAvailable(), containsAll(['raster_on', 'raster_off']));
+    bool switchValue() =>
+        tester.widget<SwitchListTile>(find.byType(SwitchListTile)).value;
+    expect(switchValue(), isFalse);
+
+    await handleJankLabRun('raster_on');
+    await tester.pump();
+    expect(switchValue(), isTrue);
+    await handleJankLabRun('raster_off');
+    await tester.pump();
+    expect(switchValue(), isFalse);
+
+    await handleJankLabRun('home');
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 1));
+    expect(find.text('Jank'), findsNothing);
+    expect(jankLabAvailable(), isNot(contains('raster_on')));
+  });
+
+  testWidgets('goto_rebuilds pushes the cart screen', (tester) async {
+    await tester.pumpWidget(const JankLabApp());
+    await handleJankLabRun('goto_rebuilds');
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 1));
+    expect(find.byType(ProductTile), findsWidgets);
+    await handleJankLabRun('home');
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 1));
+    expect(find.byType(ProductTile), findsNothing);
   });
 }

@@ -12,7 +12,15 @@ final GlobalKey<NavigatorState> navKey = GlobalKey<NavigatorState>();
 final Map<String, FutureOr<void> Function()> jankActions = {};
 
 /// Actions that work on every screen.
-const List<String> jankBuiltins = ['goto_logs', 'goto_network', 'pop', 'list'];
+const List<String> jankBuiltins = [
+  'goto_logs',
+  'goto_network',
+  'goto_jank',
+  'goto_rebuilds',
+  'home',
+  'pop',
+  'list',
+];
 
 /// Every action that can be run right now, built-ins first.
 List<String> jankLabAvailable() => [...jankBuiltins, ...jankActions.keys];
@@ -50,6 +58,12 @@ Future<developer.ServiceExtensionResponse> handleJankLabRun(
       navKey.currentState?.pushNamed('/logs');
     case 'goto_network':
       navKey.currentState?.pushNamed('/network');
+    case 'goto_jank':
+      navKey.currentState?.pushNamed('/jank');
+    case 'goto_rebuilds':
+      navKey.currentState?.pushNamed('/rebuilds');
+    case 'home':
+      navKey.currentState?.popUntil((route) => route.isFirst);
     case 'pop':
       navKey.currentState?.pop();
     case 'list':

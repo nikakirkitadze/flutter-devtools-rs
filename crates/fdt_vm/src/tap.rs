@@ -87,9 +87,70 @@ fn replace_path_prefix(text: &str, prefix: &str) -> String {
     out
 }
 
+fn blob_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"("(?:samples|trace)"\s*:\s*")([A-Za-z0-9+/]{1024,}={0,2})(")"#).unwrap()
+    })
+}
+
+/// Overwrites the user name in every `/Users/<name>/` and `/home/<name>/` of `bytes` with `x`.
+/// The length does not change, so protobuf lengths in the blob stay valid.
+fn mask_user_names(bytes: &mut [u8]) {
+    for prefix in [&b"/Users/"[..], &b"/home/"[..]] {
+        let mut i = 0;
+        while let Some(at) = bytes[i..]
+            .windows(prefix.len())
+            .position(|w| w == prefix)
+            .map(|p| p + i)
+        {
+            let start = at + prefix.len();
+            let mut end = start;
+            while end < bytes.len()
+                && !matches!(bytes[end], b'/' | b'\\' | b'"')
+                && bytes[end] >= 0x20
+            {
+                end += 1;
+            }
+            bytes[start..end].fill(b'x');
+            i = end.max(start);
+        }
+    }
+}
+
+/// Redacts one base64 blob: decodes it, masks user names, re-encodes. A string that does not
+/// decode is returned unchanged.
+fn redact_blob(b64: &str) -> String {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    match STANDARD.decode(b64) {
+        Ok(mut bytes) => {
+            mask_user_names(&mut bytes);
+            STANDARD.encode(bytes)
+        }
+        Err(_) => b64.to_string(),
+    }
+}
+
 /// Removes secrets and personal paths from text before it is stored or shown:
-/// auth tokens in URL paths, the home directory, and user names in `/Users/` paths.
+/// auth tokens in URL paths, the home directory, and user names in `/Users/` paths. Base64 blobs
+/// of 1 KB or more under `samples` and `trace` are decoded and their user names masked with `x`.
 pub fn redact(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for c in blob_re().captures_iter(text) {
+        let whole = c.get(0).unwrap();
+        out.push_str(&redact_text(&text[last..whole.start()]));
+        out.push_str(&c[1]);
+        out.push_str(&redact_blob(&c[2]));
+        out.push_str(&c[3]);
+        last = whole.end();
+    }
+    out.push_str(&redact_text(&text[last..]));
+    out
+}
+
+fn redact_text(text: &str) -> String {
     let mut out = text.to_string();
     if let Some(home) = dirs::home_dir() {
         let home = home.to_string_lossy().into_owned();
@@ -147,6 +208,29 @@ mod tests {
             replace_path_prefix("\"/Users/jane\"", "/Users/jane"),
             "\"~\""
         );
+    }
+
+    #[test]
+    fn redacts_user_names_inside_base64_blobs() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+        let mut raw = vec![7u8; 600];
+        raw.extend_from_slice(b"\x1a\x20file:///Users/jane.doe/dev/a.dart\x00/home/bob/x");
+        raw.extend_from_slice(&[9u8; 600]);
+        let b64 = STANDARD.encode(&raw);
+        assert!(b64.len() >= 1024);
+        let line = format!(r#"{{"samples":"{b64}","n":1}}"#);
+        let out = redact(&line);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let back = STANDARD.decode(v["samples"].as_str().unwrap()).unwrap();
+        assert_eq!(back.len(), raw.len());
+        let text = String::from_utf8_lossy(&back);
+        assert!(text.contains("/Users/xxxxxxxx/dev/a.dart"), "{text}");
+        assert!(text.contains("/home/xxx/x"));
+        assert!(!text.contains("jane"));
+        // Other keys and short blobs are untouched.
+        let other = format!(r#"{{"other":"{b64}"}}"#);
+        assert_eq!(redact(&other), other);
     }
 
     #[test]

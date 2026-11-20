@@ -2,6 +2,8 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 
+import '../ext.dart';
+
 /// Provokes frames over budget on both threads. `HeavyBuildPanel` busy-waits
 /// in `build` while an animation keeps frames coming (UI-thread jank), and the
 /// "Raster heavy" switch stacks blurred, translucent layers (raster jank).
@@ -28,7 +30,13 @@ class _JankScreenState extends State<JankScreen>
       vsync: this,
       duration: const Duration(seconds: 2),
     );
+    _unregister = registerJankActions({
+      'raster_on': () => _setRaster(true),
+      'raster_off': () => _setRaster(false),
+    });
   }
+
+  late final VoidCallback _unregister;
 
   void _setRaster(bool value) {
     setState(() => _raster = value);
@@ -41,6 +49,7 @@ class _JankScreenState extends State<JankScreen>
 
   @override
   void dispose() {
+    _unregister();
     _controller.dispose();
     super.dispose();
   }
