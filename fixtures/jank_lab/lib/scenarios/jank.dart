@@ -131,10 +131,10 @@ class _RasterHeavy extends StatelessWidget {
       builder: (context, _) {
         return Stack(
           children: [
-            for (var i = 0; i < 40; i++)
+            for (var i = 0; i < 160; i++)
               Positioned(
                 left: 8.0 + (i % 8) * 40 + animation.value * 20,
-                top: 8.0 + (i ~/ 8) * 40,
+                top: 8.0 + (i ~/ 8) * 24,
                 width: 160,
                 height: 120,
                 child: Opacity(

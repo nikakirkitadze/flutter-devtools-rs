@@ -14,13 +14,19 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use fdt_analysis::explain::{Cause, Explanation, explain};
+use fdt_analysis::rebuilds::frame_rebuilds;
 use fdt_capture::{Capture, CaptureConfig, CaptureRuntime, ConnStatus, Target};
+use fdt_store::Snapshot;
+use fdt_store::frames::{FrameStatus, frame_status};
 use fdt_store::logs::{LogLevel, LogSource};
 use fdt_store::net::{BodyState, StatusClass};
 use fdt_vm::discovery::{DiscoveredApp, Discovery, DiscoveryConfig};
 use fdt_vm::events::{StreamEvent, decode_notification};
+use fdt_vm::flutter::PROFILE_WIDGET_BUILDS;
 use fdt_vm::rpc::{ConnectOptions, RpcError, connect};
 use fdt_vm::service::VmService;
 use serde_json::json;
@@ -70,6 +76,251 @@ async fn act(vm: &VmService, isolate: &str, action: &str) {
             }
         }
     }
+}
+
+/// Frames from `from` on that have both phases, slowest first among those over twice the budget.
+fn janky_frames(s: &Snapshot, from: usize) -> Vec<usize> {
+    let mut v: Vec<usize> = (from..s.frames.len())
+        .filter(|&i| {
+            let f = s.frames.get(i).unwrap();
+            f.ui.is_some()
+                && f.raster.is_some()
+                && frame_status(f.time_us(), s.frame_budget_us(f.run)) == FrameStatus::Janky
+        })
+        .collect();
+    v.sort_by_key(|&i| std::cmp::Reverse(s.frames.get(i).unwrap().time_us()));
+    v
+}
+
+/// The slowest janky frame whose build phase is most of its UI time. The slowest of all can be
+/// a one-off stall (e.g. the VM serving the CPU-samples fetch), which no build code explains.
+fn build_janky(s: &Snapshot, from: usize) -> Option<usize> {
+    janky_frames(s, from).into_iter().find(|&i| {
+        let ui = s.frames.get(i).unwrap().ui.unwrap();
+        u64::from(ui.build_us) * 2 >= u64::from(ui.ui_us)
+    })
+}
+
+fn with_phases(s: &Snapshot, from: usize) -> usize {
+    (from..s.frames.len())
+        .filter(|&i| {
+            let f = s.frames.get(i).unwrap();
+            f.ui.is_some() && f.raster.is_some()
+        })
+        .count()
+}
+
+/// Polls (fetching CPU samples each round) until `pick` finds a frame from `from` on whose
+/// explanation it accepts. Returns the sentence and the explanation, and prints the sentence.
+async fn explained(
+    cap: &Capture,
+    from: usize,
+    what: &str,
+    pick: impl Fn(&Snapshot, usize) -> Option<usize>,
+    ok: impl Fn(&Explanation) -> bool,
+) -> (Arc<Snapshot>, usize, Explanation) {
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let mut last = String::from("no candidate frame");
+    loop {
+        cap.fetch_cpu_samples();
+        sleep(Duration::from_millis(700)).await;
+        let snap = cap.snapshots().borrow().clone();
+        if let Some(seq) = pick(&snap, from) {
+            let e = explain(&snap, seq);
+            if ok(&e) {
+                println!("{what}: frame {seq}: {}", e.sentence);
+                return (snap, seq, e);
+            }
+            last = format!("frame {seq}: {} / {:?}", e.sentence, e.cause);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: no matching explanation; last: {last}"
+        );
+    }
+}
+
+fn frames_len(cap: &Capture) -> usize {
+    cap.snapshots().borrow().frames.len()
+}
+
+/// Profile-mode checks of phases, explanations, rebuilds and the tracing restore.
+async fn perf_checks(cap: &Capture, vm: &VmService, iso: &str) {
+    // Jank: CPU samples name the heavy build function.
+    act(vm, iso, "home").await;
+    let from = frames_len(cap);
+    let t = Instant::now();
+    act(vm, iso, "goto_jank").await;
+    sleep(Duration::from_secs(3)).await;
+    cap.fetch_cpu_samples();
+    let snap = cap.snapshots().borrow().clone();
+    println!(
+        "jank: after 3 s frames={} with_phases={} timeline_slices={}",
+        snap.frames.len() - from,
+        with_phases(&snap, from),
+        snap.timeline.tracks().len()
+    );
+    let snap = common::wait_for(cap, Duration::from_secs(20), "20 frames with phases", |s| {
+        with_phases(s, from) >= 20
+    })
+    .await;
+    println!(
+        "jank: frames={} with_phases={} wait_ms={}",
+        snap.frames.len() - from,
+        with_phases(&snap, from),
+        t.elapsed().as_millis()
+    );
+    let (_, _, e) = explained(
+        cap,
+        from,
+        "jank (cpu)",
+        build_janky,
+        |e| matches!(&e.cause, Cause::HotFunction { function, .. } if function.contains("_HeavyBuildPanelState.build")),
+    )
+    .await;
+    assert!(matches!(e.cause, Cause::HotFunction { .. }));
+
+    // Jank with tracing: the widget is named.
+    cap.set_trace_widget_builds(true);
+    sleep(Duration::from_secs(2)).await;
+    let from2 = frames_len(cap);
+    let (_, _, _) = explained(
+        cap,
+        from2,
+        "jank (tracing)",
+        build_janky,
+        |e| matches!(&e.cause, Cause::WidgetBuild { widget, .. } if &**widget == "HeavyBuildPanel"),
+    )
+    .await;
+
+    // Raster.
+    cap.set_trace_widget_builds(false);
+    {
+        let snap = cap.snapshots().borrow().clone();
+        let mut r: Vec<u32> = (from2..snap.frames.len())
+            .map(|i| snap.frames.get(i).unwrap().raster_us)
+            .collect();
+        r.sort();
+        println!(
+            "raster baseline: frames={} median_raster_us={}",
+            r.len(),
+            r.get(r.len() / 2).copied().unwrap_or(0)
+        );
+    }
+    act(vm, iso, "raster_on").await;
+    sleep(Duration::from_secs(3)).await;
+    let from3 = frames_len(cap);
+    sleep(Duration::from_secs(2)).await;
+    {
+        let snap = cap.snapshots().borrow().clone();
+        let mut v: Vec<_> = (from3..snap.frames.len())
+            .map(|i| {
+                let f = snap.frames.get(i).unwrap();
+                (f.raster_us, f.build_us, f.elapsed_us)
+            })
+            .collect();
+        v.sort();
+        v.reverse();
+        v.truncate(8);
+        println!(
+            "raster diag: frames={} budget={} top (raster,build,elapsed) us={v:?}",
+            snap.frames.len() - from3,
+            snap.latest_budget_us()
+        );
+    }
+    let (_, _, _) = explained(
+        cap,
+        from3,
+        "raster",
+        |s, f| {
+            janky_frames(s, f).into_iter().find(|&i| {
+                let fr = s.frames.get(i).unwrap();
+                fr.raster_us > s.frame_budget_us(fr.run) && fr.raster_us > fr.build_us
+            })
+        },
+        |e| matches!(e.cause, Cause::Raster { save_layers } if save_layers >= 10),
+    )
+    .await;
+
+    // Rebuilds.
+    act(vm, iso, "raster_off").await;
+    act(vm, iso, "home").await;
+    act(vm, iso, "goto_rebuilds").await;
+    cap.set_trace_widget_builds(true);
+    sleep(Duration::from_secs(2)).await;
+    let from4 = frames_len(cap);
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let mut seen = String::new();
+    loop {
+        sleep(Duration::from_millis(500)).await;
+        let snap = cap.snapshots().borrow().clone();
+        let hit = (from4..snap.frames.len()).find_map(|i| {
+            let r = frame_rebuilds(&snap, i)?;
+            let root = r.roots.iter().find(|r| &*r.name == "CartScreen")?;
+            // The brief expects `largest_child` to be ProductGrid, but in a real app
+            // CartScreen's only direct child is Scaffold (a single-child chain down to the
+            // grid), so the child is Scaffold. Assert that ProductGrid was built under it.
+            let grid = matches!(&root.largest_child, Some((n, m)) if &**n == "Scaffold" && *m >= 64)
+                && r.widgets.iter().any(|w| &*w.name == "ProductGrid");
+            let tiles = r.widgets.iter().find(|w| &*w.name == "ProductTile")?.builds;
+            seen = format!("frame {i}: roots={:?} tiles={tiles}", r.roots);
+            (grid && tiles == 64).then_some((i, e_sentence(&snap, i)))
+        });
+        if let Some((i, sentence)) = hit {
+            println!("rebuilds: frame {i}: {sentence}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "no rebuilds frame; last: {seen}");
+    }
+
+    // Restore: tracing is on, and a user disconnect turns it back off.
+    assert!(
+        vm.get_bool_extension(PROFILE_WIDGET_BUILDS, iso)
+            .await
+            .unwrap(),
+        "tracing should be on before the disconnect"
+    );
+    cap.disconnect();
+    let t = Instant::now();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if !vm
+            .get_bool_extension(PROFILE_WIDGET_BUILDS, iso)
+            .await
+            .unwrap()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "tracing still on after disconnect"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+    println!(
+        "restore: tracing off {} ms after disconnect",
+        t.elapsed().as_millis()
+    );
+}
+
+fn e_sentence(snap: &Snapshot, i: usize) -> String {
+    explain(snap, i).sentence
+}
+
+/// Debug mode: frames only need their phases.
+async fn debug_checks(cap: &Capture, vm: &VmService, iso: &str) {
+    act(vm, iso, "home").await;
+    let from = frames_len(cap);
+    act(vm, iso, "goto_jank").await;
+    let snap = common::wait_for(cap, Duration::from_secs(20), "frames with phases", |s| {
+        with_phases(s, from) >= 1
+    })
+    .await;
+    println!(
+        "debug: frames={} with_phases={}",
+        snap.frames.len() - from,
+        with_phases(&snap, from)
+    );
 }
 
 #[test]
@@ -334,6 +585,11 @@ async fn run(rt: &CaptureRuntime, vm_uri: &str) {
             println!("hot restart: ok");
         }
         None => println!("hot restart: skipped (no hotRestart service registered; profile mode)"),
+    }
+    if is_debug {
+        debug_checks(&cap, &vm, &iso).await;
+    } else {
+        perf_checks(&cap, &vm, &iso).await;
     }
     drop(cap);
 }

@@ -16,6 +16,7 @@ log = { workspace = true }
 
 [dev-dependencies]
 fdt_vm = { path = "../fdt_vm", features = ["testing"] }
+fdt_analysis = { path = "../fdt_analysis" }
 tokio = { workspace = true, features = ["test-util"] }
 regex = { workspace = true }
 url = { workspace = true }
