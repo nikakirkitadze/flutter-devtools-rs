@@ -84,10 +84,9 @@ struct Fingerprint {
     budget_us: u32,
     coverage: Option<SessionTime>,
     cpu_status: CpuStatus,
-    /// What Rebuilds and Related read besides the frame: they grow as the app streams.
-    requests: usize,
-    logs: usize,
-    slices: u64,
+    /// Rebuilds and Related read slices, requests and log lines, and requests change in place:
+    /// any new snapshot may change them. The throttle keeps this cheap while data streams.
+    generation: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -229,8 +228,7 @@ impl PerformanceView {
     }
 
     /// Opens, closes or refreshes the pane to match the selected frame and the latest snapshot.
-    /// Starts the analysis only when the frame, its phases, its CPU coverage or the requests, log
-    /// lines and timeline slices it is related to changed, and then at most once per interval.
+    /// Starts the analysis only when the frame, its phases, its CPU coverage or the snapshot generation changed, and then at most once per interval.
     pub(super) fn sync_details(&mut self, cx: &mut Context<Self>) {
         let snap = self.session.read(cx).snapshot().clone();
         let frame = self
@@ -254,9 +252,7 @@ impl PerformanceView {
                 budget_us,
                 coverage: snap.cpu.coverage_end(frame.run),
                 cpu_status: snap.cpu.status(frame.run).clone(),
-                requests: snap.net.len(),
-                logs: snap.logs.len(),
-                slices: snap.timeline.slice_count(),
+                generation: snap.generation,
             },
         };
         let same_frame = self
@@ -1185,12 +1181,13 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn the_analysis_is_not_rerun_for_an_unchanged_frame(cx: &mut TestAppContext) {
+    fn the_analysis_is_throttled_and_not_rerun_for_an_unchanged_snapshot(cx: &mut TestAppContext) {
         let (shell, cx, fake) = open_shell_fake(cx);
         let (mut w, run) = writer();
         phased_frame(&mut w, run, 0, 100, 2);
         w.push_frame(frame_at(run, 1, 140, 5, 5));
-        fake.snaps.send(w.publish()).unwrap();
+        let first = w.publish();
+        fake.snaps.send(first.clone()).unwrap();
         fake.status.send(connected("demo", true)).unwrap();
         cx.run_until_parked();
         cx.dispatch_action(ShowPerformance);
@@ -1198,21 +1195,24 @@ mod tests {
         let runs = |shell: &Entity<MainWindow>, cx: &mut VisualTestContext| {
             shell.read_with(cx, |s, cx| s.performance_view().read(cx).details_runs())
         };
-        let before = runs(&shell, cx);
-        assert_eq!(before, 1);
-        // A snapshot that adds a frame leaves this frame's phases and coverage alone.
-        w.push_frame(frame_at(run, 2, 160, 5, 5));
-        fake.snaps.send(w.publish()).unwrap();
+        assert_eq!(runs(&shell, cx), 1);
+        // The same snapshot again changes nothing.
+        fake.snaps.send(first).unwrap();
         cx.run_until_parked();
-        assert_eq!(runs(&shell, cx), before);
-        // New CPU coverage changes what the pane shows, so it runs again, after the throttle.
-        w.set_cpu_coverage(run, SessionTime(10_000 * MS));
-        fake.snaps.send(w.publish()).unwrap();
-        cx.run_until_parked();
-        assert_eq!(runs(&shell, cx), before);
         cx.executor().advance_clock(REFRESH_INTERVAL);
         cx.run_until_parked();
-        assert_eq!(runs(&shell, cx), before + 1);
+        assert_eq!(runs(&shell, cx), 1);
+        // The first newer snapshot runs at once (the last run is over an interval old); the two
+        // after it, inside the next interval, make one more run, after it.
+        for n in 2..5 {
+            w.push_frame(frame_at(run, n, 140 + n * 20, 5, 5));
+            fake.snaps.send(w.publish()).unwrap();
+            cx.run_until_parked();
+        }
+        assert_eq!(runs(&shell, cx), 2);
+        cx.executor().advance_clock(REFRESH_INTERVAL);
+        cx.run_until_parked();
+        assert_eq!(runs(&shell, cx), 3);
     }
 
     #[gpui_kit::test]
@@ -1265,5 +1265,45 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(label(cx, "details-sentence"), Some(b));
         assert_eq!(label(cx, "details-title").as_deref(), Some("Frame #1"));
+    }
+
+    #[gpui_kit::test]
+    fn request_update_refreshes_related_row(cx: &mut TestAppContext) {
+        let (shell, cx, fake) = open_shell_fake(cx);
+        let (mut w, run) = writer();
+        phased_frame(&mut w, run, 0, 1_000, 2);
+        // Ends before the frame starts, so it is not related yet.
+        request(
+            &mut w,
+            run,
+            "GET",
+            "http://h/api",
+            Some(200),
+            900,
+            Some(950),
+        );
+        fake.snaps.send(w.publish()).unwrap();
+        fake.status.send(connected("demo", true)).unwrap();
+        cx.run_until_parked();
+        cx.dispatch_action(ShowPerformance);
+        select(&shell, cx, 0);
+        assert!(exists(cx, "details-related-empty"));
+        // The same request again, now ending inside the frame with a new status.
+        request(
+            &mut w,
+            run,
+            "GET",
+            "http://h/api",
+            Some(503),
+            900,
+            Some(1_020),
+        );
+        fake.snaps.send(w.publish()).unwrap();
+        cx.run_until_parked();
+        cx.executor().advance_clock(REFRESH_INTERVAL);
+        cx.run_until_parked();
+        let now = label(cx, "details-request-0").expect("the updated request");
+        assert!(now.contains("503") && now.contains("120 ms"), "{now}");
+        assert!(!exists(cx, "details-related-empty"));
     }
 }
