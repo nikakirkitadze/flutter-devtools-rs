@@ -298,6 +298,19 @@ struct Key {
     session: u64,
     frames: usize,
     version: u64,
+    /// What every run's frame budget is, so a refresh-rate change (which re-judges earlier
+    /// frames) forces a full run.
+    budgets: u64,
+}
+
+/// A fingerprint of the budgets of every run in `snap`.
+fn budget_stamp(snap: &Snapshot) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for r in snap.runs.iter() {
+        (r.id, snap.frame_budget_us(r.id)).hash(&mut h);
+    }
+    h.finish()
 }
 
 pub struct FramesList {
@@ -424,6 +437,7 @@ impl FramesList {
             session: snap.session,
             frames: snap.frames.len(),
             version: self.version,
+            budgets: budget_stamp(snap),
         }
     }
 
@@ -466,7 +480,9 @@ impl FramesList {
         // Only the frames changed since the rows were built: append instead of recomputing.
         let prev = self
             .applied
-            .filter(|a| a.session == key.session && a.version == key.version)
+            .filter(|a| {
+                a.session == key.session && a.version == key.version && a.budgets == key.budgets
+            })
             .map(|a| Prev {
                 rows: self.rows.clone(),
                 frames: a.frames,
@@ -1087,5 +1103,42 @@ mod tests {
             "sorted rows use the hash index"
         );
         assert!(list.read_with(cx, |l, cx| l.shares_rows_with_table(cx)));
+    }
+
+    #[gpui_kit::test]
+    fn refresh_rate_change_reruns_slow_only(cx: &mut TestAppContext) {
+        use crate::tools::performance::fixtures::push_frames;
+        let (mut w, run) = crate::test_support::writer();
+        push_frames(&mut w, run, 0, 40);
+        let (shell, cx, fake) = crate::test_support::open_shell_fake(cx);
+        fake.snaps.send(w.publish()).unwrap();
+        fake.status
+            .send(crate::test_support::connected("demo", true))
+            .unwrap();
+        cx.run_until_parked();
+        cx.dispatch_action(ShowPerformance);
+        cx.run_until_parked();
+        let list = shell.read_with(cx, |s, cx| s.performance_view().read(cx).list().clone());
+        list.update_in(cx, |l, _, cx| l.set_slow_only(true, cx));
+        cx.run_until_parked();
+        let before = rows(&list, cx);
+        // At 144 Hz the 8 ms frames are slow too. Append frames in the same publish.
+        w.set_refresh_rate(run, 144.0);
+        push_frames(&mut w, run, 40, 60);
+        let snap = w.publish();
+        fake.snaps.send(snap.clone()).unwrap();
+        cx.run_until_parked();
+        let full = frame_rows(&snap, None, true, false, "");
+        assert!(
+            full.len() > before.len() + 20,
+            "the new budget re-judged old frames"
+        );
+        assert_eq!(rows(&list, cx), full);
+        // The rate alone, with no new frames, also reruns.
+        w.set_refresh_rate(run, 30.0);
+        let snap = w.publish();
+        fake.snaps.send(snap.clone()).unwrap();
+        cx.run_until_parked();
+        assert_eq!(rows(&list, cx), frame_rows(&snap, None, true, false, ""));
     }
 }
