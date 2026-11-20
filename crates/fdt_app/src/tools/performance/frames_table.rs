@@ -264,6 +264,9 @@ impl TableDelegate for FramesTable {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
+        if col_ix == 0 {
+            crate::perf::bump(crate::perf::Counter::FramesRows, 1);
+        }
         let t = *cx.tokens();
         let cell = div()
             .w_full()
@@ -763,6 +766,7 @@ fn chip(
 
 impl Render for FramesList {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::perf::bump(crate::perf::Counter::FramesList, 1);
         let t = *cx.tokens();
         let body = if self.applied.is_none() {
             div().flex_1().into_any_element()

@@ -4,11 +4,12 @@
 //! the same slice of the session.
 
 use super::cpu_tab::CpuTab;
-use super::details::DetailsState;
+use super::details::{DetailsState, pane_build, pane_key};
 use super::frame_chart::{ChartEvent, FrameChart};
 use super::frames_table::{FramesList, ListEvent};
 use super::rebuilds_tab::RebuildsTab;
 use super::trace_tab::{SliceKey, TraceEvent, TraceView};
+use crate::facet::Facet;
 use crate::nav::{EntryId, Location, Page, Selection, TimeRange, Tool};
 use crate::session_model::SessionModel;
 use crate::shell::sidebar::tool_icon;
@@ -68,6 +69,9 @@ pub struct PerformanceView {
     pub(super) selection: Option<EntryId>,
     /// The frame details pane.
     pub(super) details: DetailsState,
+    /// The pane's elements, a cached view of its own: it is built again only when what it shows
+    /// changes, not whenever the page is notified.
+    pub(super) pane: Entity<Facet<PerformanceView>>,
     chart: Entity<FrameChart>,
     list: Entity<FramesList>,
     /// The CPU tab.
@@ -107,6 +111,8 @@ impl PerformanceView {
         let cpu = cx.new(|cx| CpuTab::new(session.clone(), window, cx));
         let rebuilds = cx.new(|cx| RebuildsTab::new(session.clone(), window, cx));
         let trace = cx.new(|cx| TraceView::new(session.clone(), cx));
+        let owner = cx.entity();
+        let pane = cx.new(|fcx| Facet::new(&owner, pane_build, pane_key, fcx));
         let subs = vec![
             cx.subscribe(&trace, |this, _, e: &TraceEvent, cx| {
                 this.trace_event(*e, cx)
@@ -122,6 +128,7 @@ impl PerformanceView {
             range: None,
             selection: None,
             details: DetailsState::default(),
+            pane,
             chart,
             list,
             cpu,

@@ -25,11 +25,43 @@ use gpui_kit::component::resizable::{
 use gpui_kit::component::skeleton::Skeleton;
 use gpui_kit::{
     AnyElement, AppContext as _, Context, Div, Entity, Hsla, InteractiveElement, IntoElement,
-    ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled, Subscription, Task,
-    TestSupportExt as _, div, relative,
+    ParentElement, Pixels, SharedString, StatefulInteractiveElement, StyleRefinement, Styled,
+    Subscription, Task, TestSupportExt as _, Window, div, relative,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Builds the pane for its facet.
+pub(super) fn pane_build(
+    view: &mut PerformanceView,
+    _: &mut Window,
+    cx: &mut Context<PerformanceView>,
+) -> AnyElement {
+    view.render_details(cx)
+}
+
+/// Everything `render_details` reads, so an unrelated notification of the page does not rebuild
+/// the pane. The result is compared by identity: a new analysis is a new `Arc`.
+pub(super) fn pane_key(view: &PerformanceView, cx: &gpui_kit::App) -> String {
+    let session = view.session.read(cx);
+    let connected = matches!(session.status(), ConnStatus::Connected { .. });
+    let result = view
+        .details
+        .result
+        .as_ref()
+        .map(|r| Arc::as_ptr(r) as usize);
+    format!(
+        "{:?}",
+        (
+            session.snapshot().session,
+            session.snapshot().generation,
+            connected,
+            view.selection,
+            result,
+            view.details.skeleton,
+        )
+    )
+}
 
 const MAX_NAME_CHARS: usize = 80;
 const TOP: usize = 10;
@@ -368,7 +400,10 @@ impl PerformanceView {
                 state
             }
         };
-        let pane = self.render_details(cx);
+        let pane = self
+            .pane
+            .clone()
+            .cached(StyleRefinement::default().size_full());
         div()
             .flex_1()
             .min_h_0()
@@ -389,6 +424,7 @@ impl PerformanceView {
     }
 
     fn render_details(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        crate::perf::bump(crate::perf::Counter::DetailsPane, 1);
         let t = *cx.tokens();
         let snap = self.session.read(cx).snapshot().clone();
         let connected = matches!(self.session.read(cx).status(), ConnStatus::Connected { .. });
@@ -984,6 +1020,74 @@ mod tests {
         click(cx, "details-close");
         assert!(!exists(cx, "frame-details"));
         assert_eq!(shell.read_with(cx, |s, _| s.current().selection), None);
+    }
+
+    /// Renders of each counter while `f` runs, then one drawn frame.
+    fn renders_in(
+        cx: &mut VisualTestContext,
+        f: impl FnOnce(&mut VisualTestContext),
+    ) -> [u64; crate::perf::N] {
+        let before = crate::perf::snapshot();
+        f(cx);
+        // `render_frame` refreshes every view and so ignores the cached ones; a draw does not.
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let after = crate::perf::snapshot();
+        std::array::from_fn(|i| after[i] - before[i])
+    }
+
+    #[gpui_kit::test]
+    fn the_pane_renders_alone_when_its_result_arrives(cx: &mut TestAppContext) {
+        use crate::perf::Counter::{DetailsPane, FrameChart, FramesList, PerformanceView};
+        let (mut w, run) = writer();
+        fdt_store::synth::perf(&mut w, run, 600, 42, 120);
+        w.set_refresh_rate(run, 120.0);
+        let snap = w.publish();
+        let budget = snap.frame_budget_us(run);
+        let seqs: Vec<usize> = (0..snap.frames.len())
+            .filter(|&i| snap.frames.get(i).unwrap().time_us() > 2 * budget)
+            .take(5)
+            .collect();
+        assert_eq!(seqs.len(), 5, "five janky frames");
+        let (shell, cx) = open_perf(cx, snap);
+        let perf = shell.read_with(cx, |s, _| s.performance_view().clone());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        for (n, &seq) in seqs.iter().enumerate() {
+            // The selection: the table shows it once, and the chart no more often than the page
+            // is drawn.
+            let to = location(&shell, cx, seq, None);
+            let picked = renders_in(cx, |cx| {
+                shell.update_in(cx, |s, w, cx| s.navigate(to, w, cx));
+            });
+            assert!(
+                picked[FrameChart as usize] <= picked[PerformanceView as usize],
+                "selection {n}: {picked:?}"
+            );
+            assert!(
+                picked[FramesList as usize] <= 1,
+                "selection {n}: {picked:?}"
+            );
+            // The result arrives: only the pane is built.
+            let arrived = renders_in(cx, |cx| cx.run_until_parked());
+            assert_eq!(
+                arrived[DetailsPane as usize], 1,
+                "selection {n}: {arrived:?}"
+            );
+            assert_eq!(
+                arrived[FrameChart as usize], 0,
+                "selection {n}: {arrived:?}"
+            );
+            assert_eq!(
+                arrived[FramesList as usize], 0,
+                "selection {n}: {arrived:?}"
+            );
+            assert!(shell.read_with(cx, |s, cx| {
+                let p = s.performance_view().read(cx);
+                p.selection().is_some_and(|id| p.details_ready(id))
+            }));
+            // Something else notifies the page: the pane is replayed, not built again.
+            let idle = renders_in(cx, |cx| perf.update(cx, |_, cx| cx.notify()));
+            assert_eq!(idle[DetailsPane as usize], 0, "selection {n}: {idle:?}");
+        }
     }
 
     #[gpui_kit::test]
