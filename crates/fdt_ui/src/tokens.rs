@@ -130,6 +130,9 @@ pub mod alpha {
     pub const SCRIM_LIGHT: u8 = 0x33;
     /// Opacity of a control that cannot be used.
     pub const DISABLED: f32 = 0.5;
+    /// Opacity of a frame phase bar, applied to `accent`: build, layout, paint, composite, and
+    /// finalize/other, from the strongest to the faintest.
+    pub const PHASE: [u8; 5] = [0xFF, 0xC0, 0x99, 0x73, 0x4D];
 }
 
 pub mod font {
@@ -255,6 +258,27 @@ pub mod layout {
     pub const STATUS_DOT: Pixels = px(8.);
     /// The tallest an image preview in the request details grows.
     pub const IMAGE_PREVIEW_MAX: Pixels = px(320.);
+    /// Height of one Timeline lane.
+    pub const LANE_HEIGHT: Pixels = px(24.);
+    /// Width of the label column left of the Timeline lanes.
+    pub const LANE_LABEL_WIDTH: Pixels = px(112.);
+    /// Height of one track row inside a lane.
+    pub const TRACK_ROW: Pixels = px(18.);
+    /// Height of one flame chart row.
+    pub const FLAME_ROW: Pixels = px(18.);
+    pub const FRAME_CHART_HEIGHT: Pixels = px(140.);
+    pub const FRAME_BAR_WIDTH: Pixels = px(6.);
+    pub const FRAME_BAR_MIN_WIDTH: Pixels = px(1.);
+    /// Height of one phase bar in a frame's breakdown.
+    pub const PHASE_BAR_HEIGHT: Pixels = px(12.);
+    /// Narrowest slice that still gets a label.
+    pub const LABEL_MIN_WIDTH: Pixels = px(32.);
+    /// Gap between the pointer and a chart tooltip.
+    pub const TOOLTIP_OFFSET: Pixels = px(12.);
+    /// Indent per level of a call tree.
+    pub const TREE_INDENT: Pixels = px(12.);
+    /// Height of the time ruler above the lanes.
+    pub const RULER_HEIGHT: Pixels = px(20.);
 }
 
 /// Fixed column widths of the log and network tables.
@@ -274,6 +298,12 @@ pub mod table {
     pub const COL_STATE: Pixels = px(88.);
     pub const COL_BYTES: Pixels = px(96.);
     pub const COL_ACTIVITY: Pixels = px(120.);
+    pub const COL_FRAME: Pixels = px(80.);
+    pub const COL_MS: Pixels = px(72.);
+    pub const COL_COUNT: Pixels = px(72.);
+    pub const COL_PERCENT: Pixels = px(64.);
+    pub const COL_FUNCTION: Pixels = px(360.);
+    pub const COL_WIDGET: Pixels = px(280.);
 }
 
 #[cfg(test)]
@@ -477,5 +507,28 @@ mod tests {
         assert_eq!(motion::FULL_BODY_TIMEOUT, Duration::from_secs(30));
         assert_eq!(layout::IMAGE_PREVIEW_MAX, px(320.));
         assert_eq!(super::alpha::DISABLED, 0.5);
+    }
+
+    #[test]
+    fn m3_tokens_match_spec() {
+        assert_eq!(layout::LANE_HEIGHT, px(24.));
+        assert_eq!(layout::LANE_LABEL_WIDTH, px(112.));
+        assert_eq!(layout::TRACK_ROW, px(18.));
+        assert_eq!(layout::FLAME_ROW, px(18.));
+        assert_eq!(layout::FRAME_CHART_HEIGHT, px(140.));
+        assert_eq!(layout::FRAME_BAR_WIDTH, px(6.));
+        assert_eq!(layout::FRAME_BAR_MIN_WIDTH, px(1.));
+        assert_eq!(layout::PHASE_BAR_HEIGHT, px(12.));
+        assert_eq!(layout::LABEL_MIN_WIDTH, px(32.));
+        assert_eq!(layout::TOOLTIP_OFFSET, px(12.));
+        assert_eq!(layout::TREE_INDENT, px(12.));
+        assert_eq!(layout::RULER_HEIGHT, px(20.));
+        assert_eq!(table::COL_FRAME, px(80.));
+        assert_eq!(table::COL_MS, px(72.));
+        assert_eq!(table::COL_COUNT, px(72.));
+        assert_eq!(table::COL_PERCENT, px(64.));
+        assert_eq!(table::COL_FUNCTION, px(360.));
+        assert_eq!(table::COL_WIDGET, px(280.));
+        assert_eq!(super::alpha::PHASE, [0xFF, 0xC0, 0x99, 0x73, 0x4D]);
     }
 }
