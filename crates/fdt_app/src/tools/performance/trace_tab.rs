@@ -44,7 +44,7 @@ const KEY_ZOOM: f32 = 1.5; // token-check: allow: zoom step, not a visual size
 const FIRST_WIDTH_PX: f32 = 900.0; // token-check: allow: stand-in until the first paint
 const FIRST_HEIGHT_PX: f32 = 400.0; // token-check: allow: stand-in until the first paint
 /// The spacing the ruler aims for between two ticks.
-const TICK_TARGET_PX: f32 = 100.0; // token-check: allow: ruler density, not a visual size
+pub(crate) const TICK_TARGET_PX: f32 = 100.0; // token-check: allow: ruler density, not a visual size
 /// Slices this wide or wider leave a one pixel gap to the next one.
 const GAP_FROM_PX: f32 = 4.0; // token-check: allow: threshold, not a visual size
 /// The faintest a level of detail cell is drawn.
@@ -364,7 +364,7 @@ fn nice_step(raw_ns: f64) -> u64 {
 }
 
 /// The ruler's ticks for `viewport` in `width` pixels, labelled in seconds from the session start.
-fn ruler_ticks(viewport: Viewport, width: f32) -> Vec<(f32, String)> {
+pub(crate) fn ruler_ticks(viewport: Viewport, width: f32) -> Vec<(f32, String)> {
     let mut out = Vec::new();
     if width <= 0.0 {
         return out;
