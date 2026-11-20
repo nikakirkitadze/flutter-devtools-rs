@@ -152,6 +152,11 @@ impl<T: Clone> ChunkedSnapshot<T> {
     }
 
     #[cfg(test)]
+    pub(crate) fn sealed_chunk(&self, c: usize) -> Option<&Arc<Vec<T>>> {
+        self.sealed.get(c)
+    }
+
+    #[cfg(test)]
     fn chunk_ptr(&self, c: usize) -> *const T {
         if c < self.sealed.len() {
             self.sealed[c].as_ptr()

@@ -130,11 +130,31 @@ fn strip_bars_72k(c: &mut Criterion) {
     g.finish();
 }
 
+fn timeline_cells(c: &mut Criterion) {
+    let mut w = SessionWriter::new(0);
+    let run = start(&mut w);
+    synth::perf(&mut w, run, 72_000, 7, 120);
+    let snap = w.publish();
+    let whole = TimeRange::new(SessionTime(0), snap.latest_time());
+    let ui = snap.timeline.tracks()[0].id;
+    let mut g = c.benchmark_group("timeline_cells");
+    g.bench_function("ui_lanes_whole_2000", |b| {
+        b.iter(|| {
+            for l in snap.timeline.lanes(ui) {
+                black_box(l.range_indices(whole));
+                black_box(l.cells(whole, 2_000));
+            }
+        })
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     log_search_100k,
     log_search_1m,
     net_filter_100k,
-    strip_bars_72k
+    strip_bars_72k,
+    timeline_cells
 );
 criterion_main!(benches);

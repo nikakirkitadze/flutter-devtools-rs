@@ -13,5 +13,6 @@ pub mod run;
 pub mod session;
 pub mod synth;
 pub mod time;
+pub mod timeline;
 
 pub use session::{SessionWriter, Snapshot};

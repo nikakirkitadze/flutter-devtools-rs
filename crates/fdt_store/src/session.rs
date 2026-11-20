@@ -10,6 +10,7 @@ use crate::net::{
 };
 use crate::run::{AppInfo, RunInfo};
 use crate::time::{EntryId, RunId, SessionTime};
+use crate::timeline::{NameId, Slice, TimelineSnapshot, TimelineStore, TrackId, TrackKind};
 use std::sync::Arc;
 
 /// An immutable, cheaply clonable view of the session at one generation.
@@ -24,6 +25,7 @@ pub struct Snapshot {
     pub logs: LogsSnapshot,
     pub net: NetSnapshot,
     pub frames: FramesSnapshot,
+    pub timeline: TimelineSnapshot,
     latest: SessionTime,
 }
 
@@ -38,6 +40,7 @@ impl Snapshot {
             logs: LogsSnapshot::default(),
             net: NetSnapshot::default(),
             frames: FramesSnapshot::default(),
+            timeline: TimelineSnapshot::default(),
             latest: SessionTime(0),
         }
     }
@@ -72,6 +75,7 @@ pub struct SessionWriter {
     logs: LogStore,
     net: NetStore,
     frames: FrameStore,
+    timeline: TimelineStore,
     latest: SessionTime,
     generation: u64,
     dirty: bool,
@@ -103,6 +107,7 @@ impl SessionWriter {
             logs: LogStore::new(chunk),
             net: NetStore::new(chunk),
             frames: FrameStore::new(chunk),
+            timeline: TimelineStore::new(),
             latest: SessionTime(0),
             generation: 0,
             dirty: false,
@@ -165,6 +170,50 @@ impl SessionWriter {
             self.frames.set_budget(run, budget_us(Some(hz)));
             self.dirty = true;
         }
+    }
+
+    /// Interns a slice name.
+    pub fn intern_name(&mut self, s: &str) -> NameId {
+        let before = self.timeline_names();
+        let id = self.timeline.intern(s);
+        if self.timeline_names() != before {
+            self.dirty = true;
+        }
+        id
+    }
+
+    fn timeline_names(&self) -> usize {
+        self.timeline.name_count()
+    }
+
+    /// The track for `(run, kind, key)`, created on first use. A non-empty name replaces an
+    /// empty one.
+    pub fn timeline_track(&mut self, run: RunId, kind: TrackKind, key: u64, name: &str) -> TrackId {
+        self.dirty = true;
+        self.timeline.track(run, kind, key, name)
+    }
+
+    pub fn set_track_order(&mut self, track: TrackId, order: u32) {
+        self.timeline.set_order(track, order);
+        self.dirty = true;
+    }
+
+    /// Stores a slice in the lane of `track` at `depth`. Returns false, storing nothing and
+    /// counting the drop, when the depth is out of range, the slice would overlap the lane's
+    /// last slice, or the widget-build cap is reached.
+    pub fn push_slice(&mut self, track: TrackId, depth: u16, s: Slice, widget_build: bool) -> bool {
+        self.dirty = true;
+        let stored = self.timeline.push(track, depth, s, widget_build);
+        if stored {
+            self.touch(s.end());
+        }
+        stored
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_build_cap(mut self, cap: u64) -> Self {
+        self.timeline.set_build_cap(cap);
+        self
     }
 
     /// Inserts or updates a request, keyed by `(run, isolate, vm_id)`.
@@ -263,6 +312,7 @@ impl SessionWriter {
                 logs: self.logs.snapshot(),
                 net: self.net.snapshot(self.latest),
                 frames: self.frames.snapshot(),
+                timeline: self.timeline.snapshot(),
                 latest: self.latest,
             });
         }

@@ -5,6 +5,7 @@ use crate::logs::{LogInput, LogLevel, LogSource};
 use crate::net::HttpUpdate;
 use crate::session::SessionWriter;
 use crate::time::{RunId, SessionTime};
+use crate::timeline::{Slice, SliceCat, TrackId, TrackKind};
 
 struct Rng(u64);
 
@@ -278,6 +279,206 @@ pub fn frames(w: &mut SessionWriter, run: RunId, n: usize, seed: u64, hz: u32) {
             );
         }
     }
+}
+
+/// Frames (see [`frames`], which already carries each frame's UI and raster phases) plus about
+/// 70 slices per frame that match those phases: the UI and raster threads, two async rows and a
+/// `DartWorker` track with a GC slice every 50 frames. A frame whose work would overlap the
+/// previous frame's in a lane (a janky frame running into the next one) gets no slices there.
+pub fn perf(w: &mut SessionWriter, run: RunId, n: usize, seed: u64, hz: u32) {
+    frames(w, run, n, seed, hz);
+    let snap = w.publish();
+    let mut r = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
+    let ui = w.timeline_track(run, TrackKind::Thread, 1, "io.flutter.ui");
+    w.set_track_order(ui, 0);
+    let raster = w.timeline_track(run, TrackKind::Thread, 2, "io.flutter.raster");
+    w.set_track_order(raster, 1);
+    let frame_row = w.timeline_track(run, TrackKind::Async, 3, "Frame");
+    let pipeline = w.timeline_track(run, TrackKind::Async, 4, "PipelineItem");
+    let worker = w.timeline_track(run, TrackKind::Thread, 5, "DartWorker");
+    let mut ends = [0u64; 4];
+    for i in 0..snap.frames.len() {
+        let f = snap.frames.get(i).expect("frame in range");
+        let (Some(u), Some(rs)) = (f.ui, f.raster) else {
+            continue;
+        };
+        let (frame_start, frame_end) = (f.start.0, f.end().0);
+        if u.begin.0 >= ends[0] {
+            ends[0] = ui_slices(w, ui, &mut r, &u);
+        }
+        if rs.start.0 >= ends[1] {
+            ends[1] = raster_slices(
+                w,
+                raster,
+                &mut r,
+                rs.start.0,
+                u64::from(rs.raster_us) * 1_000,
+            );
+        }
+        if frame_start >= ends[2] {
+            let dur = frame_end - frame_start;
+            let animate = Slice {
+                start: SessionTime(frame_start),
+                dur_ns: dur / 10,
+                name: w.intern_name("Animate"),
+                cat: SliceCat::Embedder,
+            };
+            w.push_slice(frame_row, 1, animate, false);
+            let parent = Slice {
+                dur_ns: dur,
+                name: w.intern_name("Frame"),
+                ..animate
+            };
+            w.push_slice(frame_row, 0, parent, false);
+            ends[2] = frame_end;
+        }
+        if frame_start >= ends[3] {
+            let dur = u64::from(u.ui_us) * 1_000;
+            let child = Slice {
+                start: SessionTime(frame_start),
+                dur_ns: dur / 2,
+                name: w.intern_name("PipelineProduce"),
+                cat: SliceCat::Embedder,
+            };
+            w.push_slice(pipeline, 1, child, false);
+            let parent = Slice {
+                dur_ns: dur,
+                name: w.intern_name("PipelineItem"),
+                ..child
+            };
+            w.push_slice(pipeline, 0, parent, false);
+            ends[3] = frame_start + dur;
+        }
+        if i % 50 == 49 {
+            let gc = Slice {
+                start: SessionTime(frame_start + 1_000_000),
+                dur_ns: 1_000_000 + r.below(2_000_000),
+                name: w.intern_name("CollectNewGeneration"),
+                cat: SliceCat::Gc,
+            };
+            w.push_slice(worker, 0, gc, false);
+        }
+    }
+}
+
+fn slice(w: &mut SessionWriter, name: &str, start: u64, dur: u64, cat: SliceCat) -> Slice {
+    Slice {
+        start: SessionTime(start),
+        dur_ns: dur,
+        name: w.intern_name(name),
+        cat,
+    }
+}
+
+/// The UI thread's slices for one frame, children before parents; returns where they end.
+fn ui_slices(w: &mut SessionWriter, t: TrackId, r: &mut Rng, u: &UiPhases) -> u64 {
+    let us = |v: u32| u64::from(v) * 1_000;
+    let begin = u.begin.0;
+    let build_at = begin;
+    let layout_at = build_at + us(u.build_us);
+    let paint_at = layout_at + us(u.layout_us);
+    let comp_at = paint_at + us(u.paint_us);
+    let fin_at = comp_at + us(u.composite_us);
+    let end = begin + us(u.ui_us);
+    if r.below(10) == 0 {
+        // Three levels of four widget builds, each level inside the first slice of the one above.
+        let (at, mut dur) = (build_at, us(u.build_us));
+        for depth in 3..6u16 {
+            let each = dur / 4;
+            for k in 0..4 {
+                let name = format!("Widget{depth}_{k}.build");
+                let s = slice(w, &name, at + k * each, each, SliceCat::Dart);
+                w.push_slice(t, depth, s, true);
+            }
+            dur = each;
+        }
+    }
+    let s = slice(w, "BUILD", build_at, us(u.build_us), SliceCat::Dart);
+    w.push_slice(t, 2, s, false);
+    let s = slice(w, "LAYOUT", layout_at, us(u.layout_us), SliceCat::Dart);
+    w.push_slice(t, 3, s, false);
+    let s = slice(
+        w,
+        "LAYOUT (root)",
+        layout_at,
+        us(u.layout_us),
+        SliceCat::Dart,
+    );
+    w.push_slice(t, 2, s, false);
+    let s = slice(w, "PAINT", paint_at, us(u.paint_us), SliceCat::Dart);
+    w.push_slice(t, 3, s, false);
+    let s = slice(w, "PAINT (root)", paint_at, us(u.paint_us), SliceCat::Dart);
+    w.push_slice(t, 2, s, false);
+    let s = slice(
+        w,
+        "Animator::Render",
+        comp_at,
+        us(u.composite_us),
+        SliceCat::Embedder,
+    );
+    w.push_slice(t, 3, s, false);
+    let s = slice(
+        w,
+        "COMPOSITING",
+        comp_at,
+        us(u.composite_us),
+        SliceCat::Dart,
+    );
+    w.push_slice(t, 2, s, false);
+    let fin = us(u.finalize_us);
+    let s = slice(w, "FINALIZE TREE", fin_at, fin - fin / 4, SliceCat::Dart);
+    w.push_slice(t, 2, s, false);
+    let s = slice(w, "POST_FRAME", end - fin / 4, fin / 4, SliceCat::Dart);
+    w.push_slice(t, 2, s, false);
+    let s = slice(
+        w,
+        "Animator::BeginFrame",
+        begin,
+        us(u.ui_us),
+        SliceCat::Embedder,
+    );
+    w.push_slice(t, 1, s, false);
+    let s = slice(
+        w,
+        "VsyncProcessCallback",
+        begin,
+        us(u.ui_us),
+        SliceCat::Embedder,
+    );
+    w.push_slice(t, 0, s, false);
+    end
+}
+
+/// The raster thread's slices for one frame, children before parents.
+fn raster_slices(w: &mut SessionWriter, t: TrackId, r: &mut Rng, start: u64, dur: u64) -> u64 {
+    let preroll = dur / 5;
+    let paint_at = start + preroll;
+    let paint = dur * 7 / 10;
+    let n = 40 + r.below(23);
+    let each = paint / n;
+    for k in 0..n {
+        let s = slice(
+            w,
+            "Canvas::saveLayer",
+            paint_at + k * each,
+            each * 4 / 5,
+            SliceCat::Embedder,
+        );
+        w.push_slice(t, 4, s, false);
+    }
+    let s = slice(w, "LayerTree::Preroll", start, preroll, SliceCat::Embedder);
+    w.push_slice(t, 3, s, false);
+    let s = slice(w, "LayerTree::Paint", paint_at, paint, SliceCat::Embedder);
+    w.push_slice(t, 3, s, false);
+    for (depth, name) in [
+        (2, "Rasterizer::DrawToSurfaces"),
+        (1, "Rasterizer::DoDraw"),
+        (0, "GPURasterizer::Draw"),
+    ] {
+        let s = slice(w, name, start, dur, SliceCat::Embedder);
+        w.push_slice(t, depth, s, false);
+    }
+    start + dur
 }
 
 /// A writer holding one run of synthetic data (`logs_n` log records, `requests_n` requests and
