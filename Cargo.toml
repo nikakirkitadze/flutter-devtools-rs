@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/fdt_ui", "crates/fdt_app", "crates/fdt_store", "crates/fdt_vm", "crates/fdt_capture"]
+members = ["crates/fdt_ui", "crates/fdt_app", "crates/fdt_store", "crates/fdt_vm", "crates/fdt_capture", "crates/fdt_analysis"]
 
 [workspace.package]
 version = "0.1.0"
