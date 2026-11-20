@@ -11,6 +11,9 @@ use std::sync::Arc;
 pub const LOG_CHUNK: usize = 1024;
 /// The store keeps at most this many bytes of a record's text.
 pub const MAX_RECORD_BYTES: usize = 1 << 20;
+/// The tail chunk is sealed once its text reaches this many bytes, so a snapshot never copies
+/// much more than this, however large the records are.
+pub const LOG_TAIL_MAX_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum LogLevel {
@@ -153,8 +156,11 @@ fn count_lines(text: &str) -> u32 {
 pub(crate) struct LogStore {
     chunk_size: usize,
     sealed: Vec<Arc<LogChunk>>,
+    /// First seq of each sealed chunk (chunks seal by count or by bytes, so sizes vary).
+    bases: Vec<usize>,
     tail: LogChunk,
     cache: Option<Arc<[Arc<LogChunk>]>>,
+    bases_cache: Option<Arc<[usize]>>,
     loggers: Vec<Arc<str>>,
     logger_ix: HashMap<Arc<str>, u32>,
     loggers_cache: Option<Arc<[Arc<str>]>>,
@@ -166,8 +172,10 @@ impl LogStore {
         Self {
             chunk_size: chunk_size.max(1),
             sealed: Vec::new(),
+            bases: Vec::new(),
             tail: LogChunk::default(),
             cache: None,
+            bases_cache: None,
             loggers: vec![Arc::from("")],
             logger_ix: HashMap::new(),
             loggers_cache: None,
@@ -209,9 +217,12 @@ impl LogStore {
             error: input.error.map(Arc::new),
         });
         self.len += 1;
-        if self.tail.metas.len() == self.chunk_size {
+        if self.tail.metas.len() >= self.chunk_size || self.tail.text.len() >= LOG_TAIL_MAX_BYTES {
+            let base = self.len - self.tail.metas.len();
+            self.bases.push(base);
             self.sealed.push(Arc::new(std::mem::take(&mut self.tail)));
             self.cache = None;
+            self.bases_cache = None;
         }
         EntryId {
             run: input.run,
@@ -224,6 +235,10 @@ impl LogStore {
             .cache
             .get_or_insert_with(|| self.sealed.clone().into())
             .clone();
+        let bases = self
+            .bases_cache
+            .get_or_insert_with(|| self.bases.clone().into())
+            .clone();
         let loggers = self
             .loggers_cache
             .get_or_insert_with(|| self.loggers.clone().into())
@@ -231,6 +246,7 @@ impl LogStore {
         LogsSnapshot {
             chunk_size: self.chunk_size,
             sealed,
+            bases,
             tail: Arc::new(self.tail.clone()),
             loggers,
             len: self.len,
@@ -256,6 +272,8 @@ pub struct LogRow<'a> {
 pub struct LogsSnapshot {
     chunk_size: usize,
     sealed: Arc<[Arc<LogChunk>]>,
+    /// First seq of each sealed chunk.
+    bases: Arc<[usize]>,
     tail: Arc<LogChunk>,
     /// Index 0 is the empty "no logger" name.
     loggers: Arc<[Arc<str>]>,
@@ -308,9 +326,14 @@ impl LogsSnapshot {
     /// The record at `seq`. Panics when out of range.
     pub fn row(&self, seq: usize) -> LogRow<'_> {
         assert!(seq < self.len, "log row {seq} out of range ({})", self.len);
-        let (c, o) = (seq / self.chunk_size, seq % self.chunk_size);
-        let chunk = self.sealed.get(c).map_or(&*self.tail, |c| &**c);
-        let m = &chunk.metas[o];
+        let tail_base = self.len - self.tail.metas.len();
+        let (chunk, base) = if seq >= tail_base {
+            (&*self.tail, tail_base)
+        } else {
+            let c = self.bases.partition_point(|&b| b <= seq) - 1;
+            (&*self.sealed[c], self.bases[c])
+        };
+        let m = &chunk.metas[seq - base];
         LogRow {
             id: EntryId {
                 run: m.run,
@@ -329,9 +352,17 @@ impl LogsSnapshot {
 
     /// O(n); call off the UI thread.
     pub fn level_counts(&self, range: Option<TimeRange>) -> [u64; 4] {
+        self.level_counts_from(0, range)
+    }
+
+    /// Counts only the records at or after `from_seq`.
+    pub fn level_counts_from(&self, from_seq: usize, range: Option<TimeRange>) -> [u64; 4] {
         let mut counts = [0u64; 4];
-        for chunk in self.chunks() {
-            for m in &chunk.metas {
+        for (base, chunk) in self.chunks_with_base() {
+            if base + chunk.metas.len() <= from_seq {
+                continue;
+            }
+            for m in &chunk.metas[from_seq.saturating_sub(base)..] {
                 if range.is_none_or(|r| r.contains(m.time)) {
                     counts[m.level.index()] += 1;
                 }
@@ -340,12 +371,23 @@ impl LogsSnapshot {
         counts
     }
 
-    /// Non-empty chunks in order; chunk `i` starts at seq `i * chunk_size`.
-    pub(crate) fn chunks(&self) -> impl Iterator<Item = &LogChunk> {
-        self.sealed
+    /// Text bytes in the tail chunk (the part a snapshot copies).
+    pub fn tail_text_bytes(&self) -> usize {
+        self.tail.text.len()
+    }
+
+    /// Non-empty chunks in order, each with the seq of its first record.
+    pub(crate) fn chunks_with_base(&self) -> impl Iterator<Item = (usize, &LogChunk)> {
+        let tail_base = self.len - self.tail.metas.len();
+        self.bases
             .iter()
-            .map(|c| &**c)
-            .chain((!self.tail.metas.is_empty()).then_some(&*self.tail))
+            .copied()
+            .zip(self.sealed.iter().map(|c| &**c))
+            .chain((!self.tail.metas.is_empty()).then_some((tail_base, &*self.tail)))
+    }
+
+    pub(crate) fn chunks(&self) -> impl Iterator<Item = &LogChunk> {
+        self.chunks_with_base().map(|(_, c)| c)
     }
 
     pub(crate) fn loggers_all(&self) -> &[Arc<str>] {
@@ -493,5 +535,52 @@ mod tests {
         assert_eq!(s.logs.level_counts(None), [1, 2, 0, 1]);
         let r = TimeRange::new(SessionTime(2_000_000), SessionTime(3_000_000));
         assert_eq!(s.logs.level_counts(Some(r)), [0, 2, 0, 0]);
+    }
+
+    #[test]
+    fn a_stream_of_large_records_seals_by_bytes() {
+        let (mut w, run) = writer(LOG_CHUNK);
+        let text = "x".repeat(64 * 1024);
+        for i in 0..100 {
+            w.push_log(input(run, i, LogLevel::Info, "", &text));
+            let s = w.publish();
+            assert!(s.logs.tail_text_bytes() <= LOG_TAIL_MAX_BYTES + 64 * 1024);
+        }
+        let s = w.publish();
+        assert_eq!(s.logs.len(), 100);
+        for i in [0, 3, 4, 5, 50, 99] {
+            assert_eq!(s.logs.row(i).id.seq, i as u64);
+            assert_eq!(s.logs.row(i).time, SessionTime(i as u64 * 1_000_000));
+        }
+    }
+
+    #[test]
+    fn level_counts_from_matches_a_full_count() {
+        let (mut w, run) = writer(LOG_CHUNK);
+        crate::synth::logs(&mut w, run, 10_000, 3);
+        let s = w.publish();
+        let ranges = [
+            None,
+            Some(TimeRange::new(SessionTime(0), SessionTime(3_000_000_000))),
+            Some(TimeRange::new(
+                SessionTime(2_000_000_000),
+                SessionTime(9_000_000_000),
+            )),
+        ];
+        for r in ranges {
+            let full = s.logs.level_counts(r);
+            for k in [0usize, 1, 1023, 1024, 7_777] {
+                let from = s.logs.level_counts_from(k, r);
+                let mut head = [0u64; 4];
+                for i in 0..k {
+                    let row = s.logs.row(i);
+                    if r.is_none_or(|r| r.contains(row.time)) {
+                        head[row.level as usize] += 1;
+                    }
+                }
+                let sum: Vec<u64> = (0..4).map(|i| from[i] + head[i]).collect();
+                assert_eq!(sum, full.to_vec(), "k={k} r={r:?}");
+            }
+        }
     }
 }

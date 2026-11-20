@@ -304,9 +304,7 @@ fn scan_chunk(
 }
 
 fn scan(
-    chunks: &[&LogChunk],
-    first_index: usize,
-    chunk_size: usize,
+    chunks: &[(usize, &LogChunk)],
     f: &LogFilter,
     p: &Prepared,
     from_seq: usize,
@@ -314,9 +312,7 @@ fn scan(
 ) -> Vec<u32> {
     let parts: Vec<Vec<u32>> = chunks
         .par_iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let base = (first_index + i) * chunk_size;
+        .map(|&(base, c)| {
             if base + c.metas.len() <= from_seq {
                 return Vec::new();
             }
@@ -328,9 +324,9 @@ fn scan(
 
 /// Ascending seqs `>= from_seq` that pass the filter.
 pub fn filter_logs(snap: &LogsSnapshot, f: &LogFilter, from_seq: usize) -> Vec<u32> {
-    let chunks: Vec<&LogChunk> = snap.chunks().collect();
+    let chunks: Vec<(usize, &LogChunk)> = snap.chunks_with_base().collect();
     let p = Prepared::new(snap, f);
-    scan(&chunks, 0, snap.chunk_size(), f, &p, from_seq, None)
+    scan(&chunks, f, &p, from_seq, None)
 }
 
 /// Scans the newest `FIRST_PHASE_CHUNKS` chunks and hands them to `on_first`,
@@ -341,31 +337,15 @@ pub fn filter_logs_two_phase(
     cancel: &AtomicBool,
     on_first: impl FnOnce(Vec<u32>),
 ) -> Option<Vec<u32>> {
-    let chunks: Vec<&LogChunk> = snap.chunks().collect();
+    let chunks: Vec<(usize, &LogChunk)> = snap.chunks_with_base().collect();
     let p = Prepared::new(snap, f);
     let split = chunks.len().saturating_sub(FIRST_PHASE_CHUNKS);
-    let first = scan(
-        &chunks[split..],
-        split,
-        snap.chunk_size(),
-        f,
-        &p,
-        0,
-        Some(cancel),
-    );
+    let first = scan(&chunks[split..], f, &p, 0, Some(cancel));
     if cancel.load(Ordering::Relaxed) {
         return None;
     }
     on_first(first.clone());
-    let mut all = scan(
-        &chunks[..split],
-        0,
-        snap.chunk_size(),
-        f,
-        &p,
-        0,
-        Some(cancel),
-    );
+    let mut all = scan(&chunks[..split], f, &p, 0, Some(cancel));
     if cancel.load(Ordering::Relaxed) {
         return None;
     }
