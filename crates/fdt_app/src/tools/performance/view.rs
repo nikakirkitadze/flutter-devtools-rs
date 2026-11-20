@@ -3,6 +3,7 @@
 //! The page keeps the shared range and the selected frame the shell hands it, so each tab shows
 //! the same slice of the session.
 
+use super::cpu_tab::CpuTab;
 use super::details::DetailsState;
 use super::frame_chart::{ChartEvent, FrameChart};
 use super::frames_table::{FramesList, ListEvent};
@@ -19,8 +20,8 @@ use fdt_ui::tokens::{alpha, font, layout, radius, space};
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{Icon, Sizable as _, Size};
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, Entity, EventEmitter, Hsla, InteractiveElement as _,
-    IntoElement, ParentElement as _, Pixels, Point, Render, SharedString,
+    AnyElement, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Hsla,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, Render, SharedString,
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription,
     TestSupportExt as _, Window, anchored, deferred, div, point,
 };
@@ -76,6 +77,10 @@ pub struct PerformanceView {
     pub(super) details: DetailsState,
     chart: Entity<FrameChart>,
     list: Entity<FramesList>,
+    /// The CPU tab.
+    cpu: Entity<CpuTab>,
+    /// Where the keyboard focus goes when a tab's own element leaves the screen.
+    focus: FocusHandle,
     /// The frame under the pointer and where, for the tooltip.
     hover: Option<(usize, Point<Pixels>)>,
     /// Whether the chart follows the newest frame; "Latest" shows while it does not.
@@ -100,6 +105,7 @@ impl PerformanceView {
         let snap = session.read(cx).snapshot().clone();
         let chart = cx.new(|cx| FrameChart::new(snap, cx));
         let list = cx.new(|cx| FramesList::new(session.clone(), window, cx));
+        let cpu = cx.new(|cx| CpuTab::new(session.clone(), window, cx));
         let subs = vec![
             cx.subscribe(&chart, |this, _, e: &ChartEvent, cx| {
                 this.chart_event(*e, cx)
@@ -114,6 +120,8 @@ impl PerformanceView {
             details: DetailsState::default(),
             chart,
             list,
+            cpu,
+            focus: cx.focus_handle(),
             hover: None,
             following: true,
             page_active: false,
@@ -130,6 +138,11 @@ impl PerformanceView {
     #[cfg(test)]
     pub(crate) fn list(&self) -> &Entity<FramesList> {
         &self.list
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cpu(&self) -> &Entity<CpuTab> {
+        &self.cpu
     }
 
     #[cfg(test)]
@@ -236,6 +249,8 @@ impl PerformanceView {
     fn refresh_active(&mut self, cx: &mut Context<Self>) {
         let on = self.page_active && self.tab == PerfTab::Frames;
         self.list.update(cx, |l, cx| l.set_active(on, cx));
+        let cpu_on = self.page_active && self.tab == PerfTab::Cpu;
+        self.cpu.update(cx, |c, cx| c.set_active(cpu_on, cx));
     }
 
     /// The shared time range and the selected frame, from the shell's location.
@@ -253,6 +268,7 @@ impl PerformanceView {
                 c.set_range(range, cx);
                 c.set_selection(seq, cx);
             });
+            self.cpu.update(cx, |c, cx| c.set_range(range, cx));
             self.list.update(cx, |l, cx| {
                 l.set_range(range, cx);
                 l.set_selection(seq, cx);
@@ -447,10 +463,22 @@ impl PerformanceView {
 }
 
 impl Render for PerformanceView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::perf::bump(crate::perf::Counter::PerformanceView, 1);
+        if self.tab != PerfTab::Cpu {
+            let to = self.focus.clone();
+            self.cpu
+                .update(cx, |c, cx| c.release_focus(&to, window, cx));
+        }
         let body = if self.tab == PerfTab::Frames {
             self.render_frames(cx)
+        } else if self.tab == PerfTab::Cpu {
+            div()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .child(self.cpu.clone())
+                .into_any_element()
         } else {
             div()
                 .flex_1()
@@ -469,6 +497,7 @@ impl Render for PerformanceView {
         div()
             .id("performance-view")
             .test_support()
+            .track_focus(&self.focus)
             .size_full()
             .flex()
             .flex_col()
