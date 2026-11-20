@@ -3,6 +3,9 @@
 
 use super::model::{line_at, line_starts, shown_highlights};
 use super::view::{LogsView, format_time, level_color};
+use crate::nav::{Location, Page, Selection, Tool};
+use crate::tools::OpenLocation;
+use crate::tools::related::{Kind, RelatedState, RelatedView, status_label};
 use fdt_store::logs::LogRow;
 use fdt_store::time::EntryId;
 use fdt_ui::theme::TokensExt as _;
@@ -25,6 +28,8 @@ pub(super) struct DetailsState {
     lines: Option<(RecordKey, Arc<Vec<u32>>)>,
     message_scroll: UniformListScrollHandle,
     stack_scroll: UniformListScrollHandle,
+    /// The frame and requests around the selected record, computed off the UI thread.
+    pub(super) related: RelatedState,
 }
 
 impl Default for DetailsState {
@@ -33,6 +38,7 @@ impl Default for DetailsState {
             lines: None,
             message_scroll: UniformListScrollHandle::new(),
             stack_scroll: UniformListScrollHandle::new(),
+            related: RelatedState::default(),
         }
     }
 }
@@ -40,6 +46,7 @@ impl Default for DetailsState {
 impl DetailsState {
     pub(super) fn reset(&mut self) {
         self.lines = None;
+        self.related.clear();
     }
 
     #[cfg(test)]
@@ -73,6 +80,119 @@ pub(super) fn record_json(rec: &LogRow<'_>) -> String {
 }
 
 impl LogsView {
+    /// Starts (or skips) the correlation for the selected record while the pane is open.
+    pub(super) fn sync_related(&mut self, cx: &mut Context<Self>) {
+        let target = self
+            .selected
+            .filter(|_| self.details_open)
+            .and_then(|seq| Some((self.snap.logs.get_row(seq as usize)?.id, seq as usize)));
+        let Some(target) = target else {
+            self.details.related.clear();
+            return;
+        };
+        let snap = self.snap.clone();
+        self.details.related.sync(
+            cx,
+            |v| &mut v.details.related,
+            |v, cx| v.sync_related(cx),
+            snap,
+            target,
+            Kind::Log,
+        );
+    }
+
+    /// Asks the shell to open `selection` in `tool`, keeping the range, with a Back step.
+    pub(super) fn open_related(
+        &mut self,
+        tool: Tool,
+        selection: Selection,
+        cx: &mut Context<Self>,
+    ) {
+        cx.emit(OpenLocation(Location {
+            page: Page::Tool(tool),
+            selection: Some(selection),
+            range: self.filter.range,
+        }));
+    }
+
+    fn render_related(
+        &self,
+        view: &RelatedView,
+        t: &fdt_ui::tokens::Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let link = |id: SharedString, text: String| {
+            div()
+                .id(id)
+                .test_support()
+                .aria_label(SharedString::from(text.clone()))
+                .w_full()
+                .truncate()
+                .px(space::S4)
+                .rounded(radius::CONTROL)
+                .text_color(Hsla::from(t.accent))
+                .cursor_pointer()
+                .hover(|s| s.bg(Hsla::from(t.elevated)))
+                .child(text)
+        };
+        let muted = |id: &'static str, text: &'static str| {
+            div()
+                .id(id)
+                .test_support()
+                .aria_label(text)
+                .text_size(font::LABEL)
+                .font_weight(font::SEMIBOLD)
+                .text_color(Hsla::from(t.text_muted))
+                .child(text)
+        };
+        let mut block = div()
+            .id("logs-related")
+            .test_support()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .gap(space::S2)
+            .child(muted("logs-related-heading", "Related"));
+        match view.frame {
+            Some(f) => {
+                let id = f.id;
+                block = block.child(
+                    link(
+                        "logs-related-frame".into(),
+                        format!("Frame #{} \u{b7} {}", f.number, status_label(f.status)),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_related(Tool::Performance, Selection::Frame(id), cx)
+                    })),
+                );
+            }
+            None => {
+                block = block.child(
+                    div()
+                        .id("logs-related-empty")
+                        .test_support()
+                        .aria_label("No frame at this moment.")
+                        .text_color(Hsla::from(t.text_muted))
+                        .child("No frame at this moment."),
+                );
+            }
+        }
+        if !view.requests.is_empty() {
+            block = block.child(muted("logs-related-requests-heading", "Requests in flight"));
+            for (i, r) in view.requests.iter().enumerate() {
+                let id = r.id;
+                block = block.child(
+                    link(format!("logs-related-request-{i}").into(), r.text.clone()).on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.open_related(Tool::Network, Selection::Request(id), cx)
+                        }),
+                    ),
+                );
+            }
+        }
+        block.into_any_element()
+    }
+
     pub(super) fn copy_text(&self, seq: u32, cx: &mut Context<Self>) {
         let Some(rec) = self.snap.logs.get_row(seq as usize) else {
             return;
@@ -158,6 +278,11 @@ impl LogsView {
         let time = format_time(rec.time);
         let clamped = rec.clamped;
         let error = rec.error.cloned();
+        let related = self
+            .details
+            .related
+            .view(self.snap.session, rec.id)
+            .map(|v| self.render_related(&v, &t, cx));
 
         let meta = |id: &'static str, key: &'static str, value: String, colour: Hsla| {
             div()
@@ -256,7 +381,8 @@ impl LogsView {
                             .text_color(Hsla::from(t.text_muted))
                             .child("Before fdt connected")
                     })),
-            );
+            )
+            .children(related);
 
         if let Some(err) = error {
             body = body

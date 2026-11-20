@@ -7,7 +7,10 @@
 use super::body::{BodyKindGuess, RenderedBody, guess, render_lines};
 use super::model::{Tone, format_bytes, format_duration_ns, format_time, status_text, status_tone};
 use super::view::NetworkView;
+use crate::nav::{Location, Page, Selection, Tool};
 use crate::settings::settings;
+use crate::tools::OpenLocation;
+use crate::tools::related::{Kind, RelatedState};
 use fdt_capture::ConnStatus;
 use fdt_store::net::{Body, BodyKind, BodyState, HttpRecord};
 use fdt_store::time::{EntryId, RunId};
@@ -163,6 +166,8 @@ pub(super) struct DetailsState {
     loads: HashMap<(EntryId, BodyKind), Load>,
     scroll: [UniformListScrollHandle; 2],
     shown: Option<EntryId>,
+    /// The frame that processed the response and the log lines during the request.
+    pub(super) related: RelatedState,
     /// The session the waits and `shown` belong to: ids repeat across sessions.
     session: u64,
 }
@@ -184,6 +189,7 @@ impl DetailsState {
                 UniformListScrollHandle::new(),
             ],
             shown: None,
+            related: RelatedState::default(),
             session: 0,
         }
     }
@@ -270,9 +276,109 @@ impl NetworkView {
             return;
         };
         self.details.open = true;
+        self.sync_related(cx);
         // Enter commits the selection as a history step (nothing new if it already is one).
         cx.emit(super::NetworkEvent::Selected(Some(id)));
         cx.notify();
+    }
+
+    /// Starts (or skips) the correlation for the selected request while the pane is open.
+    pub(super) fn sync_related(&mut self, cx: &mut Context<Self>) {
+        let snap = self.session.read(cx).snapshot().clone();
+        let target = self
+            .selected
+            .filter(|_| self.details.open)
+            .and_then(|seq| Some((snap.net.get(seq as usize)?.id, seq as usize)));
+        let Some(target) = target else {
+            self.details.related.clear();
+            return;
+        };
+        self.details.related.sync(
+            cx,
+            |v| &mut v.details.related,
+            |v, cx| v.sync_related(cx),
+            snap,
+            target,
+            Kind::Request,
+        );
+    }
+
+    fn open_related(&mut self, tool: Tool, selection: Selection, cx: &mut Context<Self>) {
+        cx.emit(OpenLocation(Location {
+            page: Page::Tool(tool),
+            selection: Some(selection),
+            range: self.filter.range,
+        }));
+    }
+
+    /// The Related section's content: filled in once the background job has run.
+    fn related_body(&mut self, rec: &HttpRecord, cx: &mut Context<Self>) -> AnyElement {
+        let t = *cx.tokens();
+        let session = self.session.read(cx).snapshot().session;
+        let Some(view) = self.details.related.view(session, rec.id) else {
+            return div().into_any_element();
+        };
+        let link = |id: SharedString, text: String| {
+            div()
+                .id(id)
+                .test_support()
+                .aria_label(SharedString::from(text.clone()))
+                .w_full()
+                .truncate()
+                .px(space::S4)
+                .rounded(radius::CONTROL)
+                .text_color(Hsla::from(t.accent))
+                .cursor_pointer()
+                .hover(|s| s.bg(Hsla::from(t.elevated)))
+                .child(text)
+        };
+        let mut body = div().flex().flex_col().gap(space::S2);
+        match view.frame {
+            Some(f) => {
+                let id = f.id;
+                body = body.child(
+                    link(
+                        "net-related-frame".into(),
+                        format!("Frame that processed the response: #{}", f.number),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_related(Tool::Performance, Selection::Frame(id), cx)
+                    })),
+                );
+            }
+            None => {
+                body = body.child(
+                    div()
+                        .id("net-related-empty")
+                        .test_support()
+                        .aria_label("No frame processed the response.")
+                        .text_color(Hsla::from(t.text_muted))
+                        .child("No frame processed the response."),
+                );
+            }
+        }
+        if !view.logs.is_empty() {
+            body = body.child(
+                div()
+                    .id("net-related-logs-heading")
+                    .test_support()
+                    .aria_label("Log lines during this request")
+                    .text_size(font::LABEL)
+                    .text_color(Hsla::from(t.text_muted))
+                    .child("Log lines during this request"),
+            );
+            for (i, l) in view.logs.iter().enumerate() {
+                let id = l.id;
+                body = body.child(
+                    link(sid(format!("net-related-log-{i}")), l.text.clone()).on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.open_related(Tool::Logs, Selection::Log(id), cx)
+                        }),
+                    ),
+                );
+            }
+        }
+        body.into_any_element()
     }
 
     /// Closes the details pane; true when it was open (Esc closes it before the selection).
@@ -360,6 +466,7 @@ impl NetworkView {
             self.details.shown = None;
             cx.notify();
         }
+        self.sync_related(cx);
         if self.details.loads.is_empty() {
             return;
         }
@@ -711,6 +818,13 @@ impl NetworkView {
             ));
         }
         sections.push(self.section("timing", "Timing", None, |_, cx| timing_body(&rec, cx), cx));
+        sections.push(self.section(
+            "related",
+            "Related",
+            None,
+            |this, cx| this.related_body(&rec, cx),
+            cx,
+        ));
         let wanted = std::mem::take(&mut self.details.wanted);
         self.details.cache.retain(|k, _| wanted.contains(k));
         self.details.wanted = wanted;
@@ -769,6 +883,8 @@ impl NetworkView {
         });
         let body = (!collapsed).then(|| content(self, cx));
         div()
+            .id(sid(format!("net-section-{id}")))
+            .test_support()
             .flex()
             .flex_col()
             .flex_none()

@@ -90,16 +90,22 @@ pub fn related_to_log(snap: &Snapshot, log_seq: usize) -> Related {
         return Related::default();
     };
     let t = row.time;
-    let frame = snap.frames.at(t).or_else(|| {
-        let i = snap.frames.first_after(t)?;
-        let f = snap.frames.get(i)?;
-        (f.start.0 - t.0 <= AFTER_LOG_NS).then_some(i)
-    });
     Related {
-        frames: frame.into_iter().collect(),
+        frames: frame_for_log(snap, log_seq).into_iter().collect(),
         requests: nearest(request_times(snap, net_in(snap, TimeRange::new(t, t))), t),
         logs: Vec::new(),
     }
+}
+
+/// The frame at the line's time, else the first one starting within 100 ms after it. Binary
+/// searches only.
+pub fn frame_for_log(snap: &Snapshot, log_seq: usize) -> Option<usize> {
+    let t = snap.logs.get_row(log_seq)?.time;
+    snap.frames.at(t).or_else(|| {
+        let i = snap.frames.first_after(t)?;
+        let f = snap.frames.get(i)?;
+        (f.start.0 - t.0 <= AFTER_LOG_NS).then_some(i)
+    })
 }
 
 /// The first frame starting at or after the response end, within 1 s (the frame that processed
@@ -231,5 +237,18 @@ mod tests {
         assert_eq!(related_to_request(&s, 1).frames, vec![1]);
         assert!(related_to_request(&s, 2).frames.is_empty());
         assert!(related_to_request(&s, 3).frames.is_empty());
+    }
+
+    #[test]
+    fn frame_for_log_matches_the_related_frame() {
+        let (mut w, run) = writer();
+        frame(&mut w, run, 1, 100, 20_000);
+        log(&mut w, run, 110);
+        log(&mut w, run, 150);
+        let s = w.publish();
+        assert_eq!(frame_for_log(&s, 0), Some(0));
+        assert_eq!(frame_for_log(&s, 1), None);
+        assert_eq!(related_to_log(&s, 0).frames, vec![0]);
+        assert_eq!(frame_for_log(&s, 9), None);
     }
 }

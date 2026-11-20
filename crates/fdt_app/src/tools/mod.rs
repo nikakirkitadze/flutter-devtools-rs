@@ -1,8 +1,11 @@
 //! Pieces shared by every tool page.
 
+#[cfg(test)]
+mod cross_links;
 pub mod logs;
 pub mod network;
 pub mod performance;
+pub mod related;
 pub mod timeline;
 
 use crate::nav::Location;

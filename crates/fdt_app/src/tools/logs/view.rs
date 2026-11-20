@@ -441,6 +441,7 @@ impl LogsView {
             self.selected = None;
             cx.emit(LogsEvent::Moved(None));
         }
+        self.sync_related(cx);
         if first_load || !result.incremental {
             if self.follow.following {
                 self.scroll.scroll_to_bottom();
@@ -669,6 +670,7 @@ impl LogsView {
             None => {
                 self.pending = None;
                 if self.selected.take().is_some() {
+                    self.details.related.clear();
                     cx.notify();
                 }
             }
@@ -711,6 +713,7 @@ impl LogsView {
                 self.selected = None;
             }
         }
+        self.sync_related(cx);
         cx.notify();
     }
 
@@ -736,6 +739,7 @@ impl LogsView {
         } else {
             LogsEvent::Selected(Some(id))
         });
+        self.sync_related(cx);
         cx.notify();
     }
 
@@ -803,6 +807,7 @@ impl LogsView {
     pub fn open_details(&mut self, cx: &mut Context<Self>) {
         let Some(seq) = self.selected else { return };
         self.details_open = true;
+        self.sync_related(cx);
         // Enter commits the selection as a history step (nothing new if it already is one).
         let Some(id) = self.snap.logs.get_row(seq as usize).map(|r| r.id) else {
             return;
@@ -1089,6 +1094,63 @@ impl LogsView {
         }
     }
 
+    /// The row's time. A link to the frame at that moment when there is one (a binary search per
+    /// visible row), plain text when there is none. Pressing it opens the frame only; it does not
+    /// also select the row.
+    fn time_cell(
+        &self,
+        rec: &LogRow<'_>,
+        seq: u32,
+        t: &fdt_ui::tokens::Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let cell = div()
+            .flex_none()
+            .w(table::COL_TIME)
+            .text_color(Hsla::from(t.text_muted));
+        let text = format_time(rec.time);
+        if crate::tools::related::frame_for_log(&self.snap, seq as usize).is_none() {
+            return cell.child(text).into_any_element();
+        }
+        cell.id(SharedString::from(format!("logs-row-time-{seq}")))
+            .test_support()
+            .aria_label(SharedString::from(text.clone()))
+            .cursor_pointer()
+            .hover(|s| s.text_color(Hsla::from(t.accent)).underline())
+            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                // Keep the row from also taking the press as a selection.
+                window.prevent_default();
+                cx.stop_propagation();
+            })
+            .on_click(cx.listener(move |this, _, _, cx| this.open_frame_at(seq, cx)))
+            .child(text)
+            .into_any_element()
+    }
+
+    /// Finds the frame at the row's time in the background, then asks the shell to open it. The
+    /// snapshot is the one the row was drawn from.
+    fn open_frame_at(&mut self, seq: u32, cx: &mut Context<Self>) {
+        let snap = self.snap.clone();
+        cx.spawn(async move |this, cx| {
+            let frame = cx
+                .background_spawn(async move {
+                    crate::tools::related::frame_for_log(&snap, seq as usize)
+                })
+                .await;
+            if let Some(f) = frame {
+                this.update(cx, |this, cx| {
+                    this.open_related(
+                        crate::nav::Tool::Performance,
+                        crate::nav::Selection::Frame(f.id),
+                        cx,
+                    )
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
     fn record_cells(
         &self,
         rec: &LogRow<'_>,
@@ -1138,13 +1200,7 @@ impl LogsView {
             .min_w_0()
             .items_center()
             .gap(space::S8)
-            .child(
-                div()
-                    .flex_none()
-                    .w(table::COL_TIME)
-                    .text_color(Hsla::from(t.text_muted))
-                    .child(format_time(rec.time)),
-            )
+            .child(self.time_cell(rec, seq, t, cx))
             .child(
                 div()
                     .flex_none()

@@ -573,6 +573,7 @@ impl NetworkView {
                 }
             }
         }
+        self.sync_related(cx);
         cx.notify();
     }
 
@@ -593,6 +594,7 @@ impl NetworkView {
         } else {
             NetworkEvent::Selected(Some(id))
         });
+        self.sync_related(cx);
         cx.notify();
     }
 
@@ -621,6 +623,7 @@ impl NetworkView {
         self.table.update(cx, |t, cx| t.set_selected_row(row, cx));
         let id = self.snap.net.request(seq as usize).id;
         cx.emit(NetworkEvent::Moved(Some(id)));
+        self.sync_related(cx);
         cx.notify();
     }
 
