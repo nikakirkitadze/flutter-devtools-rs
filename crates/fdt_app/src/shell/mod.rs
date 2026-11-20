@@ -209,7 +209,8 @@ impl MainWindow {
             return;
         }
         self.history = NavHistory::new(Location::at(self.current().page));
-        // The views drop their selection and expansion with the range.
+        // Each view notices the new session id on its next result and drops its selection,
+        // expansion and caches, whatever its filter or the range did.
         self.sync_logs(cx);
         self.refresh_counts(cx);
         cx.notify();

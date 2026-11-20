@@ -73,6 +73,9 @@ pub(super) const ALL_SOURCES: [LogSource; 5] = [
 /// What a filter job was computed for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Key {
+    /// The store the job read: generations restart with every session, so a generation alone
+    /// cannot tell a new session from the one already applied.
+    session: u64,
     generation: u64,
     /// Bumped on every filter change.
     version: u64,
@@ -111,7 +114,7 @@ fn fingerprint(snap: &Snapshot) -> Option<(SessionTime, SessionTime)> {
 fn compute(
     snap: &Arc<Snapshot>,
     filter: &LogFilter,
-    version: u64,
+    key: Key,
     prior: Option<(Applied, Arc<[u32]>)>,
     cancel: &AtomicBool,
     first: oneshot::Sender<(Vec<u32>, Arc<Snapshot>)>,
@@ -120,9 +123,10 @@ fn compute(
     let first_snap = snap.clone();
     let same_filter = prior
         .as_ref()
-        .is_some_and(|(p, _)| p.key.version == version);
+        .is_some_and(|(p, _)| p.key.session == key.session && p.key.version == key.version);
     if let Some((p, old)) = prior
-        && p.key.version == version
+        && p.key.session == key.session
+        && p.key.version == key.version
         && p.len > 0
         && snap.logs.len() >= p.len
         && fingerprint(snap).is_some_and(|(first, _)| first == p.first)
@@ -291,8 +295,10 @@ impl LogsView {
 
     /// Starts a filter job for the newest snapshot and filter unless one is current or running.
     fn request(&mut self, cx: &mut Context<Self>) {
+        let snap = self.session.read(cx).snapshot();
         let key = Key {
-            generation: self.session.read(cx).snapshot().generation,
+            session: snap.session,
+            generation: snap.generation,
             version: self.version,
         };
         // A running job re-reads the newest snapshot and filter when it finishes a round.
@@ -314,6 +320,7 @@ impl LogsView {
                 let next = this.update(cx, |this, cx| {
                     let snap = this.session.read(cx).snapshot().clone();
                     let key = Key {
+                        session: snap.session,
                         generation: snap.generation,
                         version: this.version,
                     };
@@ -346,7 +353,7 @@ impl LogsView {
                 let job_snap = snap.clone();
                 let result = cx
                     .background_spawn(async move {
-                        compute(&job_snap, &filter, key.version, prior, &cancel, first_tx)
+                        compute(&job_snap, &filter, key, prior, &cancel, first_tx)
                     })
                     .await;
                 done = Some(key);
@@ -382,7 +389,10 @@ impl LogsView {
         let at_end = self.scroll.is_scrolled_to_end();
         let first_load = self.applied.is_none();
         let old_rows = self.rows.row_count();
-        if result.replaced {
+        // A different session replaced the store whatever the filter did meanwhile (clearing the
+        // range bumps its version, which makes the result look like a fresh filter).
+        let new_session = self.applied.is_some_and(|a| a.key.session != key.session);
+        if result.replaced || new_session {
             // A new session or run replaced the store: nothing expanded or selected before
             // refers to these records.
             self.rows.clear_expanded();
@@ -897,6 +907,7 @@ impl LogsView {
     #[cfg(test)]
     pub fn apply_first_for_test(&mut self, rows: Vec<u32>, cx: &mut Context<Self>) {
         let key = Key {
+            session: self.snap.session,
             generation: self.snap.generation,
             version: self.version,
         };
@@ -2278,6 +2289,81 @@ mod tests {
         assert!(!view.read_with(cx, |v, _| v.is_expanded(5)));
         assert_eq!(view.read_with(cx, |v, _| v.selected()), None);
         assert_eq!(view.read_with(cx, |v, _| v.filtered_len()), 40);
+    }
+
+    /// `n` records; seq 5 is `text`.
+    fn feed_with_record_5(w: &mut fdt_store::SessionWriter, run: RunId, n: usize, text: &str) {
+        for i in 0..n {
+            let mut input = log_at(run, i as u64 * 1_000, LogLevel::Info);
+            input.text = if i == 5 {
+                text.to_string()
+            } else {
+                format!("line {i}")
+            };
+            w.push_log(input);
+        }
+    }
+
+    #[gpui_kit::test]
+    fn a_new_session_after_a_range_change_clears_expansion_and_details(cx: &mut TestAppContext) {
+        let (shell, cx, h) = open_shell_fake(cx);
+        let (mut w, run) = writer();
+        let long = format!("{}\nsecond\nthird", "x".repeat(200));
+        feed_with_record_5(&mut w, run, 12, &long);
+        h.status.send(connected("demo", true)).unwrap();
+        h.snaps.send(w.publish()).unwrap();
+        cx.run_until_parked();
+        frame(cx);
+        let view = view_of(&shell, cx);
+        let mut loc = shell.read_with(cx, |s, _| s.current().clone());
+        loc.range = Some(crate::nav::TimeRange::new(
+            SessionTime(0),
+            SessionTime(1_000 * SEC),
+        ));
+        shell.update_in(cx, |s, w, cx| s.navigate(loc, w, cx));
+        cx.run_until_parked();
+        click(cx, "log-row-5");
+        cx.simulate_keystrokes("space enter");
+        cx.run_until_parked();
+        frame(cx);
+        assert!(view.read_with(cx, |v, _| v.is_expanded(5)));
+        assert!(view.read_with(cx, |v, _| v.details_open()));
+        // A new session (the shell clears the range): a short record at the same seq.
+        let (mut w2, run2) = writer();
+        feed_with_record_5(&mut w2, run2, 12, "short-rec");
+        h.snaps.send(w2.publish()).unwrap();
+        cx.run_until_parked();
+        frame(cx);
+        assert!(!view.read_with(cx, |v, _| v.is_expanded(5)));
+        assert_eq!(view.read_with(cx, |v, _| v.selected()), None);
+        click(cx, "log-row-5");
+        cx.run_until_parked();
+        frame(cx);
+        assert_eq!(view.read_with(cx, |v, _| v.selected()), Some(5));
+        assert!(!view.read_with(cx, |v, _| v.is_expanded(5)));
+        assert_eq!(label_of(cx, "details-line-0").as_deref(), Some("short-rec"));
+    }
+
+    #[gpui_kit::test]
+    fn a_new_session_with_the_same_generation_replaces_the_rows(cx: &mut TestAppContext) {
+        let (shell, cx, h) = open_shell_fake(cx);
+        let (mut w, run) = writer();
+        feed(&mut w, run, 0, 30);
+        let first = w.publish();
+        h.status.send(connected("demo", true)).unwrap();
+        h.snaps.send(first.clone()).unwrap();
+        cx.run_until_parked();
+        frame(cx);
+        let view = view_of(&shell, cx);
+        assert_eq!(view.read_with(cx, |v, _| v.filtered_len()), 30);
+        let (mut w2, run2) = writer();
+        feed(&mut w2, run2, 0, 12);
+        let second = w2.publish();
+        assert_eq!(first.generation, second.generation);
+        assert_ne!(first.session, second.session);
+        h.snaps.send(second).unwrap();
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |v, _| v.filtered_len()), 12);
     }
 
     #[gpui_kit::test]

@@ -4,6 +4,7 @@
 use super::model::{line_at, line_starts, shown_highlights};
 use super::view::{LogsView, format_time, level_color};
 use fdt_store::logs::LogRow;
+use fdt_store::time::EntryId;
 use fdt_ui::theme::TokensExt as _;
 use fdt_ui::tokens::{alpha, font, layout, radius, row, space};
 use gpui_kit::{
@@ -18,7 +19,7 @@ use std::sync::Arc;
 /// The details pane's per-record caches and scroll positions.
 pub(super) struct DetailsState {
     /// The record the line index is for, and where each of its lines starts.
-    lines: Option<(u32, Arc<Vec<u32>>)>,
+    lines: Option<(EntryId, Arc<Vec<u32>>)>,
     message_scroll: UniformListScrollHandle,
     stack_scroll: UniformListScrollHandle,
 }
@@ -135,8 +136,8 @@ impl LogsView {
                 )
                 .into_any_element();
         };
-        if self.details.lines.as_ref().map(|l| l.0) != Some(seq) {
-            self.details.lines = Some((seq, Arc::new(line_starts(rec.text))));
+        if self.details.lines.as_ref().map(|l| l.0) != Some(rec.id) {
+            self.details.lines = Some((rec.id, Arc::new(line_starts(rec.text))));
             self.details.message_scroll = UniformListScrollHandle::new();
             self.details.stack_scroll = UniformListScrollHandle::new();
         }
@@ -343,12 +344,19 @@ impl LogsView {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let t = *cx.tokens();
-        let (Some(seq), Some((_, starts))) = (self.selected, self.details.lines.clone()) else {
+        let Some(seq) = self.selected else {
             return Vec::new();
         };
         let Some(rec) = self.snap.logs.get_row(seq as usize) else {
             return Vec::new();
         };
+        // The index belongs to one record; for any other it would cut inside the wrong text.
+        let Some((id, starts)) = self.details.lines.clone() else {
+            return Vec::new();
+        };
+        if id != rec.id {
+            return Vec::new();
+        }
         let bg = t.accent.with_alpha(alpha::SELECTION);
         range
             .map(|i| {
