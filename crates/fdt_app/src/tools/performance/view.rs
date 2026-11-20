@@ -8,6 +8,7 @@ use super::details::DetailsState;
 use super::frame_chart::{ChartEvent, FrameChart};
 use super::frames_table::{FramesList, ListEvent};
 use super::rebuilds_tab::RebuildsTab;
+use super::trace_tab::{SliceKey, TraceEvent, TraceView};
 use crate::nav::{EntryId, Location, Page, Selection, TimeRange, Tool};
 use crate::session_model::SessionModel;
 use crate::shell::sidebar::tool_icon;
@@ -58,15 +59,6 @@ impl PerfTab {
     fn index(self) -> usize {
         Self::ALL.iter().position(|t| *t == self).unwrap_or(0)
     }
-
-    fn empty_body(self) -> &'static str {
-        match self {
-            PerfTab::Frames => "Frames appear as your app draws. Use the app to record some.",
-            PerfTab::Cpu => "CPU samples appear here once your app has been running for a moment.",
-            PerfTab::Rebuilds => "Widget rebuilds appear here when widget-build tracing is on.",
-            PerfTab::Trace => "Timeline events appear here as your app records them.",
-        }
-    }
 }
 
 pub struct PerformanceView {
@@ -82,6 +74,10 @@ pub struct PerformanceView {
     cpu: Entity<CpuTab>,
     /// The Rebuilds tab.
     rebuilds: Entity<RebuildsTab>,
+    /// The Raw trace tab.
+    trace: Entity<TraceView>,
+    /// The trace slice under the pointer and where, for the tooltip.
+    trace_hover: Option<(SliceKey, Point<Pixels>)>,
     /// Where the keyboard focus goes when a tab's own element leaves the screen.
     focus: FocusHandle,
     /// The frame under the pointer and where, for the tooltip.
@@ -110,7 +106,11 @@ impl PerformanceView {
         let list = cx.new(|cx| FramesList::new(session.clone(), window, cx));
         let cpu = cx.new(|cx| CpuTab::new(session.clone(), window, cx));
         let rebuilds = cx.new(|cx| RebuildsTab::new(session.clone(), window, cx));
+        let trace = cx.new(|cx| TraceView::new(session.clone(), cx));
         let subs = vec![
+            cx.subscribe(&trace, |this, _, e: &TraceEvent, cx| {
+                this.trace_event(*e, cx)
+            }),
             cx.subscribe(&chart, |this, _, e: &ChartEvent, cx| {
                 this.chart_event(*e, cx)
             }),
@@ -126,6 +126,8 @@ impl PerformanceView {
             list,
             cpu,
             rebuilds,
+            trace,
+            trace_hover: None,
             focus: cx.focus_handle(),
             hover: None,
             following: true,
@@ -213,6 +215,27 @@ impl PerformanceView {
         }
     }
 
+    fn trace_event(&mut self, event: TraceEvent, cx: &mut Context<Self>) {
+        match event {
+            TraceEvent::Hover(hover) => {
+                if self.trace_hover != hover {
+                    self.trace_hover = hover;
+                    cx.notify();
+                }
+            }
+            TraceEvent::Range(range) => cx.emit(OpenLocation(Location {
+                page: Page::Tool(Tool::Performance),
+                selection: self.selection.map(Selection::Frame),
+                range,
+            })),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn trace(&self) -> &Entity<TraceView> {
+        &self.trace
+    }
+
     fn list_event(&mut self, event: ListEvent, cx: &mut Context<Self>) {
         match event {
             ListEvent::Selected { seq, by_key } => self.pick(seq, by_key, cx),
@@ -282,6 +305,7 @@ impl PerformanceView {
                 c.set_selection(seq, cx);
             });
             self.cpu.update(cx, |c, cx| c.set_range(range, cx));
+            self.trace.update(cx, |t, cx| t.set_range(range, cx));
             self.rebuilds.update(cx, |r, cx| {
                 r.set_range(range, cx);
                 r.set_selection(seq, cx);
@@ -363,6 +387,49 @@ impl PerformanceView {
 }
 
 impl PerformanceView {
+    /// The Raw trace tab: the track view, and the hover tooltip over it.
+    fn render_trace(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let t = *cx.tokens();
+        let tooltip = self.trace_hover.and_then(|(key, at)| {
+            let text = self.trace.read(cx).tooltip(key)?;
+            let offset = layout::TOOLTIP_OFFSET;
+            Some(
+                deferred(
+                    anchored()
+                        .position(at + point(offset, offset))
+                        .snap_to_window_with_margin(space::S8)
+                        .child(
+                            div()
+                                .id("trace-tooltip")
+                                .test_support()
+                                .aria_label(SharedString::from(text.clone()))
+                                .px(space::S8)
+                                .py(space::S4)
+                                .rounded(radius::CONTROL)
+                                .bg(Hsla::from(t.elevated))
+                                .border_1()
+                                .border_color(Hsla::from(t.border))
+                                .text_size(font::LABEL)
+                                .text_color(Hsla::from(t.text))
+                                .child(text),
+                        ),
+                )
+                .with_priority(1),
+            )
+        });
+        div()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(
+                self.trace
+                    .clone()
+                    .cached(StyleRefinement::default().size_full()),
+            )
+            .children(tooltip)
+            .into_any_element()
+    }
+
     /// The Frames tab: the chart over the table, or the empty state.
     fn render_frames(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let t = *cx.tokens();
@@ -487,6 +554,12 @@ impl Render for PerformanceView {
             self.cpu
                 .update(cx, |c, cx| c.release_focus(&to, window, cx));
         }
+        if self.tab != PerfTab::Trace {
+            let trace_focus = self.trace.read(cx).focus_handle().clone();
+            if trace_focus.is_focused(window) {
+                window.focus(&self.focus, cx);
+            }
+        }
         let body = if self.tab == PerfTab::Frames {
             self.render_frames(cx)
         } else if self.tab == PerfTab::Cpu {
@@ -504,19 +577,7 @@ impl Render for PerformanceView {
                 .child(self.rebuilds.clone())
                 .into_any_element()
         } else {
-            div()
-                .flex_1()
-                .min_h_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(EmptyState::new(
-                    "perf-empty",
-                    tool_icon(Tool::Performance),
-                    "Nothing to show yet",
-                    self.tab.empty_body(),
-                ))
-                .into_any_element()
+            self.render_trace(cx)
         };
         div()
             .id("performance-view")
