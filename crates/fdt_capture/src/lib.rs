@@ -2,6 +2,8 @@
 //! ingest of a running app's logs, errors, navigation and frames into an `fdt_store` session.
 //! This crate has no UI dependencies.
 
+#[doc(hidden)]
+pub mod bench_support;
 mod capture;
 mod config;
 mod connect;

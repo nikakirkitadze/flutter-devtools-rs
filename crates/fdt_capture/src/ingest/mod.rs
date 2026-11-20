@@ -2,6 +2,7 @@
 //!
 //! Connection tasks never touch the store; they send [`Ingest`] messages to the session task.
 
+pub(crate) mod assemble;
 pub(crate) mod flutter_error;
 pub(crate) mod frames;
 pub(crate) mod http;

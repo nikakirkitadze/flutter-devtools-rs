@@ -19,3 +19,8 @@ fdt_vm = { path = "../fdt_vm", features = ["testing"] }
 tokio = { workspace = true, features = ["test-util"] }
 regex = { workspace = true }
 url = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "ingest"
+harness = false
