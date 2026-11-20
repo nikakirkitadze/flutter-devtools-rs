@@ -781,6 +781,11 @@ impl Script {
                     full_seen: None,
                 });
                 self.pending = None;
+                // The frame drawn next shows the sentence. The next selection waits for it, so
+                // that draw is measured and no selection replaces a sentence before it is drawn.
+                if self.switches < self.len {
+                    return;
+                }
             }
         }
         if self.pending.is_none() && self.switches < self.len {
@@ -1817,6 +1822,12 @@ mod tests {
         assert_eq!(script.outcome().error, None);
         assert_eq!(script.outcome().keystrokes, 3, "one selection per frame");
         assert_eq!(script.outcome().samples.len(), 3);
+        // A frame is drawn between a sentence being seen and the next selection.
+        assert!(
+            script.outcome().steps >= 6,
+            "steps {}",
+            script.outcome().steps
+        );
         assert_eq!(sentence_when_sampled, [true, true, true]);
         assert!(
             script
