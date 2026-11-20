@@ -1,10 +1,12 @@
 //! Rebuild attribution from widget-build timeline slices.
 
+use crate::user_code::is_user_library;
 use fdt_store::Snapshot;
+use fdt_store::cpu::FunctionId;
 use fdt_store::time::{RunId, SessionTime, TimeRange};
 use fdt_store::timeline::{LaneSnapshot, NameId};
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -138,13 +140,49 @@ pub fn frame_rebuilds(snap: &Snapshot, frame_seq: usize) -> Option<FrameRebuilds
             largest_of[p] = Some(c);
         }
     }
+    let user = user_classes(snap);
+    let mut child_count = vec![0u32; nodes.len()];
+    let mut depth = vec![0u32; nodes.len()];
+    let mut root_of: Vec<usize> = (0..nodes.len()).collect();
+    for (i, n) in nodes.iter().enumerate() {
+        if let Some(p) = n.parent {
+            child_count[p] += 1;
+            depth[i] = depth[p] + 1;
+            root_of[i] = root_of[p];
+        }
+    }
+    // Per root, the user widget below it with the largest subtree; ties go to the shallowest.
+    let mut user_best: Vec<Option<usize>> = vec![None; nodes.len()];
+    if !user.is_empty() {
+        for (i, n) in nodes.iter().enumerate().filter(|(_, n)| n.parent.is_some()) {
+            if !user.contains(snap.timeline.name(n.name)) {
+                continue;
+            }
+            let r = root_of[i];
+            let better = user_best[r].is_none_or(|b| {
+                (n.subtree, std::cmp::Reverse(depth[i]))
+                    > (nodes[b].subtree, std::cmp::Reverse(depth[b]))
+            });
+            if better {
+                user_best[r] = Some(i);
+            }
+        }
+    }
     let mut roots: Vec<RootRebuild> = Vec::new();
     for (i, n) in nodes.iter().enumerate().filter(|(_, n)| n.parent.is_none()) {
+        let largest = user_best[i].or_else(|| {
+            // Skip single-child chains down to the first branch.
+            let mut at = i;
+            while child_count[at] == 1 {
+                at = largest_of[at]?;
+            }
+            largest_of[at]
+        });
         roots.push(RootRebuild {
             name: name(n.name),
             widgets: n.subtree,
             total_ns: n.end - n.start,
-            largest_child: largest_of[i].map(|c| (name(nodes[c].name), nodes[c].subtree)),
+            largest_child: largest.map(|c| (name(nodes[c].name), nodes[c].subtree)),
         });
     }
     roots.sort_by(|a, b| b.widgets.cmp(&a.widgets).then(b.total_ns.cmp(&a.total_ns)));
@@ -171,6 +209,30 @@ pub fn frame_rebuilds(snap: &Snapshot, frame_seq: usize) -> Option<FrameRebuilds
         roots,
         widgets,
     })
+}
+
+/// Class names of the app's own code, from the CPU function table (`Class.method` in a user
+/// library). A State class also gives its widget: `_FooState` adds `Foo`.
+fn user_classes(snap: &Snapshot) -> HashSet<String> {
+    let mut set = HashSet::new();
+    for i in 0..snap.cpu.function_count() {
+        let f = snap.cpu.function(FunctionId(i as u32));
+        if !is_user_library(f.library.as_deref()) {
+            continue;
+        }
+        let Some((class, _)) = f.name.split_once('.') else {
+            continue;
+        };
+        if class.is_empty() || class.contains(' ') {
+            continue;
+        }
+        set.insert(class.to_string());
+        if let Some(widget) = class.strip_suffix("State").filter(|w| w.len() > 1) {
+            set.insert(widget.trim_start_matches('_').to_string());
+            set.insert(widget.to_string());
+        }
+    }
+    set
 }
 
 fn sort_widgets(v: &mut [WidgetCount]) {
@@ -294,6 +356,7 @@ mod tests {
     #[test]
     fn frame_rebuilds_counts_roots_and_children() {
         let (mut w, run) = writer();
+        w.intern_function("ProductGrid.build", Some("package:app/cart.dart"));
         cart_frame(&mut w, run, 1, 10, 64);
         let s = w.publish();
         let r = frame_rebuilds(&s, 0).expect("rebuilds");
@@ -320,6 +383,94 @@ mod tests {
                 .windows(2)
                 .all(|p| (p[0].builds, p[0].total_ns) >= (p[1].builds, p[1].total_ns))
         );
+    }
+
+    /// `BUILD > CartScreen > Scaffold > {Body > ProductGrid > 3 x Tile, Bar}`.
+    fn chain_frame(w: &mut SessionWriter, run: RunId) {
+        frame(w, run, 1, 10, 30_000);
+        let begin = 10 * MS;
+        w.set_frame_ui(
+            run,
+            1,
+            UiPhases {
+                begin: SessionTime(begin),
+                ui_us: 20_000,
+                build_us: 15_000,
+                layout_us: 2000,
+                paint_us: 2000,
+                composite_us: 500,
+                finalize_us: 500,
+                widgets_built: Some(9),
+            },
+        );
+        let ui = w.timeline_track(run, TrackKind::Thread, 1, "io.flutter.ui");
+        w.set_track_order(ui, 0);
+        let nodes: [(u16, &str, u64, u64); 12] = [
+            (0, "VsyncProcessCallback", 0, 20_000),
+            (1, "Animator::BeginFrame", 0, 20_000),
+            (2, "BUILD", 0, 15_000),
+            (3, "CartScreen", 0, 14_000),
+            (4, "Scaffold", 0, 13_000),
+            (5, "Body", 0, 10_000),
+            (6, "ProductGrid", 0, 9_000),
+            (7, "Tile", 0, 100),
+            (7, "Tile", 200, 100),
+            (7, "Tile", 400, 100),
+            (5, "Bar", 11_000, 1_000),
+            (5, "Dummy", 12_500, 100),
+        ];
+        for (depth, name, at_us, dur_us) in nodes {
+            let s = Slice {
+                start: SessionTime(begin + at_us * 1000),
+                dur_ns: dur_us * 1000,
+                name: w.intern_name(name),
+                cat: SliceCat::Dart,
+            };
+            assert!(w.push_slice(ui, depth, s, depth > 2), "{name} stored");
+        }
+    }
+
+    #[test]
+    fn largest_child_skips_framework_chains() {
+        let (mut w, run) = writer();
+        w.intern_function("_ProductGridState.build", Some("package:app/cart.dart"));
+        w.intern_function(
+            "Scaffold.build",
+            Some("package:flutter/src/material/scaffold.dart"),
+        );
+        chain_frame(&mut w, run);
+        let s = w.publish();
+        let r = frame_rebuilds(&s, 0).unwrap();
+        assert_eq!(&*r.roots[0].name, "CartScreen");
+        assert_eq!(
+            r.roots[0]
+                .largest_child
+                .clone()
+                .map(|(n, m)| (n.to_string(), m)),
+            Some(("ProductGrid".to_string(), 4))
+        );
+    }
+
+    #[test]
+    fn largest_child_falls_back_to_first_branch() {
+        let (mut w, run) = writer();
+        chain_frame(&mut w, run);
+        let s = w.publish();
+        let r = frame_rebuilds(&s, 0).unwrap();
+        // No CPU names: CartScreen > Scaffold is a chain; Scaffold branches into Body and Bar.
+        assert_eq!(
+            r.roots[0]
+                .largest_child
+                .clone()
+                .map(|(n, m)| (n.to_string(), m)),
+            Some(("Body".to_string(), 5))
+        );
+        // CPU names without a match behave the same.
+        let (mut w, run) = writer();
+        w.intern_function("Other.build", Some("package:app/other.dart"));
+        chain_frame(&mut w, run);
+        let r = frame_rebuilds(&w.publish(), 0).unwrap();
+        assert_eq!(&*r.roots[0].largest_child.clone().unwrap().0, "Body");
     }
 
     #[test]
