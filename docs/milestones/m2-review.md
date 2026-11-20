@@ -15,7 +15,7 @@ Two kinds of measurement could **not** be taken in this verification run, becaus
 
 The author needs to re-run those two on an unlocked R1 (commands under "Pending verification"). The last bench-ui numbers I have are the ones the Task 21b implementer took on an unlocked, loaded machine; they are shown separately and marked as such.
 
-Not-met budgets known from those earlier runs: Logs search and tool switch draw p99 (see "Open decisions").
+Not-met budgets known from those earlier runs: Logs search and tool switch draw p99 (see "Open decisions"). The bench-ui and idle measurements were filled in by M3's verification: see "Measurements filled in by M3".
 
 ## Automated checks (all green)
 
@@ -163,6 +163,27 @@ Save screenshots next to this file as `m2-<os>-<theme>-<view>.png`.
 - **The first CI run** on macOS, Windows and Linux, including the live job and the release budget step (report-only on hosted runners; `FDT_BUDGETS=strict` enforces it).
 - **Windows and Linux** code paths read only from source (discovery, process checks, shortcuts, client-side frame).
 - **Profile-mode attach** was measured once (Task 22), not three times.
+
+## Measurements filled in by M3 (21 November 2026)
+
+Taken on R1 (Apple M3 Max, 120 Hz) on the M3 branch (`3d0e8a7`), whose Logs, Network and shell code is M2's plus the M3 changes. Raw runs and context are in `m3-review.md`, appendices B and E.
+
+**`fdt bench-ui`, M2's six scenarios, 3 runs each, screen unlocked, `uptime` load 11.4, 11.1, 9.2 before the three batches.** Medians of draw p99 (budget 4 ms), interval p99 (budget 8.833 ms at 120 Hz):
+
+| Scenario | Draw p99 ms | Interval p99 ms | Verdict |
+|---|---|---|---|
+| logs-scroll | 3.13 | 8.41 | met |
+| logs-search | 6.33 | 8.56 | **missed** (open decision 1; first-result latency 19.6 ms against 16, 2 frames against 2; full result 5 frames against 12) |
+| net-scroll | 3.29 | 8.41 | met |
+| net-filter | 3.40 (one run 4.21) | 8.47 | met on the median |
+| tool-switch | 7.08 | 11.51 (one run 33.4) | **missed** (open decision 1; switch latency 16.8 ms against 50) |
+| strip-drag | 4.28 (one run errored: the drag did not select a range) | 8.66 | **missed** by 0.3 ms |
+
+This confirms open decision 1 (6.3 and 7.1 ms; M2's last numbers were 6.5 and 6.9). `strip-drag` rose from 3.4 ms (Task 21b) to 4.3 ms; the strip changed in M3.
+
+**Idle memory and CPU of the connected window, app idle on the home screen, 30 s warm-up, 30 one-second samples.** Measured with the screen locked, so the window drew no frames, which makes this a lower bound for a drawing window (the capture host now installs from a timer, so the window did connect): RSS 156.4 to 157.0 MB (budget 150 MB, **missed** by about 7 MB), CPU 0.0 to 0.5 %, mean 0.11 % (budget 1 %, met). The window alone was 101 MB unconnected; the M2 build measured on the same machine gave 70.8 MB, and `attach_hold` (the capture alone) about 52 to 61 MB, against the 3.2 MB recorded above for M2's capture. See M3 open decision 3.
+
+**Still not measured:** the UI part of attach to data on screen, the first CI run, and Windows and Linux. Profile-mode attach was not repeated 3 times (the screen locked): `attach_ms` was 126 ms in one profile run, against 5 ms in the Task 22 run recorded above.
 
 ## Carry into M3
 

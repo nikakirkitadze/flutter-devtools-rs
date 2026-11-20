@@ -27,7 +27,20 @@ cargo run -p fdt_app
   `{"main_entry_unix_ms":…,"first_paint_ms":…,"interactive_ms":…,"phases":{…}}`.
   `main_entry_unix_ms` is the wall-clock time at `main()` entry, so a script can add the time
   between spawning the process and `main()`. It exits 1 if the palette did not open.
+- `fdt bench-ui <scenario>` replays a scripted interaction over a stress session and prints draw
+  time, frame interval and latency as JSON (see `docs/milestones/m3-review.md`).
+- `fdt --connect <vm-service-url>` opens a window and connects it.
 - `FDT_LOG=info|debug|trace` raises the log level (the default shows warnings and errors on stderr).
+
+## Tools
+
+- **Logs** and **Network**: search and filter a million log lines or a hundred thousand requests
+  while the app keeps running, with details for every record and body.
+- **Performance**: frames with their build, raster and GC phases and a one-sentence reason for each
+  slow frame; the CPU profile (bottom-up, top-down, flame chart); widget rebuild counts (turn on
+  "Trace widget builds" in profile mode); and the raw timeline trace.
+- **Timeline**: one zoomable page with the frames, the UI and raster threads, GC, logs and requests
+  on the same time axis. Click anything to jump to the same moment in the other tools.
 
 ## Test app
 
