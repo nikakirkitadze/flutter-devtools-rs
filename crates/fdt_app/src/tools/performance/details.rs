@@ -29,10 +29,13 @@ use gpui_kit::{
     TestSupportExt as _, div, relative,
 };
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const MAX_NAME_CHARS: usize = 80;
 const TOP: usize = 10;
 const DASH: &str = "\u{2014}";
+/// The shortest time between two analyses of the same frame, as for the sidebar counts.
+const REFRESH_INTERVAL: Duration = Duration::from_millis(250); // token-check: allow: throttle, not a visual duration
 const SEP: &str = " \u{b7} ";
 
 /// A name cut to 80 characters: the first 79 and an ellipsis.
@@ -81,6 +84,10 @@ struct Fingerprint {
     budget_us: u32,
     coverage: Option<SessionTime>,
     cpu_status: CpuStatus,
+    /// What Rebuilds and Related read besides the frame: they grow as the app streams.
+    requests: usize,
+    logs: usize,
+    slices: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,7 +100,13 @@ struct Key {
 
 /// The details pane's state.
 pub(super) struct DetailsState {
+    /// The selected frame and what it showed last; `Some` while the pane is open.
     key: Option<Key>,
+    /// The key the latest analysis was started for.
+    started: Option<Key>,
+    last_start: Option<Instant>,
+    /// A rerun waiting out `REFRESH_INTERVAL`.
+    trailing: Option<Task<()>>,
     result: Option<Arc<Explanation>>,
     /// Set once the analysis has taken longer than `LOADING_DELAY`.
     skeleton: bool,
@@ -110,6 +123,9 @@ impl Default for DetailsState {
     fn default() -> Self {
         Self {
             key: None,
+            started: None,
+            last_start: None,
+            trailing: None,
             result: None,
             skeleton: false,
             runs: 0,
@@ -125,6 +141,9 @@ impl Default for DetailsState {
 impl DetailsState {
     fn clear(&mut self) {
         self.key = None;
+        self.started = None;
+        self.last_start = None;
+        self.trailing = None;
         self.result = None;
         self.skeleton = false;
         self.job = None;
@@ -210,7 +229,8 @@ impl PerformanceView {
     }
 
     /// Opens, closes or refreshes the pane to match the selected frame and the latest snapshot.
-    /// Starts the analysis only when the frame, its phases or its CPU coverage changed.
+    /// Starts the analysis only when the frame, its phases, its CPU coverage or the requests, log
+    /// lines and timeline slices it is related to changed, and then at most once per interval.
     pub(super) fn sync_details(&mut self, cx: &mut Context<Self>) {
         let snap = self.session.read(cx).snapshot().clone();
         let frame = self
@@ -234,6 +254,9 @@ impl PerformanceView {
                 budget_us,
                 coverage: snap.cpu.coverage_end(frame.run),
                 cpu_status: snap.cpu.status(frame.run).clone(),
+                requests: snap.net.len(),
+                logs: snap.logs.len(),
+                slices: snap.timeline.slice_count(),
             },
         };
         let same_frame = self
@@ -241,7 +264,8 @@ impl PerformanceView {
             .key
             .as_ref()
             .is_some_and(|k| k.session == key.session && k.id == key.id);
-        if self.details.key.as_ref() == Some(&key) {
+        self.details.key = Some(key.clone());
+        if self.details.started.as_ref() == Some(&key) {
             return;
         }
         if !same_frame {
@@ -249,6 +273,7 @@ impl PerformanceView {
             // analysis has been running for `LOADING_DELAY`.
             self.details.result = None;
             self.details.skeleton = false;
+            self.details.trailing = None;
             self.details.timer = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(motion::LOADING_DELAY).await;
                 this.update(cx, |this, cx| {
@@ -259,17 +284,37 @@ impl PerformanceView {
                 })
                 .ok();
             }));
+        } else if let Some(at) = self.details.last_start {
+            // The same frame again, as data streams in: the old content stays on screen (no
+            // skeleton), and the analysis runs at most once per interval, the last one last.
+            let since = cx.background_executor().now().saturating_duration_since(at);
+            if since < REFRESH_INTERVAL {
+                if self.details.trailing.is_none() {
+                    let wait = REFRESH_INTERVAL - since;
+                    self.details.trailing = Some(cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(wait).await;
+                        this.update(cx, |this, cx| {
+                            this.details.trailing = None;
+                            this.sync_details(cx);
+                        })
+                        .ok();
+                    }));
+                }
+                return;
+            }
         }
         self.details.runs += 1;
+        self.details.trailing = None;
+        self.details.last_start = Some(cx.background_executor().now());
+        self.details.started = Some(key.clone());
         let seq = frame.id.seq as usize;
-        self.details.key = Some(key.clone());
         self.details.job = Some(cx.spawn(async move |this, cx| {
             let explanation = cx
                 .background_spawn(async move { explain(&snap, seq) })
                 .await;
             this.update(cx, |this, cx| {
-                // A newer selection or snapshot replaced this job's key.
-                if this.details.key.as_ref() == Some(&key) {
+                // A newer analysis (another frame, or the same one later) replaced this one.
+                if this.details.started.as_ref() == Some(&key) {
                     this.details.result = Some(Arc::new(explanation));
                     this.details.skeleton = false;
                     this.details.timer = None;
@@ -1160,10 +1205,65 @@ mod tests {
         fake.snaps.send(w.publish()).unwrap();
         cx.run_until_parked();
         assert_eq!(runs(&shell, cx), before);
-        // New CPU coverage changes what the pane shows, so it runs again.
+        // New CPU coverage changes what the pane shows, so it runs again, after the throttle.
         w.set_cpu_coverage(run, SessionTime(10_000 * MS));
         fake.snaps.send(w.publish()).unwrap();
         cx.run_until_parked();
+        assert_eq!(runs(&shell, cx), before);
+        cx.executor().advance_clock(REFRESH_INTERVAL);
+        cx.run_until_parked();
         assert_eq!(runs(&shell, cx), before + 1);
+    }
+
+    #[gpui_kit::test]
+    fn late_request_appears_in_related(cx: &mut TestAppContext) {
+        let (shell, cx, fake) = open_shell_fake(cx);
+        let (mut w, run) = writer();
+        phased_frame(&mut w, run, 0, 1_000, 2);
+        fake.snaps.send(w.publish()).unwrap();
+        fake.status.send(connected("demo", true)).unwrap();
+        cx.run_until_parked();
+        cx.dispatch_action(ShowPerformance);
+        select(&shell, cx, 0);
+        assert!(exists(cx, "details-related-empty"));
+        request(
+            &mut w,
+            run,
+            "GET",
+            "http://h/late",
+            Some(200),
+            1_005,
+            Some(1_015),
+        );
+        fake.snaps.send(w.publish()).unwrap();
+        cx.run_until_parked();
+        // Throttled: the old content stays, with no skeleton.
+        assert!(exists(cx, "details-related-empty"));
+        assert!(!exists(cx, "details-skeleton"));
+        cx.executor().advance_clock(REFRESH_INTERVAL);
+        cx.run_until_parked();
+        let req = label(cx, "details-request-0").expect("the late request");
+        assert!(req.starts_with("GET /late"), "{req}");
+        assert!(!exists(cx, "details-related-empty"));
+    }
+
+    #[gpui_kit::test]
+    fn explanation_for_a_previous_frame_is_dropped(cx: &mut TestAppContext) {
+        let snap = snapshot(|w, run| {
+            phased_frame(w, run, 0, 100, 2);
+            w.push_frame(frame_at(run, 1, 300, 40, 3));
+        });
+        let a = fdt_analysis::explain::explain(&snap, 0).sentence;
+        let b = fdt_analysis::explain::explain(&snap, 1).sentence;
+        assert_ne!(a, b);
+        let (shell, cx) = open_perf(cx, snap);
+        // B is selected before A's analysis has landed.
+        for seq in [0, 1] {
+            let to = location(&shell, cx, seq, None);
+            shell.update_in(cx, |s, w, cx| s.navigate(to, w, cx));
+        }
+        cx.run_until_parked();
+        assert_eq!(label(cx, "details-sentence"), Some(b));
+        assert_eq!(label(cx, "details-title").as_deref(), Some("Frame #1"));
     }
 }
