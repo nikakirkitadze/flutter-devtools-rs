@@ -22,7 +22,7 @@ const SEC_NS: u64 = 1_000_000_000;
 /// The shortest span the strip shows.
 const MIN_SPAN_NS: u64 = 10 * SEC_NS;
 /// A press that moves less than this many pixels is a click, not a drag.
-const MIN_DRAG_PX: f32 = 3.0; // token-check: allow: interaction threshold, not a visual size
+pub(crate) const MIN_DRAG_PX: f32 = 3.0; // token-check: allow: interaction threshold, not a visual size
 /// The narrowest gap (in pixels) a "Run N" label needs.
 const RUN_LABEL_MIN_PX: f32 = 56.0;
 

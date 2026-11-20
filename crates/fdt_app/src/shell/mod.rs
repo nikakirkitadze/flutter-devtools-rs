@@ -31,11 +31,11 @@ use crate::palette::items::PaletteModel;
 use crate::palette::view::open_palette;
 use crate::session_model::{SessionEvent, SessionModel};
 use crate::settings::{settings, update_settings};
-use crate::tools::OpenLocation;
 use crate::tools::logs::{LogsEvent, LogsView};
 use crate::tools::network::{NetworkEvent, NetworkView};
 use crate::tools::performance::{PerfTab, PerformanceView, adjacent_slow};
 use crate::tools::timeline::TimelineView;
+use crate::tools::{OpenLocation, ReplaceLocation};
 use fdt_capture::ConnStatus;
 use fdt_ui::hud::FrameHud;
 use fdt_ui::theme::{self, ThemePreference, TokensExt as _};
@@ -184,7 +184,13 @@ impl MainWindow {
             |this: &mut Self, event: &OpenLocation, window: &mut Window, cx: &mut Context<Self>| {
                 this.navigate(event.0.clone(), window, cx)
             };
+        let replace = |this: &mut Self, event: &ReplaceLocation, cx: &mut Context<Self>| {
+            this.replace_location(event.0.clone(), cx)
+        };
         let opens = vec![
+            cx.subscribe(&performance, move |this, _, e: &ReplaceLocation, cx| {
+                replace(this, e, cx)
+            }),
             cx.subscribe_in(&logs, window, move |this, _, e: &OpenLocation, w, cx| {
                 open(this, e, w, cx)
             }),
@@ -384,7 +390,13 @@ impl MainWindow {
             selection: Some(Selection::Frame(frame.id)),
             range: loc.range,
         };
-        self.navigate(to, window, cx);
+        // Stepping from another page goes there and keeps a Back step; stepping on the
+        // Performance page, like arrow keys through rows, does not add one.
+        if loc.page == Page::Tool(Tool::Performance) {
+            self.replace_location(to, cx);
+        } else {
+            self.navigate(to, window, cx);
+        }
     }
 
     /// Turns widget-build tracing in the app on or off. The latest run says what it is now; with
@@ -406,6 +418,11 @@ impl MainWindow {
         let session = self.session.read(cx);
         !session.snapshot().net.is_empty()
             || matches!(session.status(), ConnStatus::Connected { .. })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn performance_view(&self) -> &Entity<PerformanceView> {
+        &self.performance
     }
 
     pub(crate) fn network_view(&self) -> &Entity<NetworkView> {
@@ -804,6 +821,9 @@ impl Render for MainWindow {
             .on_action(cx.listener(|this, _: &OpenDetails, _, cx| {
                 this.with_logs(cx, |v, cx| v.open_details(cx));
                 this.with_network(cx, |v, cx| v.open_details(cx));
+                if this.current().page == Page::Tool(Tool::Performance) && this.frames_routed(cx) {
+                    this.performance.update(cx, |v, cx| v.open_details(cx));
+                }
             }))
             .on_action(cx.listener(|this, _: &LoadFullBody, _, cx| {
                 this.with_network(cx, |v, cx| v.load_full_selected(cx));
@@ -1503,6 +1523,19 @@ mod tests {
         timeline.update(cx, |_, cx| cx.emit(OpenLocation(to)));
         cx.run_until_parked();
         assert_eq!(page(&shell, cx), Page::Tool(Tool::Performance));
+    }
+
+    #[gpui_kit::test]
+    fn stepping_slow_frames_on_the_page_adds_no_back_step(cx: &mut TestAppContext) {
+        let (shell, cx) = open_shell_snapshot(cx, five_frames());
+        cx.dispatch_action(NextSlowFrame);
+        let back = shell.read_with(cx, |s, _| s.history().back_len());
+        assert_eq!(selected_frame(&shell, cx), Some(1));
+        cx.dispatch_action(NextSlowFrame);
+        cx.dispatch_action(NextSlowFrame);
+        cx.dispatch_action(PreviousSlowFrame);
+        assert_eq!(selected_frame(&shell, cx), Some(2));
+        assert_eq!(shell.read_with(cx, |s, _| s.history().back_len()), back);
     }
 
     #[gpui_kit::test]

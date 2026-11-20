@@ -12,6 +12,11 @@ use crate::nav::Location;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenLocation(pub Location);
 
+/// Like [`OpenLocation`], but the shell rewrites the current history entry instead of adding one.
+/// Keyboard movement through rows and frames sends this, so it adds no Back step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplaceLocation(pub Location);
+
 use fdt_ui::theme::TokensExt as _;
 use fdt_ui::tokens::{font, space};
 use gpui_kit::{
