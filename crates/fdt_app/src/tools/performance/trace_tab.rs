@@ -57,6 +57,114 @@ pub struct TraceRow {
     pub depth: u16,
 }
 
+/// Quads kept back from the canvas cap for the overlays (selection outline, drag band, ruler
+/// ticks, separators), which are added after the slices in the same layer. Reserving them up
+/// front means the cap never cuts an overlay; a second layer would cost a second `paint_quads`
+/// call for at most about 210 quads.
+pub const OVERLAY_QUADS: usize = 256;
+/// What the slices of one frame may use.
+const SLICE_QUADS: usize = CANVAS_MAX_QUADS - OVERLAY_QUADS;
+
+/// What an overlay quad is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Overlay {
+    Outline,
+    Drag,
+    Tick,
+    Border,
+}
+
+/// The overlay quads, in pixels from the canvas's top-left corner (`canvas` is its size): the
+/// outline of the `selection` (plot coordinates), the ruler `drag` band, the ruler ticks and the
+/// two separators. Never more than `OVERLAY_QUADS`.
+pub fn overlay_rects(
+    geo: &TraceGeometry,
+    selection: Option<Rect>,
+    drag: Option<(f32, f32)>,
+    canvas: (f32, f32),
+) -> Vec<(Rect, Overlay)> {
+    let (cw, ch) = canvas;
+    let label_w = f32::from(layout::LANE_LABEL_WIDTH);
+    let ruler_h = f32::from(layout::RULER_HEIGHT);
+    let e = f32::from(layout::BORDER);
+    let mut out = Vec::new();
+    if let Some(r) = selection {
+        let (x, y, w, h) = (label_w + r.x, ruler_h + r.y, r.w, r.h);
+        for r in [
+            Rect { x, y, w, h: e },
+            Rect {
+                x,
+                y: y + h - e,
+                w,
+                h: e,
+            },
+            Rect { x, y, w: e, h },
+            Rect {
+                x: x + w - e,
+                y,
+                w: e,
+                h,
+            },
+        ] {
+            out.push((r, Overlay::Outline));
+        }
+    }
+    if let Some((a, z)) = drag {
+        let (a, z) = (a.min(z), a.max(z));
+        out.push((
+            Rect {
+                x: a,
+                y: 0.0,
+                w: z - a,
+                h: ch,
+            },
+            Overlay::Drag,
+        ));
+    }
+    let tick = 4.0; // token-check: allow: tick length
+    for (x, _) in &geo.ruler {
+        out.push((
+            Rect {
+                x: label_w + x,
+                y: ruler_h - tick,
+                w: e,
+                h: tick,
+            },
+            Overlay::Tick,
+        ));
+    }
+    out.push((
+        Rect {
+            x: 0.0,
+            y: ruler_h - e,
+            w: cw,
+            h: e,
+        },
+        Overlay::Border,
+    ));
+    out.push((
+        Rect {
+            x: label_w - e,
+            y: 0.0,
+            w: e,
+            h: ch,
+        },
+        Overlay::Border,
+    ));
+    out.truncate(OVERLAY_QUADS);
+    out
+}
+
+/// The colour of a slice's name: `bg` or `text`, whichever reads better on the slice colour.
+pub fn label_colour(t: &fdt_ui::tokens::Palette, cat: SliceCat) -> fdt_ui::tokens::Color {
+    let fill = hue(t, cat);
+    if t.bg.contrast(fill) >= t.text.contrast(fill) {
+        t.bg
+    } else {
+        t.text
+    }
+}
+
 /// A rectangle in pixels from the plot's top-left corner.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rect {
@@ -77,6 +185,8 @@ pub struct ColorKey {
 pub struct TraceGeometry {
     pub quads: Vec<(Rect, ColorKey)>,
     pub labels: Vec<(Rect, NameId)>,
+    /// The category of each label's slice, in the same order as `labels`.
+    pub label_cats: Vec<SliceCat>,
     /// `(x, text)` for each ruler tick.
     pub ruler: Vec<(f32, String)>,
 }
@@ -154,7 +264,7 @@ pub fn trace_layout(
     let first = ((scroll_y / row_h).floor() as usize).min(rows.len());
     let last = (((scroll_y + height) / row_h).ceil() as usize).min(rows.len());
     let visible = last.saturating_sub(first);
-    let per_row = (CANVAS_MAX_QUADS / visible.max(1)).max(1);
+    let per_row = (SLICE_QUADS / visible.max(1)).max(1);
     let (a, z) = viewport.range();
     let range = TimeRange::new(SessionTime(a), SessionTime(z));
     for (i, row) in rows.iter().enumerate().take(last).skip(first) {
@@ -199,6 +309,7 @@ pub fn trace_layout(
                 ));
                 if w >= min_label && geo.labels.len() < CANVAS_MAX_LABELS {
                     geo.labels.push((rect, s.name));
+                    geo.label_cats.push(s.cat);
                 }
             }
         } else {
@@ -227,7 +338,7 @@ pub fn trace_layout(
             }
         }
     }
-    geo.quads.truncate(CANVAS_MAX_QUADS);
+    geo.quads.truncate(SLICE_QUADS);
     geo.ruler = ruler_ticks(viewport, width);
     geo
 }
@@ -446,7 +557,13 @@ impl TraceView {
     }
 
     pub fn set_snapshot(&mut self, snap: Arc<Snapshot>, cx: &mut Context<Self>) {
+        let same = snap.timeline.slice_count() == self.snap.timeline.slice_count()
+            && snap.timeline.tracks().len() == self.snap.timeline.tracks().len();
         self.snap = snap;
+        if same {
+            // Nothing the canvas shows changed (a log-only snapshot): keep its cache.
+            return;
+        }
         self.rebuild();
         if self.fitted {
             self.fit();
@@ -457,7 +574,10 @@ impl TraceView {
         {
             self.selected = None;
         }
-        self.hover = None;
+        if self.hover.take().is_some() {
+            // The page keeps the tooltip until told; the slice may be gone or have moved.
+            cx.emit(TraceEvent::Hover(None));
+        }
         cx.notify();
     }
 
@@ -768,57 +888,23 @@ impl Render for TraceView {
                         color: Hsla::from(hue(&t, k.cat)).opacity(f32::from(k.alpha) / 255.0),
                     })
                     .collect();
-                if let Some(r) = selection {
-                    let e = layout::BORDER;
-                    let c = Hsla::from(t.text);
-                    let b = to_bounds(&r);
-                    let (x, y, w, h) = (b.origin.x, b.origin.y, b.size.width, b.size.height);
-                    for r in [
-                        Bounds::new(point(x, y), size(w, e)),
-                        Bounds::new(point(x, y + h - e), size(w, e)),
-                        Bounds::new(point(x, y), size(e, h)),
-                        Bounds::new(point(x + w - e, y), size(e, h)),
-                    ] {
-                        quads.push(Quad {
-                            bounds: r,
-                            color: c,
-                        });
-                    }
-                }
-                if let Some(d) = drag {
-                    let (a, z) = (d.start_x.min(d.x), d.start_x.max(d.x));
+                for (r, kind) in
+                    overlay_rects(&geo, selection, drag.map(|d| (d.start_x, d.x)), (cw, ch))
+                {
+                    let color = match kind {
+                        Overlay::Outline => Hsla::from(t.text),
+                        Overlay::Drag => t.accent.with_alpha(alpha::SELECTION),
+                        Overlay::Tick => Hsla::from(t.text_faint),
+                        Overlay::Border => Hsla::from(t.border),
+                    };
                     quads.push(Quad {
                         bounds: Bounds::new(
-                            point(ox + px(a), oy),
-                            size(px(z - a), ruler_h + px(plot_h)),
+                            point(ox + px(r.x), oy + px(r.y)),
+                            size(px(r.w), px(r.h)),
                         ),
-                        color: t.accent.with_alpha(alpha::SELECTION),
+                        color,
                     });
                 }
-                // Ruler ticks, one pixel wide.
-                for (x, _) in &geo.ruler {
-                    quads.push(Quad {
-                        bounds: Bounds::new(
-                            point(plot.origin.x + px(*x), oy + ruler_h - px(4.0)), // token-check: allow: tick length
-                            size(layout::BORDER, px(4.0)), // token-check: allow: tick length
-                        ),
-                        color: Hsla::from(t.text_faint),
-                    });
-                }
-                quads.push(Quad {
-                    bounds: Bounds::new(
-                        point(ox, oy + ruler_h - layout::BORDER),
-                        size(px(cw), layout::BORDER),
-                    ),
-                    color: Hsla::from(t.border),
-                });
-                quads.push(Quad {
-                    bounds: Bounds::new(
-                        point(ox + label_w - layout::BORDER, oy),
-                        size(layout::BORDER, px(ch)),
-                    ),
-                    color: Hsla::from(t.border),
-                });
                 paint_quads(window, bounds, &quads);
 
                 let line = font::LABEL * font::LINE_HEIGHT_UI;
@@ -826,14 +912,15 @@ impl Render for TraceView {
                 let slice_labels: Vec<Label> = geo
                     .labels
                     .iter()
-                    .map(|(r, name)| Label {
+                    .zip(&geo.label_cats)
+                    .map(|((r, name), cat)| Label {
                         text: snap.timeline.name(*name).to_string().into(),
                         origin: point(
                             plot.origin.x + px(r.x) + space::S4,
                             plot.origin.y + px(r.y) + centred,
                         ),
                         max_width: px(r.w) - space::S4,
-                        color: Hsla::from(t.bg),
+                        color: Hsla::from(label_colour(&t, *cat)),
                     })
                     .collect();
                 paint_labels(window, cx, plot, &slice_labels);
@@ -1317,6 +1404,75 @@ mod tests {
         trace.update(cx, |t, cx| t.press(label_w + 10.0, 5.0, 2, cx));
         cx.run_until_parked();
         assert_eq!(perf.read_with(cx, |p, _| p.range()), None);
+    }
+
+    #[test]
+    fn dense_trace_keeps_overlays() {
+        let snap = stress(20, 2, 5_000);
+        let rows = rows_of(&snap);
+        let (a, z) = timeline_bounds(&snap).unwrap();
+        let vp = Viewport::fit(a, z);
+        let geo = trace_layout(&snap, vp, &rows, 0.0, (1400.0, 40.0 * 18.0));
+        let sel = Rect {
+            x: 10.0,
+            y: 0.0,
+            w: 50.0,
+            h: 17.0,
+        };
+        let over = overlay_rects(&geo, Some(sel), Some((20.0, 90.0)), (1512.0, 740.0));
+        assert!(geo.quads.len() + over.len() <= CANVAS_MAX_QUADS);
+        assert_eq!(
+            over.iter().filter(|(_, k)| *k == Overlay::Outline).count(),
+            4
+        );
+        assert_eq!(
+            over.iter().filter(|(_, k)| *k == Overlay::Tick).count(),
+            geo.ruler.len()
+        );
+        assert!(!geo.ruler.is_empty());
+        assert_eq!(
+            over.iter().filter(|(_, k)| *k == Overlay::Border).count(),
+            2
+        );
+        assert!(over.iter().any(|(_, k)| *k == Overlay::Drag));
+    }
+
+    #[test]
+    fn trace_label_colours_meet_contrast() {
+        for (name, p) in [
+            ("dark", &fdt_ui::tokens::DARK),
+            ("light", &fdt_ui::tokens::LIGHT),
+        ] {
+            for cat in [
+                SliceCat::Dart,
+                SliceCat::Embedder,
+                SliceCat::Gc,
+                SliceCat::Other,
+            ] {
+                let c = label_colour(p, cat).contrast(hue(p, cat));
+                assert!(c >= 4.5, "{name} {cat:?}: {c:.2}");
+            }
+        }
+    }
+
+    #[gpui_kit::test]
+    fn tooltip_clears_or_follows_after_new_data(cx: &mut gpui_kit::TestAppContext) {
+        let v = view(cx, stress(1, 1, 50));
+        let (log, _sub) = log_events(cx, &v);
+        let label_w = f32::from(layout::LANE_LABEL_WIDTH);
+        let ruler_h = f32::from(layout::RULER_HEIGHT);
+        let at = point(px(0.), px(0.));
+        // Hover over the first slice.
+        v.update(cx, |v, cx| {
+            v.moved(label_w + 1.0, ruler_h + 1.0, at, false, true, cx)
+        });
+        assert!(matches!(
+            log.borrow().last(),
+            Some(TraceEvent::Hover(Some(_)))
+        ));
+        // New data arrives: the page is told the tooltip is gone.
+        v.update(cx, |v, cx| v.set_snapshot(stress(1, 1, 60), cx));
+        assert_eq!(log.borrow().last(), Some(&TraceEvent::Hover(None)));
     }
 
     #[test]
