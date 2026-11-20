@@ -11,7 +11,7 @@ use fdt_vm::uri::VmServiceUri;
 use serde_json::{Value, json};
 
 const BASE: i64 = 1_000_000;
-const TRACE: &str = "ext.flutter.profileWidgetBuilds";
+const TRACE: &str = "ext.flutter.profileUserWidgetBuilds";
 const HTTP: &str = "ext.dart.io.httpEnableTimelineLogging";
 const SOCKET: &str = "ext.dart.io.socketProfilingEnabled";
 

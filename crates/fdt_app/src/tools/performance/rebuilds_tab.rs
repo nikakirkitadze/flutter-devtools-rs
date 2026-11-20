@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// What the toggle's note says.
-pub const OVERHEAD_NOTE: &str = "Adds about 90 % to build time while on.";
+pub const OVERHEAD_NOTE: &str = "Adds about 30 % to build time while on.";
 /// The tooltip of the switch while no app is connected.
 pub const DISCONNECTED_TIP: &str = "Connect to an app to trace widget builds.";
 /// Shown when the store stopped keeping raw widget builds.

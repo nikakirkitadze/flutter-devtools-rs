@@ -269,7 +269,7 @@ impl Router {
                 self.main_isolate = isolate.id;
             }
             StreamEvent::ServiceExtensionAdded { isolate, rpc }
-                if rpc == fdt_vm::flutter::PROFILE_WIDGET_BUILDS =>
+                if rpc == fdt_vm::flutter::PROFILE_USER_WIDGET_BUILDS =>
             {
                 self.perf.reapply_tracing(&isolate.id);
             }

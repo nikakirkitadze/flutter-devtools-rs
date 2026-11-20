@@ -23,7 +23,7 @@ pub struct Settings {
     pub body_cap_kib: u32,
     /// Total memory for kept response bodies, in MiB.
     pub body_budget_mib: u32,
-    /// Trace widget builds in an app from the moment of connecting. Off: it adds about 90 % to
+    /// Trace widget builds in an app from the moment of connecting. Off: it adds about 30 % to
     /// build time.
     pub trace_widget_builds: bool,
     /// App addresses used recently, newest first.

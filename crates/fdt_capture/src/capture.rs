@@ -120,7 +120,7 @@ impl Capture {
         self.command(Command::FetchCpuNow);
     }
 
-    /// Traces widget builds in the app (about +90 % build time while on) and takes the timeline
+    /// Traces widget builds in the app (about +30 % build time while on) and takes the timeline
     /// from the `Timeline` stream. Kept across connects and hot restarts.
     pub fn set_trace_widget_builds(&self, on: bool) {
         self.command(Command::SetTraceWidgetBuilds(on));

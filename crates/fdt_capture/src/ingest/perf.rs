@@ -16,7 +16,7 @@ use fdt_store::cpu::{CpuSample, CpuStatus, FunctionId};
 use fdt_store::frames::{RasterPhase, UiPhases};
 use fdt_store::time::{RunId, SessionTime};
 use fdt_store::timeline::{Slice, SliceCat, TrackId, TrackKind};
-use fdt_vm::flutter::PROFILE_WIDGET_BUILDS;
+use fdt_vm::flutter::PROFILE_USER_WIDGET_BUILDS;
 use fdt_vm::perfetto::CpuProfile;
 use fdt_vm::rpc::RpcError;
 use fdt_vm::service::VmService;
@@ -300,7 +300,7 @@ impl PerfControl {
         let isolate = self.shared.main.lock().unwrap().clone();
         let off = self
             .svc
-            .set_bool_extension(PROFILE_WIDGET_BUILDS, &isolate, false);
+            .set_bool_extension(PROFILE_USER_WIDGET_BUILDS, &isolate, false);
         match tokio::time::timeout(timeout, off).await {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => log::debug!("turning widget-build tracing off failed: {e}"),
@@ -494,7 +494,7 @@ async fn apply_tracing(
         if !known {
             match tokio::time::timeout(
                 cfg.call_timeout,
-                svc.get_bool_extension(PROFILE_WIDGET_BUILDS, &isolate),
+                svc.get_bool_extension(PROFILE_USER_WIDGET_BUILDS, &isolate),
             )
             .await
             {
@@ -504,7 +504,7 @@ async fn apply_tracing(
             }
         }
         match svc
-            .set_bool_extension(PROFILE_WIDGET_BUILDS, &isolate, true)
+            .set_bool_extension(PROFILE_USER_WIDGET_BUILDS, &isolate, true)
             .await
         {
             Ok(true) => cpu.tracing_now.store(true, Ordering::Relaxed),
@@ -526,7 +526,7 @@ async fn apply_tracing(
         return Some(true);
     }
     let actual = match svc
-        .set_bool_extension(PROFILE_WIDGET_BUILDS, &isolate, false)
+        .set_bool_extension(PROFILE_USER_WIDGET_BUILDS, &isolate, false)
         .await
     {
         Ok(on) => {
