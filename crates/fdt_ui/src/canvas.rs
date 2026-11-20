@@ -40,7 +40,7 @@ fn warn_once(flag: &AtomicBool, what: &str, cap: usize) {
     }
 }
 
-/// Paints `quads` (at most `CANVAS_MAX_QUADS`) in one layer clipped to `layer`.
+/// Paints `quads` (at most `CANVAS_MAX_QUADS`) in one layer covering `layer` (it does not clip; mask the parent if needed).
 pub fn paint_quads(window: &mut Window, layer: Bounds<Pixels>, quads: &[Quad]) {
     static WARNED: AtomicBool = AtomicBool::new(false);
     if quads.len() > CANVAS_MAX_QUADS {
@@ -124,9 +124,11 @@ pub fn paint_labels(window: &mut Window, cx: &mut App, clip: Bounds<Pixels>, lab
 pub enum ZoomPan {
     /// Zoom about `x`, measured from the left edge of the hitbox. A factor above 1 zooms in.
     Zoom { x: Pixels, factor: f32 },
-    /// Pan horizontally by this many pixels; positive shows later time (`Viewport::pan_px`).
+    /// Pan horizontally by this many pixels. Positive shows later time, as `Viewport::pan_px`
+    /// takes it. gpui's scroll delta is the motion of the content, so the listener negates it.
     PanX(Pixels),
-    /// Scroll vertically by this many pixels, for the canvas to apply to its rows.
+    /// Pan vertically by this many pixels. Positive shows content further down (the same
+    /// negation of gpui's delta).
     PanY(Pixels),
 }
 
@@ -160,11 +162,11 @@ pub fn zoom_pan_listeners(
             }
         } else if e.modifiers.shift {
             let dx = if d.x == Pixels::ZERO { d.y } else { d.x };
-            ZoomPan::PanX(dx)
+            ZoomPan::PanX(-dx)
         } else if d.x.abs() > d.y.abs() {
-            ZoomPan::PanX(d.x)
+            ZoomPan::PanX(-d.x)
         } else {
-            ZoomPan::PanY(d.y)
+            ZoomPan::PanY(-d.y)
         };
         scroll_on(action, window, cx);
         cx.stop_propagation();
@@ -316,7 +318,7 @@ mod tests {
 
         // One dispatch runs both the capture and the bubble phase: the callback fires once.
         cx.simulate_event(scroll(0., 12., Modifiers::none()));
-        assert_eq!(*seen.borrow(), vec![ZoomPan::PanY(px(12.))]);
+        assert_eq!(*seen.borrow(), vec![ZoomPan::PanY(px(-12.))]);
 
         cx.simulate_event(scroll(9., 1., Modifiers::none()));
         cx.simulate_event(scroll(0., 7., Modifiers::shift()));
@@ -329,12 +331,13 @@ mod tests {
         });
         let seen = seen.borrow();
         assert_eq!(seen.len(), 5, "{seen:?}");
-        assert_eq!(seen[1], ZoomPan::PanX(px(9.)));
-        assert_eq!(seen[2], ZoomPan::PanX(px(7.)));
+        assert_eq!(seen[1], ZoomPan::PanX(px(-9.)));
+        assert_eq!(seen[2], ZoomPan::PanX(px(-7.)));
         let ZoomPan::Zoom { x, factor } = seen[3] else {
             panic!("{:?}", seen[3])
         };
-        assert!(factor > 1.0 && x.abs() <= px(1000.));
+        assert!(factor > 1.0);
+        assert_eq!(x, px(50.));
         assert!(matches!(seen[4], ZoomPan::Zoom { factor, .. } if (factor - 1.1).abs() < 1e-6));
     }
 
@@ -357,5 +360,50 @@ mod tests {
             ..Default::default()
         });
         assert!(seen.borrow().is_empty());
+    }
+
+    #[gpui_kit::test]
+    fn swipe_left_shows_later_time_and_scroll_down_shows_lower_content(cx: &mut TestAppContext) {
+        use crate::viewport::Viewport;
+        let bounds = (0, 100_000_000);
+        let view = Rc::new(Cell::new(Viewport::fit(10_000_000, 20_000_000)));
+        let down = Rc::new(Cell::new(0.0f32));
+        let (v, d) = (view.clone(), down.clone());
+        let cx = open(cx, move |window, _, _, hit| {
+            let (v, d) = (v.clone(), d.clone());
+            zoom_pan_listeners(window, hit, px(20.), move |a, _, _| match a {
+                ZoomPan::PanX(dx) => {
+                    let mut vp = v.get();
+                    vp.pan_px(f32::from(dx), 500.0, bounds);
+                    v.set(vp);
+                }
+                ZoomPan::PanY(dy) => d.set(d.get() + f32::from(dy)),
+                ZoomPan::Zoom { .. } => {}
+            });
+        });
+        draw(cx);
+        let inside = point(px(50.), px(40.));
+        cx.simulate_mouse_move(inside, None, Modifiers::none());
+        let scroll = |dx: f32, dy: f32| ScrollEvent {
+            position: inside,
+            delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
+            ..Default::default()
+        };
+        // A trackpad swipe left moves the content left: a negative x delta.
+        cx.simulate_event(scroll(-40., 0.));
+        assert!(view.get().start_ns > 10_000_000, "{:?}", view.get());
+        // A swipe right goes back.
+        cx.simulate_event(scroll(40., 0.));
+        assert_eq!(view.get().start_ns, 10_000_000);
+        // Content moving up (a negative y delta) shows content further down.
+        cx.simulate_event(scroll(0., -30.));
+        assert_eq!(down.get(), 30.0);
+        // A wheel mouse reports lines; they go through the line height.
+        cx.simulate_event(ScrollEvent {
+            position: inside,
+            delta: ScrollDelta::Lines(point(0., -2.)),
+            ..Default::default()
+        });
+        assert_eq!(down.get(), 70.0);
     }
 }
