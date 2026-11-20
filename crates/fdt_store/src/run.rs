@@ -30,4 +30,6 @@ pub struct RunInfo {
     pub clock: RunClock,
     /// The display's refresh rate, once known.
     pub refresh_hz: Option<f32>,
+    /// Widget-build tracing is on in the app (the run's actual state, not the wish).
+    pub tracing: bool,
 }

@@ -203,6 +203,9 @@ impl CaptureControl for FakeCapture {
     fn fetch_cpu_samples(&self) {
         self.record("fetch_cpu");
     }
+    fn set_trace_widget_builds(&self, on: bool) {
+        self.record(format!("trace_builds {on}"));
+    }
     fn status(&self) -> watch::Receiver<ConnStatus> {
         self.status.clone()
     }

@@ -706,6 +706,7 @@ impl crate::capture_host::CaptureControl for LiveFeed {
     fn set_free_app_http_memory(&self, _: bool) {}
     fn set_body_limits(&self, _: fdt_store::net::BodyLimits) {}
     fn fetch_cpu_samples(&self) {}
+    fn set_trace_widget_builds(&self, _on: bool) {}
     fn status(&self) -> tokio::sync::watch::Receiver<ConnStatus> {
         self.status.clone()
     }

@@ -11,7 +11,7 @@ pub const PROFILE_RENDER_OBJECT_LAYOUTS: &str = "ext.flutter.profileRenderObject
 pub const PROFILE_RENDER_OBJECT_PAINTS: &str = "ext.flutter.profileRenderObjectPaints";
 
 /// `enabled` comes back as the string `"true"`/`"false"`, though a bool is accepted too.
-fn read_enabled(v: &Value) -> Result<bool, RpcError> {
+pub(crate) fn read_enabled(v: &Value) -> Result<bool, RpcError> {
     match v.get("enabled") {
         Some(Value::Bool(b)) => Ok(*b),
         Some(Value::String(s)) if s == "true" => Ok(true),

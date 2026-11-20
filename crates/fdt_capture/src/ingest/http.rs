@@ -269,10 +269,75 @@ fn side(r: Result<Option<Vec<u8>>, RpcError>) -> Result<Option<Vec<u8>>, u64> {
 
 /// Everything a poller needs.
 pub(crate) struct PollerConfig {
+    /// Where each isolate's profiling state before fdt is kept.
+    pub(crate) restore: Arc<NetRestore>,
     pub(crate) http_poll: Duration,
     pub(crate) socket_poll: Duration,
     /// Shared with the session, which flips it live.
     pub(crate) free_app_memory: Arc<AtomicBool>,
+}
+
+/// What an isolate's HTTP logging and socket profiling were before fdt enabled them.
+#[derive(Clone, Copy)]
+struct Prior {
+    http: Option<bool>,
+    socket: Option<bool>,
+}
+
+/// What fdt changed in the app, and how to put it back. Shared by the pollers (which record) and
+/// the session (which restores when the user disconnects).
+pub(crate) struct NetRestore {
+    svc: VmService,
+    prior: Mutex<HashMap<String, Prior>>,
+}
+
+impl NetRestore {
+    pub(crate) fn new(svc: VmService) -> NetRestore {
+        NetRestore {
+            svc,
+            prior: Mutex::default(),
+        }
+    }
+
+    /// Switches off what was off before fdt enabled it; what was on stays on, and what could not
+    /// be read first is left alone. Every call gives up after `timeout`, and all run at once.
+    pub(crate) async fn restore(&self, timeout: Duration) {
+        let priors: Vec<(String, Prior)> = self.prior.lock().unwrap().drain().collect();
+        let mut calls = tokio::task::JoinSet::new();
+        for (isolate, prior) in priors {
+            if prior.http == Some(false) {
+                let (svc, isolate) = (self.svc.clone(), isolate.clone());
+                calls.spawn(async move {
+                    let off = svc.http_enable(&isolate, false);
+                    log_restore(
+                        "HTTP logging",
+                        tokio::time::timeout(timeout, off)
+                            .await
+                            .map(|r| r.map(|_| ())),
+                    );
+                });
+            }
+            if prior.socket == Some(false) {
+                let svc = self.svc.clone();
+                calls.spawn(async move {
+                    let off = svc.socket_profiling_enable(&isolate, false);
+                    log_restore("socket profiling", tokio::time::timeout(timeout, off).await);
+                });
+            }
+        }
+        while calls.join_next().await.is_some() {}
+    }
+}
+
+fn log_restore<E: std::fmt::Display>(
+    what: &str,
+    r: Result<Result<(), E>, tokio::time::error::Elapsed>,
+) {
+    match r {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log::debug!("turning {what} off failed: {e}"),
+        Err(_) => log::debug!("turning {what} off timed out"),
+    }
 }
 
 /// One poller task per isolate that exposes the HTTP profile.
@@ -319,6 +384,12 @@ impl NetHub {
         if let Some(h) = self.pollers.remove(isolate) {
             h.abort();
         }
+        self.cfg.restore.prior.lock().unwrap().remove(isolate);
+    }
+
+    /// What to put back when the user disconnects.
+    pub(crate) fn restorer(&self) -> Arc<NetRestore> {
+        self.cfg.restore.clone()
     }
 }
 
@@ -337,6 +408,16 @@ async fn poll_isolate(
     cfg: Arc<PollerConfig>,
     isolate: String,
 ) {
+    // Read first: what is already on is not ours to turn off.
+    let prior = Prior {
+        http: svc.http_enabled(&isolate).await.ok(),
+        socket: svc.socket_profiling_enabled(&isolate).await.ok(),
+    };
+    cfg.restore
+        .prior
+        .lock()
+        .unwrap()
+        .insert(isolate.clone(), prior);
     match svc.http_enable(&isolate, true).await {
         Err(RpcError::Closed) => return,
         Err(e) => log::warn!("enabling HTTP profiling in {isolate} failed: {e}"),

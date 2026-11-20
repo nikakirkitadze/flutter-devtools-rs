@@ -336,6 +336,25 @@ impl VmService {
         Ok(v["enabled"].as_bool().unwrap_or(enabled))
     }
 
+    /// Whether HTTP profiling is on: the extension answers a call without `enabled` with its
+    /// current state.
+    pub async fn http_enabled(&self, isolate: &str) -> Result<bool, RpcError> {
+        crate::flutter::read_enabled(
+            &self
+                .call_extension("ext.dart.io.httpEnableTimelineLogging", isolate, json!({}))
+                .await?,
+        )
+    }
+
+    /// Whether socket profiling is on (read the same way as [`http_enabled`](Self::http_enabled)).
+    pub async fn socket_profiling_enabled(&self, isolate: &str) -> Result<bool, RpcError> {
+        crate::flutter::read_enabled(
+            &self
+                .call_extension("ext.dart.io.socketProfilingEnabled", isolate, json!({}))
+                .await?,
+        )
+    }
+
     pub async fn get_http_profile(
         &self,
         isolate: &str,
@@ -425,6 +444,22 @@ mod tests {
         let mut m = serde_json::Map::new();
         m.insert("b".into(), v);
         take_bytes(&mut m, "b")
+    }
+
+    #[tokio::test]
+    async fn profiling_state_is_read_without_enabled() {
+        use crate::testing::ScriptedServer;
+        let server = ScriptedServer::start(|m, p| {
+            assert!(p.get("enabled").is_none(), "{m} was given `enabled`");
+            Ok(json!({"type": "State", "enabled": m.ends_with("Logging")}))
+        });
+        let (client, _notes) =
+            crate::rpc::connect(&server.ws_uri(), crate::rpc::ConnectOptions::default())
+                .await
+                .unwrap();
+        let s = VmService::new(client);
+        assert!(s.http_enabled("isolates/1").await.unwrap());
+        assert!(!s.socket_profiling_enabled("isolates/1").await.unwrap());
     }
 
     #[test]

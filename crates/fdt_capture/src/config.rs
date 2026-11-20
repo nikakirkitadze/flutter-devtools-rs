@@ -20,6 +20,10 @@ pub struct CaptureConfig {
     pub body_limits: BodyLimits,
     pub auto_fetch_limit: u64,
     pub free_app_http_memory: bool,
+    /// Trace widget builds from the moment of connecting (a setting's default).
+    pub trace_widget_builds: bool,
+    /// Each call that puts profiling back when the user disconnects gives up after this long.
+    pub restore_timeout: Duration,
     /// One body fetch gives up after this long.
     pub body_fetch_timeout: Duration,
     /// The whole connect sequence, up to the start of the run, gives up after this long.
@@ -46,6 +50,8 @@ impl Default for CaptureConfig {
             body_limits: BodyLimits::default(),
             auto_fetch_limit: 4 << 20,
             free_app_http_memory: false,
+            trace_widget_builds: false,
+            restore_timeout: Duration::from_millis(500),
             body_fetch_timeout: Duration::from_secs(10),
             connect_deadline: Duration::from_secs(5),
             calibration_timeout: Duration::from_millis(1500),

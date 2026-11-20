@@ -6,7 +6,7 @@
 //! sends the result to the session task as one [`TimelineBatch`].
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -16,6 +16,7 @@ use fdt_store::cpu::{CpuSample, CpuStatus, FunctionId};
 use fdt_store::frames::{RasterPhase, UiPhases};
 use fdt_store::time::{RunId, SessionTime};
 use fdt_store::timeline::{Slice, SliceCat, TrackId, TrackKind};
+use fdt_vm::flutter::PROFILE_WIDGET_BUILDS;
 use fdt_vm::perfetto::CpuProfile;
 use fdt_vm::rpc::RpcError;
 use fdt_vm::service::VmService;
@@ -211,9 +212,16 @@ pub(crate) struct PerfConfig {
 
 enum Msg {
     Events(Vec<TraceEvent>),
-    StreamMode(bool),
+    /// Turn widget-build tracing on or off.
+    SetTracing(bool),
+    /// A hot restart: the new main isolate has tracing off again.
+    Reapply(String),
     FetchCpuNow,
 }
+
+/// The most stream events fed to the assembler as one block, so one batch reaches the session
+/// task for many 64-event blocks.
+const MAX_COALESCED_EVENTS: usize = 16_384;
 
 /// What the CPU shows when the profiler is off.
 const CPU_OFF: &str = "CPU sampling is off in this app.";
@@ -263,6 +271,8 @@ fn cpu_batch(sink: &Sink, profile: CpuProfile, period_us: i64, window_end_us: i6
 /// The session's handle for commands to the poller task.
 pub(crate) struct PerfControl {
     tx: mpsc::UnboundedSender<Msg>,
+    svc: VmService,
+    shared: Arc<Cpu>,
 }
 
 impl PerfControl {
@@ -270,13 +280,30 @@ impl PerfControl {
     pub(crate) fn fetch_now(&self) {
         let _ = self.tx.send(Msg::FetchCpuNow);
     }
-}
 
-impl PerfControl {
-    /// In stream mode the poll tick does nothing: events come from the `Timeline` stream.
-    #[allow(dead_code)] // Used by the profiling commands that follow.
-    pub(crate) fn set_stream_mode(&self, on: bool) {
-        let _ = self.tx.send(Msg::StreamMode(on));
+    /// Turns widget-build tracing on (and the timeline to the `Timeline` stream) or off (and
+    /// back to polling). The run's actual state comes back as `Ingest::Tracing`.
+    pub(crate) fn set_tracing(&self, on: bool) {
+        if self.shared.wanted.swap(on, Ordering::Relaxed) != on {
+            let _ = self.tx.send(Msg::SetTracing(on));
+        }
+    }
+
+    /// Puts tracing back if fdt turned it on. Each call gives up after `timeout`.
+    pub(crate) async fn restore(&self, timeout: Duration) {
+        self.shared.wanted.store(false, Ordering::Relaxed);
+        if !self.shared.restore_tracing.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        let isolate = self.shared.main.lock().unwrap().clone();
+        let off = self
+            .svc
+            .set_bool_extension(PROFILE_WIDGET_BUILDS, &isolate, false);
+        match tokio::time::timeout(timeout, off).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => log::debug!("turning widget-build tracing off failed: {e}"),
+            Err(_) => log::debug!("turning widget-build tracing off timed out"),
+        }
     }
 }
 
@@ -284,53 +311,57 @@ impl PerfControl {
 pub(crate) struct PerfHub {
     tx: mpsc::UnboundedSender<Msg>,
     task: JoinHandle<()>,
-    /// The main isolate, which the router updates at a hot restart.
-    main: Arc<Mutex<String>>,
-    /// `Flutter.Frame` events seen since the task last looked.
-    frames: Arc<AtomicU64>,
+    svc: VmService,
+    /// What the router and the session share with the task.
+    shared: Arc<Cpu>,
 }
 
 impl PerfHub {
     pub(crate) fn new(
-        shared: SharedSink,
+        sink: SharedSink,
         svc: VmService,
         cfg: PerfConfig,
         main_isolate: String,
     ) -> PerfHub {
         let (tx, rx) = mpsc::unbounded_channel();
-        let main = Arc::new(Mutex::new(main_isolate));
-        let frames = Arc::new(AtomicU64::new(0));
-        let task = tokio::spawn(run(
-            shared,
-            svc,
-            cfg,
-            rx,
-            Cpu {
-                main: main.clone(),
-                frames: frames.clone(),
-            },
-        ));
+        let shared = Arc::new(Cpu {
+            main: Mutex::new(main_isolate),
+            frames: AtomicU64::new(0),
+            wanted: AtomicBool::new(false),
+            restore_tracing: AtomicBool::new(false),
+        });
+        let task = tokio::spawn(run(sink, svc.clone(), cfg, rx, shared.clone()));
         PerfHub {
             tx,
             task,
-            main,
-            frames,
+            svc,
+            shared,
         }
     }
 
     /// A hot restart: CPU samples come from the new isolate.
     pub(crate) fn set_main_isolate(&self, id: &str) {
-        *self.main.lock().unwrap() = id.to_string();
+        *self.shared.main.lock().unwrap() = id.to_string();
+    }
+
+    /// The extension that traces widget builds appeared in `isolate`: after a hot restart it is
+    /// off again, so a wanted `true` is applied anew.
+    pub(crate) fn reapply_tracing(&self, isolate: &str) {
+        if self.shared.wanted.load(Ordering::Relaxed) {
+            let _ = self.tx.send(Msg::Reapply(isolate.to_string()));
+        }
     }
 
     /// A frame was drawn; the next CPU tick fetches.
     pub(crate) fn frame_drawn(&self) {
-        self.frames.fetch_add(1, Ordering::Relaxed);
+        self.shared.frames.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn control(&self) -> std::sync::Arc<PerfControl> {
         std::sync::Arc::new(PerfControl {
             tx: self.tx.clone(),
+            svc: self.svc.clone(),
+            shared: self.shared.clone(),
         })
     }
 
@@ -348,8 +379,14 @@ impl Drop for PerfHub {
 
 /// What the router shares with the task.
 struct Cpu {
-    main: Arc<Mutex<String>>,
-    frames: Arc<AtomicU64>,
+    /// The main isolate, which the router updates at a hot restart.
+    main: Mutex<String>,
+    /// `Flutter.Frame` events seen since the task last looked.
+    frames: AtomicU64,
+    /// Widget-build tracing is wanted on.
+    wanted: AtomicBool,
+    /// fdt turned tracing on, so it turns it off when the user disconnects.
+    restore_tracing: AtomicBool,
 }
 
 /// The CPU side of the task: where the next window starts and whether a fetch is owed.
@@ -432,12 +469,97 @@ async fn fetch_cpu(
     true
 }
 
+/// Switches widget-build tracing and, with it, where the timeline comes from. Returns the state
+/// the app is in afterwards (`Some(false)` when it could not be changed), or `None` when the
+/// connection closed.
+async fn apply_tracing(
+    svc: &VmService,
+    cfg: &PerfConfig,
+    cpu: &Cpu,
+    on: bool,
+    read_prior: &mut bool,
+    stream_mode: &mut bool,
+    next: &mut i64,
+) -> Option<bool> {
+    let isolate = cpu.main.lock().unwrap().clone();
+    if on {
+        // Tracing someone else already turned on is not ours to turn off.
+        let prior = if *read_prior {
+            None
+        } else {
+            *read_prior = true;
+            match tokio::time::timeout(
+                cfg.call_timeout,
+                svc.get_bool_extension(PROFILE_WIDGET_BUILDS, &isolate),
+            )
+            .await
+            {
+                Ok(Err(RpcError::Closed)) => return None,
+                Ok(Ok(was)) => Some(was),
+                _ => None,
+            }
+        };
+        match svc
+            .set_bool_extension(PROFILE_WIDGET_BUILDS, &isolate, true)
+            .await
+        {
+            Ok(true) => {
+                if prior == Some(false) {
+                    cpu.restore_tracing.store(true, Ordering::Relaxed);
+                }
+            }
+            Ok(false) => return Some(false),
+            Err(RpcError::Closed) => return None,
+            Err(e) => {
+                log::warn!("turning widget-build tracing on failed: {e}");
+                return Some(false);
+            }
+        }
+        if !*stream_mode {
+            match svc.stream_listen("Timeline").await {
+                Ok(()) => *stream_mode = true,
+                Err(RpcError::Closed) => return None,
+                // Tracing is on, and the timeline is still polled (it holds few frames).
+                Err(e) => log::warn!("streamListen Timeline failed: {e}"),
+            }
+        }
+        return Some(true);
+    }
+    let actual = match svc
+        .set_bool_extension(PROFILE_WIDGET_BUILDS, &isolate, false)
+        .await
+    {
+        Ok(on) => on,
+        Err(RpcError::Closed) => return None,
+        Err(e) => {
+            log::warn!("turning widget-build tracing off failed: {e}");
+            false
+        }
+    };
+    cpu.restore_tracing.store(false, Ordering::Relaxed);
+    if *stream_mode {
+        match svc.stream_cancel("Timeline").await {
+            Ok(()) => {}
+            Err(RpcError::Closed) => return None,
+            Err(e) => log::debug!("streamCancel Timeline failed: {e}"),
+        }
+        *stream_mode = false;
+        // Polling continues from here: what the stream already delivered is not asked for again.
+        match svc.get_vm_timeline_micros().await {
+            Ok(now) => *next = now + 1,
+            Err(RpcError::Closed) => return None,
+            Err(e) => log::debug!("getVMTimelineMicros failed: {e}"),
+        }
+    }
+    Some(actual)
+}
+
 async fn run(
     shared: SharedSink,
     svc: VmService,
     cfg: PerfConfig,
     mut rx: mpsc::UnboundedReceiver<Msg>,
-    cpu: Cpu,
+    cpu: Arc<Cpu>,
 ) {
     let mut tick = interval(cfg.poll);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -453,6 +575,9 @@ async fn run(
     let mut pipe = Pipeline::new();
     let mut next = cfg.start_us;
     let mut stream_mode = false;
+    // Whether tracing was already on before fdt switched it, read once per connection.
+    let mut tracing_read = false;
+    let mut held: Option<Msg> = None;
     loop {
         tokio::select! {
             _ = tick.tick(), if !stream_mode => {
@@ -494,16 +619,49 @@ async fn run(
                     return;
                 }
             }
-            msg = rx.recv() => match msg {
+            msg = async {
+                match held.take() {
+                    Some(m) => Some(m),
+                    None => rx.recv().await,
+                }
+            } => match msg {
                 None => return,
-                Some(Msg::StreamMode(on)) => stream_mode = on,
+                Some(Msg::SetTracing(on)) => {
+                    let Some(actual) = apply_tracing(&svc, &cfg, &cpu, on, &mut tracing_read, &mut stream_mode, &mut next).await else {
+                        return;
+                    };
+                    shared.get().send(Ingest::Tracing(shared.get().run, actual));
+                }
+                Some(Msg::Reapply(isolate)) => {
+                    // A restart of something other than the main isolate changes nothing.
+                    if cpu.wanted.load(Ordering::Relaxed)
+                        && *cpu.main.lock().unwrap() == isolate
+                    {
+                        let Some(actual) = apply_tracing(&svc, &cfg, &cpu, true, &mut tracing_read, &mut stream_mode, &mut next).await else {
+                            return;
+                        };
+                        shared.get().send(Ingest::Tracing(shared.get().run, actual));
+                    }
+                }
                 Some(Msg::FetchCpuNow) => {
                     cpu.frames.store(0, Ordering::Relaxed);
                     if !cs.off && !fetch_cpu(&shared, &svc, &cfg, &cpu, &mut cs).await {
                         return;
                     }
                 }
-                Some(Msg::Events(events)) => {
+                Some(Msg::Events(mut events)) => {
+                    // Under tracing the stream delivers hundreds of thousands of events a
+                    // second in blocks of 64: take what is already waiting as one block.
+                    while events.len() < MAX_COALESCED_EVENTS {
+                        match rx.try_recv() {
+                            Ok(Msg::Events(more)) => events.extend(more),
+                            Ok(other) => {
+                                held = Some(other);
+                                break;
+                            }
+                            Err(_) => break,
+                        }
+                    }
                     let sink = shared.get();
                     if let Some(b) = pipe.feed(&sink, events, None) {
                         sink.send(Ingest::Timeline(b));

@@ -23,6 +23,9 @@ pub struct Settings {
     pub body_cap_kib: u32,
     /// Total memory for kept response bodies, in MiB.
     pub body_budget_mib: u32,
+    /// Trace widget builds in an app from the moment of connecting. Off: it adds about 90 % to
+    /// build time.
+    pub trace_widget_builds: bool,
     /// App addresses used recently, newest first.
     pub recent_urls: Vec<String>,
 }
@@ -35,6 +38,7 @@ impl Default for Settings {
             free_app_http_memory: false,
             body_cap_kib: 1024,
             body_budget_mib: 200,
+            trace_widget_builds: false,
             recent_urls: Vec::new(),
         }
     }
@@ -82,6 +86,7 @@ impl Settings {
         field(map, "free_app_http_memory", &mut s.free_app_http_memory);
         field(map, "body_cap_kib", &mut s.body_cap_kib);
         field(map, "body_budget_mib", &mut s.body_budget_mib);
+        field(map, "trace_widget_builds", &mut s.trace_widget_builds);
         field(map, "recent_urls", &mut s.recent_urls);
         s.recent_urls.truncate(RECENT_URLS_MAX);
         s
@@ -265,6 +270,7 @@ mod tests {
             free_app_http_memory: true,
             body_cap_kib: 64,
             body_budget_mib: 10,
+            trace_widget_builds: true,
             recent_urls: vec!["ws://x/ws".into()],
         };
         SettingsStore::write(&path, &s).unwrap();
@@ -309,6 +315,7 @@ mod tests {
     fn new_settings_fields_default() {
         let s = Settings::default();
         assert!(!s.free_app_http_memory);
+        assert!(!s.trace_widget_builds);
         assert_eq!(s.body_cap_kib, 1024);
         assert_eq!(s.body_budget_mib, 200);
         assert!(s.recent_urls.is_empty());

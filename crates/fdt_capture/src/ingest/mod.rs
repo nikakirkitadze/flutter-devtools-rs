@@ -79,6 +79,10 @@ pub(crate) enum Ingest {
     CpuStatus(RunId, CpuStatus),
     /// The connection's timeline controls, for commands.
     PerfReady(Arc<perf::PerfControl>),
+    /// What the connection's HTTP and socket profiling was before fdt, to put back.
+    NetRestoreReady(Arc<http::NetRestore>),
+    /// Whether widget-build tracing is on in the run's app, as the app answered.
+    Tracing(RunId, bool),
     /// An isolate exited (a hot restart, or the app ending it): its unfinished requests end.
     IsolateExit {
         isolate: String,
@@ -263,6 +267,11 @@ impl Router {
             {
                 self.perf.set_main_isolate(&isolate.id);
                 self.main_isolate = isolate.id;
+            }
+            StreamEvent::ServiceExtensionAdded { isolate, rpc }
+                if rpc == fdt_vm::flutter::PROFILE_WIDGET_BUILDS =>
+            {
+                self.perf.reapply_tracing(&isolate.id);
             }
             StreamEvent::ServiceExtensionAdded { isolate, rpc } if rpc == http::ENABLE_RPC => {
                 self.net.start(&isolate.id);

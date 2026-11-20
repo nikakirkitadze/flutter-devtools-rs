@@ -133,6 +133,7 @@ impl SessionWriter {
             ended: None,
             clock,
             refresh_hz: None,
+            tracing: false,
         });
         self.touch(at);
         id
@@ -173,6 +174,16 @@ impl SessionWriter {
         if let Some(r) = self.runs.iter_mut().find(|r| r.id == run) {
             r.refresh_hz = Some(hz);
             self.frames.set_budget(run, budget_us(Some(hz)));
+            self.dirty = true;
+        }
+    }
+
+    /// Records whether widget-build tracing is on in the run's app.
+    pub fn set_tracing(&mut self, run: RunId, on: bool) {
+        if let Some(r) = self.runs.iter_mut().find(|r| r.id == run)
+            && r.tracing != on
+        {
+            r.tracing = on;
             self.dirty = true;
         }
     }
@@ -424,6 +435,18 @@ mod tests {
         assert_eq!(s.run(r2).unwrap().ended, None);
         assert_eq!(s.latest_time(), SessionTime(60));
         assert!(s.run(RunId(9)).is_none());
+    }
+
+    #[test]
+    fn tracing_is_per_run_and_dirties_only_on_change() {
+        let mut w = SessionWriter::new(0);
+        let r = w.start_run(app(), clock(), SessionTime(10));
+        w.publish();
+        assert!(!w.publish().run(r).unwrap().tracing);
+        w.set_tracing(r, false);
+        assert!(!w.is_dirty());
+        w.set_tracing(r, true);
+        assert!(w.publish().run(r).unwrap().tracing);
     }
 
     #[test]

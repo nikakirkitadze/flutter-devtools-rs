@@ -144,6 +144,7 @@ impl Session {
         self.conn_gen += 1;
         self.life.shared = None;
         self.perf = None;
+        self.net_restore = None;
         if let Some(w) = &mut self.writer {
             let at = session_time(w);
             w.end_run(run, at);
@@ -291,6 +292,26 @@ impl Session {
         }
     }
 
+    /// Puts back what fdt changed in the app: tracing, and HTTP and socket profiling that were
+    /// off before. Only for a live connection the user ends; a connection that dropped has no
+    /// app to call.
+    pub(crate) async fn restore_profiling(&mut self) {
+        let (perf, net) = (self.perf.take(), self.net_restore.take());
+        let timeout = self.cfg.restore_timeout;
+        tokio::join!(
+            async {
+                if let Some(p) = &perf {
+                    p.restore(timeout).await;
+                }
+            },
+            async {
+                if let Some(n) = &net {
+                    n.restore(timeout).await;
+                }
+            }
+        );
+    }
+
     pub(crate) fn disconnect(&mut self) {
         let had_connection = !matches!(
             *self.status.borrow(),
@@ -398,6 +419,9 @@ impl Session {
         if let Some(hz) = refresh_hz {
             w.set_refresh_rate(id, hz);
         }
+        // This connection has not switched anything yet.
+        w.set_tracing(id, false);
+        self.tracing_actual = false;
         self.life.last_vm = Some(VmIdent {
             run: id,
             pid: app.pid,
@@ -452,6 +476,7 @@ impl Session {
                 shared.get().connect_timeline_us,
                 tx,
             ));
+            w.set_tracing(id, self.tracing_actual);
             self.current_run = Some(id);
             self.life.last_vm = Some(VmIdent {
                 run: id,
@@ -486,8 +511,12 @@ impl Session {
         // Everything else from a connection that is no longer current is dropped. Listed so a
         // new variant makes this match fail to compile.
         match i {
-            Ingest::Timeline(_) | Ingest::Cpu(_) | Ingest::CpuStatus(..) | Ingest::PerfReady(_) => {
-            }
+            Ingest::Timeline(_)
+            | Ingest::Cpu(_)
+            | Ingest::CpuStatus(..)
+            | Ingest::PerfReady(_)
+            | Ingest::NetRestoreReady(_)
+            | Ingest::Tracing(..) => {}
             Ingest::StartRun { .. }
             | Ingest::Failed { .. }
             | Ingest::Closed

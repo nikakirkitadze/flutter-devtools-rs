@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::capture::{SessionMsg, Target};
 use crate::config::CaptureConfig;
-use crate::ingest::http::{BodyFetcher, ENABLE_RPC, NetHub, PollerConfig};
+use crate::ingest::http::{BodyFetcher, ENABLE_RPC, NetHub, NetRestore, PollerConfig};
 use crate::ingest::perf::{PerfConfig, PerfHub};
 use crate::ingest::{Ingest, Router};
 
@@ -321,11 +321,13 @@ async fn connect_and_ingest(
         svc.clone(),
         fetcher,
         PollerConfig {
+            restore: Arc::new(NetRestore::new(svc.clone())),
             http_poll: cfg.http_poll,
             socket_poll: cfg.socket_poll,
             free_app_memory,
         },
     );
+    sink.get().send(Ingest::NetRestoreReady(hub.restorer()));
     if isolate.extension_rpcs.iter().any(|r| r == ENABLE_RPC) {
         hub.start(&main);
     }

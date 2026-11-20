@@ -15,7 +15,7 @@ use tokio::time::{Instant, sleep_until};
 
 use crate::config::CaptureConfig;
 use crate::ingest::Ingest;
-use crate::ingest::http::NetState;
+use crate::ingest::http::{NetRestore, NetState};
 use crate::ingest::perf::{self, PerfControl};
 use crate::lifecycle::Lifecycle;
 use crate::status::ConnStatus;
@@ -38,6 +38,7 @@ pub(crate) enum Command {
     SetFreeAppHttpMemory(bool),
     SetBodyLimits(BodyLimits),
     FetchCpuNow,
+    SetTraceWidgetBuilds(bool),
     /// Sent when the `Capture` is dropped.
     Shutdown,
 }
@@ -119,6 +120,12 @@ impl Capture {
         self.command(Command::FetchCpuNow);
     }
 
+    /// Traces widget builds in the app (about +90 % build time while on) and takes the timeline
+    /// from the `Timeline` stream. Kept across connects and hot restarts.
+    pub fn set_trace_widget_builds(&self, on: bool) {
+        self.command(Command::SetTraceWidgetBuilds(on));
+    }
+
     pub fn status(&self) -> watch::Receiver<ConnStatus> {
         self.status.clone()
     }
@@ -156,6 +163,13 @@ pub(crate) struct Session {
     pub(crate) life: Lifecycle,
     /// The live connection's timeline task, for commands.
     pub(crate) perf: Option<Arc<PerfControl>>,
+    /// What to put back in the live connection's app when the user disconnects.
+    pub(crate) net_restore: Option<Arc<NetRestore>>,
+    /// Whether widget builds should be traced, whatever the connection (from the settings, then
+    /// the command).
+    wanted_tracing: bool,
+    /// Whether the app answered that tracing is on, for runs that start on this connection.
+    pub(crate) tracing_actual: bool,
 }
 
 impl Session {
@@ -168,6 +182,7 @@ impl Session {
         free_app_memory: Arc<AtomicBool>,
     ) -> Session {
         Session {
+            wanted_tracing: cfg.trace_widget_builds,
             cfg,
             discovery,
             tx,
@@ -182,6 +197,8 @@ impl Session {
             free_app_memory,
             life: Lifecycle::new(),
             perf: None,
+            net_restore: None,
+            tracing_actual: false,
         }
     }
 
@@ -195,7 +212,14 @@ impl Session {
             let retry_due = self.life.retry_due();
             tokio::select! {
                 msg = rx.recv() => match msg {
-                    Some(SessionMsg::Command(Command::Shutdown)) => break,
+                    Some(SessionMsg::Command(Command::Shutdown)) => {
+                        self.restore_profiling().await;
+                        break;
+                    }
+                    Some(SessionMsg::Command(Command::Disconnect)) => {
+                        self.restore_profiling().await;
+                        self.disconnect();
+                    }
                     Some(SessionMsg::Command(c)) => self.command(c),
                     Some(SessionMsg::Ingest(g, i))
                         if g == self.conn_gen || self.ends_live_connection(g, &i) => self.ingest(i),
@@ -282,7 +306,13 @@ impl Session {
                     p.fetch_now();
                 }
             }
-            Command::Disconnect => self.disconnect(),
+            Command::Disconnect => {} // handled by the run loop, which restores first
+            Command::SetTraceWidgetBuilds(on) => {
+                self.wanted_tracing = on;
+                if let Some(p) = &self.perf {
+                    p.set_tracing(on);
+                }
+            }
             Command::StopWaiting => self.stop_waiting(),
             Command::SetRecording(on) => self.set_recording(on),
             Command::NewSession => self.new_session(),
@@ -337,7 +367,17 @@ impl Session {
             Ingest::Timeline(b) => perf::store(w, b, recording),
             Ingest::Cpu(b) => perf::store_cpu(w, b, recording),
             Ingest::CpuStatus(run, status) => w.set_cpu_status(run, status),
-            Ingest::PerfReady(p) => self.perf = Some(p),
+            Ingest::PerfReady(p) => {
+                if self.wanted_tracing {
+                    p.set_tracing(true);
+                }
+                self.perf = Some(p);
+            }
+            Ingest::NetRestoreReady(n) => self.net_restore = Some(n),
+            Ingest::Tracing(run, on) => {
+                self.tracing_actual = on;
+                w.set_tracing(run, on);
+            }
             Ingest::HttpPoll {
                 isolate,
                 updates,

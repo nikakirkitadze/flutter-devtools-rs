@@ -28,6 +28,7 @@ pub trait CaptureControl: 'static {
     fn set_free_app_http_memory(&self, on: bool);
     fn set_body_limits(&self, limits: BodyLimits);
     fn fetch_cpu_samples(&self);
+    fn set_trace_widget_builds(&self, on: bool);
     fn status(&self) -> watch::Receiver<ConnStatus>;
     fn snapshots(&self) -> watch::Receiver<Arc<Snapshot>>;
 }
@@ -59,6 +60,9 @@ impl CaptureControl for Capture {
     }
     fn fetch_cpu_samples(&self) {
         Capture::fetch_cpu_samples(self);
+    }
+    fn set_trace_widget_builds(&self, on: bool) {
+        Capture::set_trace_widget_builds(self, on);
     }
     fn status(&self) -> watch::Receiver<ConnStatus> {
         Capture::status(self)
@@ -138,6 +142,7 @@ pub fn config_from_settings(s: &Settings) -> CaptureConfig {
     CaptureConfig {
         body_limits: body_limits_from_settings(s),
         free_app_http_memory: s.free_app_http_memory,
+        trace_widget_builds: s.trace_widget_builds,
         ..CaptureConfig::default()
     }
 }
@@ -182,6 +187,30 @@ mod tests {
         let (fake, handle) = crate::test_support::fake_capture();
         CaptureControl::fetch_cpu_samples(&fake);
         assert_eq!(handle.commands(), vec!["fetch_cpu".to_string()]);
+    }
+
+    #[test]
+    fn fake_capture_logs_tracing() {
+        let (fake, handle) = crate::test_support::fake_capture();
+        CaptureControl::set_trace_widget_builds(&fake, true);
+        CaptureControl::set_trace_widget_builds(&fake, false);
+        assert_eq!(
+            handle.commands(),
+            vec![
+                "trace_builds true".to_string(),
+                "trace_builds false".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn settings_default_reaches_capture_config() {
+        assert!(!config_from_settings(&Settings::default()).trace_widget_builds);
+        let s = Settings {
+            trace_widget_builds: true,
+            ..Settings::default()
+        };
+        assert!(config_from_settings(&s).trace_widget_builds);
     }
 
     #[test]
