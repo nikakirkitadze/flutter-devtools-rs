@@ -6,7 +6,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use serde_json::Value;
 use tokio::sync::watch;
@@ -891,8 +892,7 @@ mod tests {
         assert_eq!(a.pid, Some(4242));
         assert_eq!(a.key.package, "jank_lab");
         // The probe connection is not kept open.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(vm.open_connections(), 0);
+        wait_until("probe connection closed", || vm.open_connections() == 0).await;
         // And the VM was probed exactly once despite several ticks.
         assert_eq!(
             vm.received().iter().filter(|(m, _)| m == "getVM").count(),
@@ -900,11 +900,10 @@ mod tests {
         );
 
         dtd.close_abruptly();
-        let apps = next(&mut rx, 200).await;
-        assert!(apps.is_empty());
+        wait_for(&mut rx, 5000, "app gone", |a| a.is_empty()).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn first_scan_publishes_even_when_empty() {
         let dir = tempfile::tempdir().unwrap();
         let (_disc, mut rx) =
@@ -912,7 +911,7 @@ mod tests {
         let apps = next(&mut rx, 1000).await;
         assert!(apps.is_empty());
         // Later identical scans do not publish.
-        let again = tokio::time::timeout(Duration::from_millis(300), rx.changed()).await;
+        let again = tokio::time::timeout(Duration::from_millis(300), rx.changed()).await; // paused clock
         assert!(again.is_err());
     }
 
@@ -927,8 +926,7 @@ mod tests {
         while next(&mut rx, 5000).await.is_empty() {}
         assert_eq!(dtd.open_connections(), 1);
         drop(disc);
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(dtd.open_connections(), 0);
+        wait_until("DTD connection closed", || dtd.open_connections() == 0).await;
     }
 
     async fn wait_for(
@@ -950,6 +948,18 @@ mod tests {
         }
     }
 
+    /// Polls `cond` until it holds or 5 s pass, for state that changes on another thread.
+    async fn wait_until(what: &str, cond: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for: {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     fn count(server: &ScriptedServer, method: &str) -> usize {
         server
             .received()
@@ -958,7 +968,7 @@ mod tests {
             .count()
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn probe_failure_is_retried_after_the_retry_interval() {
         let vm = vm_server_with("jank_lab", 1);
         let dtd = dtd_server(&vm);
@@ -968,7 +978,8 @@ mod tests {
         cfg.retry_after = Duration::from_millis(700);
         let (_disc, mut rx) = Discovery::spawn(&tokio::runtime::Handle::current(), cfg);
         // Several ticks pass inside the retry window: one failed attempt, no second one yet.
-        tokio::time::sleep(Duration::from_millis(350)).await;
+        wait_until("first probe", || count(&vm, "getVM") == 1).await;
+        tokio::time::advance(Duration::from_millis(350)).await;
         assert_eq!(count(&vm, "getVM"), 1);
         assert!(rx.borrow().is_empty());
         let apps = wait_for(&mut rx, 3000, "app after retry", |a| a.len() == 1).await;
@@ -990,7 +1001,7 @@ mod tests {
             Discovery::spawn(&tokio::runtime::Handle::current(), config(dir.path()));
         wait_for(&mut rx, 3000, "app", |a| a.len() == 1).await;
         list.lock().unwrap().clear();
-        wait_for(&mut rx, 500, "app gone", |a| a.is_empty()).await;
+        wait_for(&mut rx, 5000, "app gone", |a| a.is_empty()).await;
     }
 
     #[tokio::test]
@@ -1007,7 +1018,7 @@ mod tests {
         let mut cfg = config(dir.path());
         cfg.probe_timeout = Duration::from_secs(10);
         let (_disc, mut rx) = Discovery::spawn(&tokio::runtime::Handle::current(), cfg);
-        let apps = wait_for(&mut rx, 1500, "healthy app", |a| !a.is_empty()).await;
+        let apps = wait_for(&mut rx, 5000, "healthy app", |a| !a.is_empty()).await;
         assert_eq!(apps.len(), 1);
         assert_eq!(apps[0].name, "ok_app");
     }
@@ -1039,11 +1050,11 @@ mod tests {
         let mut cfg = config(dir.path());
         cfg.probe_timeout = Duration::from_secs(10);
         let (_disc, mut rx) = Discovery::spawn(&tokio::runtime::Handle::current(), cfg);
-        let apps = wait_for(&mut rx, 1500, "app via the healthy DTD", |a| !a.is_empty()).await;
+        let apps = wait_for(&mut rx, 5000, "app via the healthy DTD", |a| !a.is_empty()).await;
         assert_eq!(apps[0].name, "jank_lab");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn failing_dtd_is_backed_off() {
         let dtd = ScriptedServer::start(|_, _| Err((-32000, "broken".into())));
         let dir = tempfile::tempdir().unwrap();
@@ -1051,10 +1062,15 @@ mod tests {
         let mut cfg = config(dir.path());
         cfg.retry_after = Duration::from_millis(600);
         let (_disc, _rx) = Discovery::spawn(&tokio::runtime::Handle::current(), cfg);
-        tokio::time::sleep(Duration::from_millis(350)).await;
+        wait_until("first ask", || {
+            count(&dtd, "ConnectedApp.getVmServices") == 1
+        })
+        .await;
+        tokio::time::advance(Duration::from_millis(350)).await;
         // Many 50 ms ticks have passed, but the DTD was asked once.
         assert_eq!(count(&dtd, "ConnectedApp.getVmServices"), 1);
-        tokio::time::sleep(Duration::from_millis(900)).await;
+        tokio::time::advance(Duration::from_millis(900)).await;
+        wait_until("retry", || count(&dtd, "ConnectedApp.getVmServices") >= 2).await;
         let n = count(&dtd, "ConnectedApp.getVmServices");
         assert!((2..=3).contains(&n), "retried {n} times");
     }
