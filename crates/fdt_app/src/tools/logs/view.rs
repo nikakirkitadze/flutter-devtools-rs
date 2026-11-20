@@ -88,6 +88,8 @@ struct Applied {
     len: usize,
     first: SessionTime,
     last: SessionTime,
+    /// The level counts of the records `len` covers, in the filter's range.
+    counts: [u64; 4],
 }
 
 struct JobResult {
@@ -119,7 +121,6 @@ fn compute(
     cancel: &AtomicBool,
     first: oneshot::Sender<(Vec<u32>, Arc<Snapshot>)>,
 ) -> Option<JobResult> {
-    let counts = snap.logs.level_counts(filter.range);
     let first_snap = snap.clone();
     let same_filter = prior
         .as_ref()
@@ -132,6 +133,14 @@ fn compute(
         && fingerprint(snap).is_some_and(|(first, _)| first == p.first)
         && snap.logs.row(p.len - 1).time == p.last
     {
+        // Same filter (so the same range): the new records add to the prior counts.
+        let mut counts = p.counts;
+        for (c, n) in counts
+            .iter_mut()
+            .zip(snap.logs.level_counts_from(p.len, filter.range))
+        {
+            *c += n;
+        }
         let new = filter_logs(&snap.logs, filter, p.len);
         let filtered = if new.is_empty() {
             old
@@ -148,6 +157,7 @@ fn compute(
             replaced: false,
         });
     }
+    let counts = snap.logs.level_counts(filter.range);
     let filtered: Arc<[u32]> = if filter.text.is_some() {
         let mut first = Some(first);
         filter_logs_two_phase(&snap.logs, filter, cancel, |rows| {
@@ -419,6 +429,7 @@ impl LogsView {
             len: snap.logs.len(),
             first,
             last,
+            counts: result.counts,
         });
         self.snap = snap;
         if let Some(id) = self.pending.take() {
@@ -618,10 +629,14 @@ impl LogsView {
         }
     }
 
-    /// The matches of the current text filter, once its scan is the one on screen.
+    /// The matches of the current text filter, once its scan is the one on screen. It stays while
+    /// a job for new records runs.
     pub(super) fn match_count(&self) -> Option<usize> {
-        (self.filter.text.is_some() && self.settled() && self.search_error.is_none())
-            .then(|| self.rows.filtered().len())
+        (self.filter.text.is_some()
+            && !self.search_pending()
+            && self.applied.is_some()
+            && self.search_error.is_none())
+        .then(|| self.rows.filtered().len())
     }
 
     /// Whether the rows on screen are for an older filter than the one in the field, with search
@@ -2616,5 +2631,64 @@ mod tests {
             count(Counter::LogsToolbar) > before,
             "the level chips changed"
         );
+    }
+
+    #[test]
+    fn incremental_and_full_results_match() {
+        let (mut w, run) = writer();
+        let mut filter = LogFilter::default();
+        filter.levels.toggle(LogLevel::Debug);
+        filter.text = compile_query("line at 1", false).unwrap();
+        filter.range = Some(TimeRange::new(
+            SessionTime(100_000 * 1_000_000),
+            SessionTime(500_000 * 1_000_000),
+        ));
+        let cancel = AtomicBool::new(false);
+        let run_job = |snap: &Arc<Snapshot>, prior| {
+            let (tx, _rx) = oneshot::channel();
+            let key = Key {
+                session: snap.session,
+                generation: snap.generation,
+                version: 1,
+            };
+            let r = compute(snap, &filter, key, prior, &cancel, tx).unwrap();
+            let (first, last) = fingerprint(snap).unwrap_or((SessionTime(0), SessionTime(0)));
+            let applied = Applied {
+                key,
+                len: snap.logs.len(),
+                first,
+                last,
+                counts: r.counts,
+            };
+            (r, applied)
+        };
+        feed(&mut w, run, 0, 37);
+        let (_, mut applied) = run_job(&w.publish(), None);
+        let mut rows = run_job(&w.publish(), None).0.filtered;
+        for step in 1..=20 {
+            feed(&mut w, run, step * 37, (step + 1) * 37);
+            let snap = w.publish();
+            let (inc, next) = run_job(&snap, Some((applied, rows.clone())));
+            assert!(inc.incremental, "step {step}");
+            let (full, _) = run_job(&snap, None);
+            assert_eq!(&*inc.filtered, &*full.filtered, "rows at step {step}");
+            assert_eq!(inc.counts, full.counts, "counts at step {step}");
+            applied = next;
+            rows = inc.filtered;
+        }
+        assert!(!rows.is_empty());
+    }
+
+    #[gpui_kit::test]
+    fn match_count_stays_during_an_incremental_job(cx: &mut TestAppContext) {
+        let (_shell, view, cx) = open_search(cx, 40);
+        type_query(cx, "burst");
+        assert!(present(cx, "logs-match-count"));
+        view.update(cx, |v, cx| {
+            v.running = true;
+            cx.notify();
+        });
+        assert!(!view.read_with(cx, |v, _| v.is_settled()));
+        assert!(present(cx, "logs-match-count"));
     }
 }

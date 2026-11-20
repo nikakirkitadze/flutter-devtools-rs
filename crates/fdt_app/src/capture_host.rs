@@ -74,10 +74,16 @@ pub struct CaptureHost {
 
 impl Global for CaptureHost {}
 
+/// Why the capture runtime could not start. Set instead of [`CaptureHost`]; the Start page shows
+/// it.
+pub struct CaptureHostFailure(pub String);
+
+impl Global for CaptureHostFailure {}
+
 impl CaptureHost {
     /// Installs the host with the real discovery settings (the DTD registry, and `dart` from
-    /// `PATH` as the fallback). Does nothing if it is already installed or the runtime cannot
-    /// start; windows then stay detached.
+    /// `PATH` as the fallback). Does nothing if it is already installed. If the runtime cannot
+    /// start, windows stay detached and [`CaptureHostFailure`] is set for the Start page.
     pub fn install(cx: &mut App) {
         let config = DiscoveryConfig {
             dart_cli: find_dart(std::env::var_os("PATH").as_deref()),
@@ -96,6 +102,7 @@ impl CaptureHost {
             Ok(rt) => rt,
             Err(err) => {
                 log::error!("could not start the capture runtime: {err}");
+                cx.set_global(CaptureHostFailure(err.to_string()));
                 return;
             }
         };

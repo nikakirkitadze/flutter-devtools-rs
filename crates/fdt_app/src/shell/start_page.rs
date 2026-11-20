@@ -1,6 +1,7 @@
 //! The start page: connect to a running app from a live list, a pasted URL or a recent one.
 
 use crate::actions::{AppListConnect, AppListNext, AppListPrev};
+use crate::capture_host::CaptureHostFailure;
 use crate::keymap::APP_LIST_CONTEXT;
 use crate::session_model::{SessionEvent, SessionModel};
 use crate::settings::{record_recent_url, settings, update_settings};
@@ -493,8 +494,18 @@ impl StartPage {
         )
     }
 
+    /// The recorder failing to start, or the connection failing.
     fn failure(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let ConnStatus::Failed { message, details } = self.session.read(cx).status().clone() else {
+        let (message, details) = if let Some(f) = cx.try_global::<CaptureHostFailure>() {
+            (
+                "Couldn't start the background recorder.".to_string(),
+                f.0.clone(),
+            )
+        } else if let ConnStatus::Failed { message, details } =
+            self.session.read(cx).status().clone()
+        {
+            (message, details)
+        } else {
             return None;
         };
         let t = cx.tokens();
@@ -588,10 +599,18 @@ pub fn heading(cx: &gpui_kit::App) -> impl IntoElement {
 
 impl Render for StartPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let list = self.app_list(cx);
         let failure = self.failure(cx);
-        let url = self.url_field(cx);
-        let recent = self.recent_urls(cx);
+        let mut body: Vec<AnyElement> = Vec::new();
+        if cx.has_global::<CaptureHostFailure>() {
+            // Nothing can connect without the recorder, so only the reason is shown.
+            body.extend(failure);
+        } else {
+            body.extend(failure);
+            body.push(self.app_list(cx));
+            body.push(section_label("Or paste a VM service URL", cx).into_any_element());
+            body.push(self.url_field(cx));
+            body.extend(self.recent_urls(cx));
+        }
         div()
             .id("start-page")
             .test_support()
@@ -609,11 +628,7 @@ impl Render for StartPage {
                     .px(space::S16)
                     .py(space::S32)
                     .child(heading(cx))
-                    .children(failure)
-                    .child(list)
-                    .child(section_label("Or paste a VM service URL", cx))
-                    .child(url)
-                    .children(recent),
+                    .children(body),
             )
     }
 }
@@ -942,5 +957,27 @@ mod tests {
         cx.run_until_parked();
         click(cx, "start-recent-0");
         assert!(!crate::test_support::exists(cx, "start-connect-error"));
+    }
+
+    #[gpui_kit::test]
+    fn a_runtime_that_failed_to_start_is_explained(cx: &mut TestAppContext) {
+        let (shell, cx) = crate::test_support::open_shell(cx);
+        cx.update(|_, cx| {
+            cx.set_global(crate::capture_host::CaptureHostFailure(
+                "too many open files".into(),
+            ))
+        });
+        cx.run_until_parked();
+        assert!(shell.read_with(cx, |s, _| s.start_page().is_some()));
+        assert_eq!(
+            label(cx, "start-error").unwrap(),
+            "Couldn't start the background recorder."
+        );
+        assert!(!exists(cx, "start-app-0"));
+        click(cx, "start-error-details-toggle");
+        assert_eq!(
+            label(cx, "start-error-details").unwrap(),
+            "too many open files"
+        );
     }
 }

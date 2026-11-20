@@ -24,7 +24,7 @@
 //! through synthesised mouse events.
 
 use crate::actions::show_tool;
-use crate::app::start_fixed;
+use crate::app::{start_fixed, start_live};
 use crate::nav::{Location, Page, Tool};
 use crate::perf::{Counter, N as COUNTERS, snapshot};
 use crate::shell::MainWindow;
@@ -58,7 +58,7 @@ const LOG_QUERY: &str = "connection timeout";
 const NET_QUERY: &str = "products";
 
 pub const USAGE: &str = "usage: fdt bench-ui <scenario> [--frames N]\n\
-scenarios: logs-scroll, logs-search, net-scroll, net-filter, tool-switch, strip-drag";
+scenarios: logs-scroll, logs-search, net-scroll, net-filter, tool-switch, strip-drag, live-logs";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scenario {
@@ -68,16 +68,19 @@ pub enum Scenario {
     NetFilter,
     ToolSwitch,
     StripDrag,
+    /// The Logs view following a session that grows by 50 lines every 16 ms.
+    LiveLogs,
 }
 
 impl Scenario {
-    pub const ALL: [Scenario; 6] = [
+    pub const ALL: [Scenario; 7] = [
         Scenario::LogsScroll,
         Scenario::LogsSearch,
         Scenario::NetScroll,
         Scenario::NetFilter,
         Scenario::ToolSwitch,
         Scenario::StripDrag,
+        Scenario::LiveLogs,
     ];
 
     pub fn name(self) -> &'static str {
@@ -88,6 +91,7 @@ impl Scenario {
             Scenario::NetFilter => "net-filter",
             Scenario::ToolSwitch => "tool-switch",
             Scenario::StripDrag => "strip-drag",
+            Scenario::LiveLogs => "live-logs",
         }
     }
 
@@ -106,7 +110,7 @@ impl Scenario {
     /// The scripted length: frames for scrolls and the drag, switches for `tool-switch`.
     fn default_len(self) -> usize {
         match self {
-            Scenario::LogsScroll | Scenario::NetScroll => 600,
+            Scenario::LogsScroll | Scenario::NetScroll | Scenario::LiveLogs => 600,
             Scenario::StripDrag => 300,
             Scenario::ToolSwitch => 40,
             Scenario::LogsSearch => LOG_QUERY.len(),
@@ -438,6 +442,7 @@ impl Script {
                     }
                     Scenario::ToolSwitch => self.switch_step(shell, window, cx),
                     Scenario::StripDrag => self.drag_step(shell, window, cx),
+                    Scenario::LiveLogs => self.live_step(shell, cx),
                 }
                 self.outcome.steps += 1;
             }
@@ -472,6 +477,16 @@ impl Script {
                 .update(cx, |net, cx| net.scroll_to_row(i, cx)),
         }
         self.outcome.last_position = Some(i);
+        self.frame += 1;
+        if self.frame >= self.len {
+            self.phase = Phase::Done;
+        }
+    }
+
+    /// Nothing to do but let the feed grow the session and the view follow it; the rows the list
+    /// has at each step go in `last_position`.
+    fn live_step(&mut self, shell: &Entity<MainWindow>, cx: &mut App) {
+        self.outcome.last_position = Some(shell.read(cx).logs_view().read(cx).row_count());
         self.frame += 1;
         if self.frame >= self.len {
             self.phase = Phase::Done;
@@ -646,6 +661,92 @@ fn ready(shell: &Entity<MainWindow>, tool: Tool, cx: &App) -> bool {
             net.is_settled() && net.filtered_len() > 0
         }
         _ => shell.read(cx).logs_view().read(cx).is_settled(),
+    }
+}
+
+// ---- the live feed ----
+
+/// Lines added per publish by the `live-logs` feed.
+const LIVE_LINES: usize = 50;
+/// Time between the feed's publishes.
+const LIVE_EVERY: Duration = Duration::from_millis(16); // token-check: allow: feed pacing
+
+/// Appends `n` log lines after `*next_ms` (and moves it on), one millisecond apart.
+fn append_live_lines(w: &mut fdt_store::SessionWriter, run: RunId, next_ms: &mut u64, n: usize) {
+    use fdt_store::logs::{LogInput, LogLevel, LogSource};
+    use fdt_store::time::SessionTime;
+    for _ in 0..n {
+        w.push_log(LogInput {
+            run,
+            time: SessionTime(*next_ms * 1_000_000),
+            clamped: false,
+            level: LogLevel::Info,
+            source: LogSource::Log,
+            logger: "live".into(),
+            text: format!("live line at {} ms: request handled, status=200", *next_ms),
+            error: None,
+        });
+        *next_ms += 1;
+    }
+}
+
+/// A capture that only replays what a thread publishes: it ignores every command.
+struct LiveFeed {
+    status: tokio::sync::watch::Receiver<ConnStatus>,
+    snaps: tokio::sync::watch::Receiver<std::sync::Arc<fdt_store::Snapshot>>,
+}
+
+impl crate::capture_host::CaptureControl for LiveFeed {
+    fn connect(&self, _: fdt_capture::Target) {}
+    fn disconnect(&self) {}
+    fn stop_waiting(&self) {}
+    fn set_recording(&self, _: bool) {}
+    fn new_session(&self) {}
+    fn load_full_body(&self, _: fdt_store::time::EntryId, _: fdt_store::net::BodyKind) {}
+    fn set_free_app_http_memory(&self, _: bool) {}
+    fn set_body_limits(&self, _: fdt_store::net::BodyLimits) {}
+    fn status(&self) -> tokio::sync::watch::Receiver<ConnStatus> {
+        self.status.clone()
+    }
+    fn snapshots(&self) -> tokio::sync::watch::Receiver<std::sync::Arc<fdt_store::Snapshot>> {
+        self.snaps.clone()
+    }
+}
+
+/// Starts the `live-logs` feed: the stress session, then [`LIVE_LINES`] more log lines every
+/// [`LIVE_EVERY`], published from a thread that owns the writer.
+fn live_feed() -> LiveFeed {
+    let (mut w, run) = fdt_store::synth::stress_writer(SEED);
+    let first = w.publish();
+    let mut next_ms = first.latest_time().0 / 1_000_000 + 1;
+    let (status_tx, status) = tokio::sync::watch::channel(stress_status());
+    let (snaps_tx, snaps) = tokio::sync::watch::channel(first);
+    std::thread::spawn(move || {
+        let _keep = status_tx;
+        loop {
+            std::thread::sleep(LIVE_EVERY);
+            append_live_lines(&mut w, run, &mut next_ms, LIVE_LINES);
+            if snaps_tx.send(w.publish()).is_err() {
+                break;
+            }
+        }
+    });
+    LiveFeed { status, snaps }
+}
+
+fn stress_status() -> ConnStatus {
+    ConnStatus::Connected {
+        run: RunId(1),
+        app: AppInfo {
+            name: "stress".into(),
+            device: Some("bench".into()),
+            mode: Mode::Debug,
+            flutter_version: None,
+            workspace: None,
+            vm_uri: "ws://127.0.0.1:1/ws".into(),
+            pid: None,
+        },
+        recording: false,
     }
 }
 
@@ -859,33 +960,33 @@ pub fn main(args: &[String]) -> ExitCode {
     }
 }
 
+enum Source {
+    Fixed(std::sync::Arc<fdt_store::Snapshot>),
+    Live(LiveFeed),
+}
+
 /// Builds the stress session, opens the window, runs `scenario` and exits the process with the
 /// verdict. Never returns normally.
 pub fn run(scenario: Scenario, frames: Option<usize>) -> ExitCode {
     // Building the session is not timed (and not covered by the timeout).
-    let snapshot = fdt_store::synth::stress_session(SEED);
+    let source = if scenario == Scenario::LiveLogs {
+        Source::Live(live_feed())
+    } else {
+        Source::Fixed(fdt_store::synth::stress_session(SEED))
+    };
     std::thread::spawn(move || {
         std::thread::sleep(TIMEOUT);
         fail(scenario, "timed out");
     });
-    let status = ConnStatus::Connected {
-        run: RunId(1),
-        app: AppInfo {
-            name: "stress".into(),
-            device: Some("bench".into()),
-            mode: Mode::Debug,
-            flutter_version: None,
-            workspace: None,
-            vm_uri: "ws://127.0.0.1:1/ws".into(),
-            pid: None,
-        },
-        recording: false,
-    };
     gpui_kit::application()
         .with_assets(FdtAssets)
         .run(move |cx: &mut App| {
             set_trace_enabled(true);
-            let shell = match start_fixed(cx, snapshot, status) {
+            let started = match source {
+                Source::Fixed(snapshot) => start_fixed(cx, snapshot, stress_status()),
+                Source::Live(feed) => start_live(cx, Box::new(feed)),
+            };
+            let shell = match started {
                 Ok(shell) => shell,
                 Err(err) => fail(scenario, &format!("could not open the window: {err:#}")),
             };
@@ -1100,6 +1201,11 @@ mod tests {
         assert_eq!(s.outcome().keystrokes, 8);
         assert_eq!(s.outcome().samples.len(), 8);
 
+        let s = run_script(cx, Scenario::LiveLogs, Some(8), false);
+        assert!(s.is_done());
+        assert_eq!(s.outcome().steps, 8);
+        assert_eq!(s.outcome().last_position, Some(100));
+
         let s = run_script(cx, Scenario::ToolSwitch, Some(6), false);
         assert!(s.is_done());
         assert_eq!(s.outcome().samples.len(), 6);
@@ -1137,5 +1243,17 @@ mod tests {
                 .as_deref()
                 .is_some_and(|e| e.contains("strip"))
         );
+    }
+
+    #[test]
+    fn the_live_feed_appends_fifty_lines_per_publish() {
+        let (mut w, run) = fdt_store::synth::writer(1, 0, 0, 0);
+        let mut next = 1_000;
+        append_live_lines(&mut w, run, &mut next, LIVE_LINES);
+        append_live_lines(&mut w, run, &mut next, LIVE_LINES);
+        let s = w.publish();
+        assert_eq!(s.logs.len(), 100);
+        assert_eq!(next, 1_100);
+        assert!(s.logs.row(99).time > s.logs.row(0).time);
     }
 }

@@ -20,7 +20,7 @@ use crate::actions::{
     ToggleExpand, ToggleFrameHud, ToggleFullScreen, ToggleRecording, UseDarkTheme, UseLightTheme,
     UseSystemTheme, Zoom,
 };
-use crate::capture_host::{CaptureControl, CaptureHost};
+use crate::capture_host::{CaptureControl, CaptureHost, CaptureHostFailure};
 use crate::keymap::SHELL_CONTEXT;
 use crate::nav::{Location, NavHistory, Page, Selection, Tool};
 use crate::palette::items::PaletteModel;
@@ -92,6 +92,7 @@ pub struct MainWindow {
     /// The Network table, kept for the life of the window.
     network: Entity<NetworkView>,
     _host_wait: Option<gpui_kit::Subscription>,
+    _host_failed_wait: Option<gpui_kit::Subscription>,
     /// Whether the last status seen was `Connected`, so only a new connection leaves Start.
     was_connected: bool,
     /// The session the window last saw, to notice when a new one replaces it.
@@ -170,6 +171,11 @@ impl MainWindow {
                 this.apps_from_host(window, cx);
             })
         });
+        let host_failed_wait = (!cx.has_global::<CaptureHostFailure>()).then(|| {
+            cx.observe_global_in::<CaptureHostFailure>(window, |this, window, cx| {
+                this.apps_from_host(window, cx);
+            })
+        });
         let shell = cx.entity();
         let chrome = chrome::Parts::new(&shell, cx);
         let mut this = Self {
@@ -188,6 +194,7 @@ impl MainWindow {
             logs,
             network,
             _host_wait: host_wait,
+            _host_failed_wait: host_failed_wait,
             was_connected,
             session_id,
             _appearance: appearance,
@@ -220,11 +227,18 @@ impl MainWindow {
 
     /// Creates the start page from the host's discovery, once the host exists.
     fn apps_from_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.start.is_some() || !cx.has_global::<CaptureHost>() {
+        if self.start.is_some() {
             return;
         }
-        let apps = cx.global::<CaptureHost>().apps();
-        self.set_apps_source(apps, window, cx);
+        if cx.has_global::<CaptureHost>() {
+            let apps = cx.global::<CaptureHost>().apps();
+            self.set_apps_source(apps, window, cx);
+        } else if cx.has_global::<CaptureHostFailure>() {
+            // No recorder, so no scan either: the page gets a list that never changes and
+            // shows why.
+            let (_, apps) = watch::channel::<Arc<[DiscoveredApp]>>(Arc::from(Vec::new()));
+            self.set_apps_source(apps, window, cx);
+        }
     }
 
     /// Creates the start page over `apps` (a no-op if it exists).
@@ -242,6 +256,7 @@ impl MainWindow {
         self.start = Some(page);
         self.focus_start_if_current(window, cx);
         self._host_wait = None;
+        self._host_failed_wait = None;
         cx.notify();
     }
 

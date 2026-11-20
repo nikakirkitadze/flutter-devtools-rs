@@ -21,7 +21,7 @@ use std::cell::Cell;
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Setup shared by the real app and the tests.
 pub fn init(cx: &mut App) {
@@ -134,10 +134,30 @@ pub(crate) fn start_fixed(
     snapshot: Arc<Snapshot>,
     status: ConnStatus,
 ) -> anyhow::Result<Entity<MainWindow>> {
+    start_bench(cx, move |_| SessionModel::fixed(snapshot, status))
+}
+
+/// Like [`start_fixed`], but the session follows `control` (a scripted feed) instead of staying
+/// fixed.
+pub(crate) fn start_live(
+    cx: &mut App,
+    control: Box<dyn crate::capture_host::CaptureControl>,
+) -> anyhow::Result<Entity<MainWindow>> {
+    start_bench(cx, move |cx| {
+        let mut model = SessionModel::fixed(Arc::new(Snapshot::empty()), ConnStatus::Idle);
+        model.attach(control, cx);
+        model
+    })
+}
+
+fn start_bench(
+    cx: &mut App,
+    session: impl FnOnce(&mut gpui_kit::Context<SessionModel>) -> SessionModel,
+) -> anyhow::Result<Entity<MainWindow>> {
     setup(cx, SettingsStore::in_memory(), &mut None);
     let options = main_window_options(cx);
     let (_, shell) = gpui_kit::open_window(options, cx, |window, cx| {
-        let session = cx.new(|_| SessionModel::fixed(snapshot, status));
+        let session = cx.new(session);
         cx.new(|cx| MainWindow::new(window, cx, session))
     })?;
     cx.on_window_closed(|cx, _| {
@@ -167,6 +187,9 @@ fn install(cx: &mut App, discovery: DiscoveryChoice) {
     }
 }
 
+/// How long after the window opens the capture host installs even if no frame has run.
+const HOST_FALLBACK: Duration = Duration::from_millis(500); // token-check: allow: startup fallback
+
 /// Installs the app menus and the capture host a few frames after the window opens instead of
 /// before it.
 ///
@@ -181,6 +204,18 @@ fn defer_menus_and_host(cx: &mut App, discovery: DiscoveryChoice) {
     };
     let pending = Rc::new(Cell::new(Some(discovery)));
     let later = pending.clone();
+    // A window that is occluded or on a locked screen draws no frames, so the chain below never
+    // runs. Install anyway once the window has been open this long.
+    let fallback = pending.clone();
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(HOST_FALLBACK).await;
+        cx.update(|cx| {
+            if let Some(discovery) = fallback.take() {
+                install(cx, discovery);
+            }
+        });
+    })
+    .detach();
     let result = handle.update(cx, |_, window, _| {
         window.on_next_frame(|window, _| {
             window.on_next_frame(|window, _| {
@@ -401,5 +436,28 @@ pub(crate) mod tests {
             opts.window_decorations,
             Some(gpui_kit::WindowDecorations::Client)
         );
+    }
+
+    #[gpui_kit::test]
+    fn capture_host_installs_without_a_frame(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let config = empty_discovery(dir.path());
+        // The test window never draws, so the frame chain cannot run.
+        cx.update(|cx| {
+            start(
+                cx,
+                SettingsStore::in_memory(),
+                None,
+                DiscoveryChoice::Fixed(config),
+            )
+            .unwrap();
+        });
+        cx.run_until_parked();
+        assert!(!cx.update(|cx| cx.has_global::<CaptureHost>()));
+        cx.executor()
+            .advance_clock(HOST_FALLBACK + Duration::from_millis(100)); // token-check: allow: test clock
+        cx.run_until_parked();
+        assert!(cx.update(|cx| cx.has_global::<CaptureHost>()));
     }
 }

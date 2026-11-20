@@ -253,14 +253,14 @@ pub fn frames(w: &mut SessionWriter, run: RunId, n: usize, seed: u64, hz: u32) {
     }
 }
 
-/// One run of synthetic data: `logs` log records, `requests` requests and `frames` frames at
-/// 120 Hz, published as a single snapshot.
-pub fn session(
+/// A writer holding one run of synthetic data (`logs_n` log records, `requests_n` requests and
+/// `frames_n` frames at 120 Hz), not yet published.
+pub fn writer(
     seed: u64,
     logs_n: usize,
     requests_n: usize,
     frames_n: usize,
-) -> std::sync::Arc<crate::Snapshot> {
+) -> (SessionWriter, RunId) {
     use crate::clock::{Calibration, RunClock};
     use crate::run::{AppInfo, Mode};
     let mut w = SessionWriter::new(0);
@@ -284,13 +284,28 @@ pub fn session(
     logs(&mut w, run, logs_n, seed);
     requests(&mut w, run, requests_n, seed);
     frames(&mut w, run, frames_n, seed, 120);
-    w.publish()
+    (w, run)
+}
+
+/// One run of synthetic data, published as a single snapshot.
+pub fn session(
+    seed: u64,
+    logs_n: usize,
+    requests_n: usize,
+    frames_n: usize,
+) -> std::sync::Arc<crate::Snapshot> {
+    writer(seed, logs_n, requests_n, frames_n).0.publish()
+}
+
+/// The writer behind [`stress_session`], for scenarios that keep appending to it.
+pub fn stress_writer(seed: u64) -> (SessionWriter, RunId) {
+    writer(seed, 1_000_000, 100_000, 72_000)
 }
 
 /// The `fdt bench-ui` dataset: 1,000,000 logs, 100,000 requests and 72,000 frames (10 minutes
 /// at 120 Hz) in one run.
 pub fn stress_session(seed: u64) -> std::sync::Arc<crate::Snapshot> {
-    session(seed, 1_000_000, 100_000, 72_000)
+    stress_writer(seed).0.publish()
 }
 
 #[cfg(test)]
