@@ -3,8 +3,9 @@
 use crate::actions::{
     AppListConnect, AppListNext, AppListPrev, ClearSelection, CloseWindow, Collapse, Expand,
     FocusSearch, FollowLatest, GoBack, GoForward, GoToFirst, Hide, HideOthers, Minimize,
-    NewSession, NewWindow, OpenDetails, OpenPalette, OpenSettings, Quit, SearchEverywhere,
-    SelectNext, SelectPrevious, ShowShortcuts, ToggleExpand, ToggleFullScreen, ToggleRecording,
+    NewSession, NewWindow, NextFrame, OpenDetails, OpenPalette, OpenSettings, PreviousFrame, Quit,
+    SearchEverywhere, SelectNext, SelectPrevious, ShowShortcuts, ToggleExpand, ToggleFullScreen,
+    ToggleRecording, ZoomIn, ZoomOut, ZoomToFit,
 };
 use crate::nav::Tool;
 use gpui_kit::KeyBinding;
@@ -30,6 +31,13 @@ pub const PALETTE_CONTEXT: &str = "Palette";
 
 /// Key context of gpui-kit's data tables.
 pub const TABLE_CONTEXT: &str = "DataTable";
+
+/// Key context of time-axis views (the Timeline lanes, the raw trace and the flame chart), where
+/// the zoom keys apply. A view sets it on its focusable element.
+pub const LANES_CONTEXT: &str = "Lanes";
+
+/// Key context of the frame chart, where the arrow keys step between frames.
+pub const FRAME_CHART_CONTEXT: &str = "FrameChart";
 
 /// `mac` on macOS, `other` everywhere else.
 pub fn platform(mac: &'static str, other: &'static str) -> &'static str {
@@ -109,6 +117,17 @@ pub fn bindings() -> Vec<KeyBinding> {
         // Enter opens the selected request's details, as it does a log line's.
         KeyBinding::new("enter", OpenDetails, table),
     ]);
+    let lanes = Some(LANES_CONTEXT);
+    out.extend([
+        KeyBinding::new(platform("cmd-=", "ctrl-="), ZoomIn, lanes),
+        KeyBinding::new(platform("cmd--", "ctrl--"), ZoomOut, lanes),
+        KeyBinding::new(platform("cmd-0", "ctrl-0"), ZoomToFit, lanes),
+    ]);
+    let chart = Some(FRAME_CHART_CONTEXT);
+    out.extend([
+        KeyBinding::new("left", PreviousFrame, chart),
+        KeyBinding::new("right", NextFrame, chart),
+    ]);
     // The palette's own movement; Enter and Escape reach it through the input's events.
     let palette = Some(PALETTE_CONTEXT);
     out.extend([
@@ -147,11 +166,97 @@ pub fn shortcut_hint(
     use gpui_kit::component::kbd::Kbd;
     Kbd::binding_for_action_in(action, shell_focus, window)
         .or_else(|| Kbd::binding_for_action(action, None, window))
+        // Keys that only a focused view has (zoom, the frame arrows) are listed all the same.
+        .or_else(|| Kbd::binding_for_action(action, Some(LANES_CONTEXT), window))
+        .or_else(|| Kbd::binding_for_action(action, Some(FRAME_CHART_CONTEXT), window))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn os() -> gpui_kit::OperatingSystem {
+        if cfg!(target_os = "macos") {
+            gpui_kit::OperatingSystem::Mac
+        } else {
+            gpui_kit::OperatingSystem::Linux
+        }
+    }
+
+    fn keys_of(action: &str) -> Vec<(String, Option<String>)> {
+        bindings()
+            .iter()
+            .filter(|b| b.action().name() == action)
+            .map(|b| {
+                let keys = b
+                    .keystrokes()
+                    .iter()
+                    .map(|k| k.inner().unparse(os()))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (keys, b.predicate().map(|p| p.to_string()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn zoom_and_frame_keys_live_in_their_own_contexts() {
+        use crate::actions::*;
+        use gpui_kit::Action as _;
+        let want = |action: &str, keys: &str, ctx: &str| {
+            let found = keys_of(action);
+            assert_eq!(
+                found,
+                [(keys.to_string(), Some(ctx.to_string()))],
+                "{action}"
+            );
+        };
+        want(ZoomIn.name(), platform("cmd-=", "ctrl-="), LANES_CONTEXT);
+        want(ZoomOut.name(), platform("cmd--", "ctrl--"), LANES_CONTEXT);
+        want(ZoomToFit.name(), platform("cmd-0", "ctrl-0"), LANES_CONTEXT);
+        want(PreviousFrame.name(), "left", FRAME_CHART_CONTEXT);
+        want(NextFrame.name(), "right", FRAME_CHART_CONTEXT);
+        assert_eq!(
+            (LANES_CONTEXT, FRAME_CHART_CONTEXT),
+            ("Lanes", "FrameChart")
+        );
+    }
+
+    #[test]
+    fn the_new_keys_clash_with_no_other_binding() {
+        use crate::actions::*;
+        use gpui_kit::Action as _;
+        let mine = [
+            ZoomIn.name(),
+            ZoomOut.name(),
+            ZoomToFit.name(),
+            PreviousFrame.name(),
+            NextFrame.name(),
+        ];
+        for b in bindings() {
+            if mine.contains(&b.action().name()) {
+                continue;
+            }
+            let keys = b
+                .keystrokes()
+                .iter()
+                .map(|k| k.inner().unparse(os()))
+                .collect::<Vec<_>>()
+                .join(" ");
+            for action in mine {
+                let theirs = keys_of(action);
+                // A shared key is fine in another context, never in the same one.
+                assert!(
+                    !theirs.iter().any(|(k, c)| *k == keys
+                        && (c.is_none()
+                            || b.predicate().is_none()
+                            || *c == b.predicate().map(|p| p.to_string()))),
+                    "{keys} for {} clashes with {action}",
+                    b.action().name()
+                );
+            }
+        }
+    }
 
     #[test]
     fn platform_picks_the_os_variant() {

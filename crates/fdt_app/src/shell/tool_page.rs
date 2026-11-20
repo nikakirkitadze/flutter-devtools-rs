@@ -18,10 +18,7 @@ pub fn empty_copy(tool: Tool, connected: bool) -> (String, String) {
 }
 
 fn static_copy(tool: Tool, connected: bool) -> (&'static str, String) {
-    let not_built = matches!(
-        tool,
-        Tool::Timeline | Tool::Performance | Tool::Memory | Tool::Widgets | Tool::State
-    );
+    let not_built = matches!(tool, Tool::Memory | Tool::Widgets | Tool::State);
     if connected && not_built {
         return (
             "Not available yet",
@@ -146,13 +143,7 @@ mod tests {
 
     #[test]
     fn not_built_tools_say_so_when_connected() {
-        for tool in [
-            Tool::Timeline,
-            Tool::Performance,
-            Tool::Memory,
-            Tool::Widgets,
-            Tool::State,
-        ] {
+        for tool in [Tool::Memory, Tool::Widgets, Tool::State] {
             let (heading, body) = empty_copy(tool, true);
             assert_eq!(heading, "Not available yet");
             assert_eq!(
@@ -163,6 +154,9 @@ mod tests {
                 )
             );
         }
+        // Timeline and Performance are built: they show their own idle copy.
+        assert_eq!(empty_copy(Tool::Timeline, true).0, "Nothing recorded yet");
+        assert_eq!(empty_copy(Tool::Performance, true).0, "No frames yet");
         assert_eq!(empty_copy(Tool::Logs, false).0, "No logs yet");
         assert_eq!(empty_copy(Tool::Logs, true).0, "No logs yet");
     }

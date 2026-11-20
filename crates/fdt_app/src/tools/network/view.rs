@@ -143,6 +143,7 @@ pub struct NetworkView {
 }
 
 impl EventEmitter<NetworkEvent> for NetworkView {}
+impl EventEmitter<crate::tools::OpenLocation> for NetworkView {}
 
 impl NetworkView {
     pub fn new(session: Entity<SessionModel>, window: &mut Window, cx: &mut Context<Self>) -> Self {

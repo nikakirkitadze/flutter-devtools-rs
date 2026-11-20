@@ -4,7 +4,8 @@
 //! palette opens and merged in, because scanning a long session must not block the UI thread.
 
 use super::items::{
-    ItemKind, PaletteItem, PaletteModel, REQUEST_ITEM_LIMIT, command_items, request_items,
+    ItemKind, PaletteItem, PaletteModel, REQUEST_ITEM_LIMIT, SLOW_FRAME_ITEM_LIMIT, command_items,
+    frame_items, request_items, slow_frame_items,
 };
 use super::recent::record_recent;
 use crate::actions::OpenPalette;
@@ -46,6 +47,7 @@ struct PaletteView {
     last_query: SharedString,
     shell: WeakEntity<MainWindow>,
     shell_focus: FocusHandle,
+    snapshot: Arc<Snapshot>,
     _subs: Vec<Subscription>,
     _load: Task<()>,
 }
@@ -92,7 +94,12 @@ impl PaletteView {
             cx.observe(&model, |_, _, cx| cx.notify()),
         ];
         // R15: the request scan runs off the UI thread; the commands are usable meanwhile.
-        let scan = cx.background_spawn(async move { request_items(&snapshot, REQUEST_ITEM_LIMIT) });
+        let scanned = snapshot.clone();
+        let scan = cx.background_spawn(async move {
+            let mut items = request_items(&scanned, REQUEST_ITEM_LIMIT);
+            items.extend(slow_frame_items(&scanned, SLOW_FRAME_ITEM_LIMIT));
+            items
+        });
         let target = model.clone();
         let load = cx.spawn(async move |this, cx| {
             let items = scan.await;
@@ -128,6 +135,7 @@ impl PaletteView {
             last_query: SharedString::default(),
             shell,
             shell_focus,
+            snapshot,
             _subs: subs,
             _load: load,
         }
@@ -135,8 +143,11 @@ impl PaletteView {
 
     fn query_changed(&mut self, query: &str, cx: &mut Context<Self>) {
         let recents = settings(cx).recent_commands.clone();
+        // A frame number is a lookup per run, so it stays on the UI thread.
+        let exact = frame_items(&self.snapshot, query);
         self.model.update(cx, |m, cx| {
             m.set_query(query, &recents);
+            m.set_exact(exact);
             cx.notify();
         });
         self.selected = 0;
@@ -618,5 +629,61 @@ mod tests {
             s.logs_view().read(cx).search_query().to_string()
         });
         assert_eq!(q, "zzqq");
+    }
+
+    fn frames_shell(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<crate::shell::MainWindow>,
+        &mut gpui_kit::VisualTestContext,
+    ) {
+        let snap = snapshot(|w, run| {
+            for (n, ms) in [8u64, 40, 9].into_iter().enumerate() {
+                w.push_frame(crate::test_support::frame_at(
+                    run,
+                    n as u64 + 10,
+                    1_000 + n as u64 * 100,
+                    ms,
+                    1,
+                ));
+            }
+        });
+        open_shell_snapshot(cx, snap)
+    }
+
+    #[gpui_kit::test]
+    fn slow_frames_come_in_with_the_background_scan(cx: &mut TestAppContext) {
+        let (shell, cx) = frames_shell(cx);
+        open(cx);
+        cx.run_until_parked();
+        cx.simulate_input("janky");
+        cx.run_until_parked();
+        let m = model(&shell, cx);
+        assert_eq!(
+            m.read_with(cx, |m, _| m.item(0).label.clone()),
+            "Frame #11 \u{b7} 40.0 ms \u{b7} Janky"
+        );
+        press(cx, "enter", "enter");
+        let loc = shell.read_with(cx, |s, _| s.current().clone());
+        assert_eq!(loc.page, Page::Tool(Tool::Performance));
+        assert!(matches!(loc.selection, Some(Selection::Frame(_))));
+    }
+
+    #[gpui_kit::test]
+    fn a_frame_number_looks_the_frame_up_first(cx: &mut TestAppContext) {
+        let (shell, cx) = frames_shell(cx);
+        open(cx);
+        cx.run_until_parked();
+        cx.simulate_input("#12");
+        cx.run_until_parked();
+        let m = model(&shell, cx);
+        assert_eq!(m.read_with(cx, |m, _| m.item(0).label.clone()), "Frame #12");
+        press(cx, "enter", "enter");
+        let loc = shell.read_with(cx, |s, _| s.current().clone());
+        assert_eq!(loc.page, Page::Tool(Tool::Performance));
+        let Some(Selection::Frame(id)) = loc.selection else {
+            panic!("selects a frame")
+        };
+        assert_eq!(id.seq, 2);
     }
 }

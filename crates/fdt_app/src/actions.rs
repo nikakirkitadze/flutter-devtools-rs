@@ -50,7 +50,20 @@ gpui_kit::actions!(
         GoToFirst,
         FocusSearch,
         SearchEverywhere,
-        LoadFullBody
+        LoadFullBody,
+        ShowFramesTab,
+        ShowCpuTab,
+        ShowRebuildsTab,
+        ShowTraceTab,
+        ToggleTraceWidgetBuilds,
+        NextSlowFrame,
+        PreviousSlowFrame,
+        FetchCpuSamples,
+        ZoomIn,
+        ZoomOut,
+        ZoomToFit,
+        PreviousFrame,
+        NextFrame
     ]
 );
 

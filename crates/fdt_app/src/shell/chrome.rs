@@ -76,13 +76,15 @@ fn sidebar_key(shell: &MainWindow, cx: &App) -> String {
     )
 }
 
-fn strip_key(shell: &MainWindow, cx: &App) -> String {
+pub(super) fn strip_key(shell: &MainWindow, cx: &App) -> String {
     let session = shell.session.read(cx);
     format!(
         "{:?}",
         (
             cx.appearance(),
             session.snapshot().generation,
+            // Bars are coloured and sized against the refresh-rate budget.
+            session.snapshot().latest_budget_us(),
             session.recording_elapsed(),
             shell.current().range,
             // The width the strip was last painted at: the layout is bucketed per pixel.

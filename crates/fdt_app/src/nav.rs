@@ -70,6 +70,8 @@ pub enum Selection {
     Log(EntryId),
     Request(EntryId),
     Socket(EntryId),
+    /// A frame in the Performance tool.
+    Frame(EntryId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

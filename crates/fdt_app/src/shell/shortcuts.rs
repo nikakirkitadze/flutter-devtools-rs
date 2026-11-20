@@ -194,4 +194,22 @@ mod tests {
         cx.run_until_parked();
         assert!(cx.windows().is_empty());
     }
+
+    #[gpui_kit::test]
+    fn the_cheat_sheet_lists_the_zoom_and_frame_shortcuts(cx: &mut TestAppContext) {
+        let (_shell, cx) = open_shell(cx);
+        cx.dispatch_action(ShowShortcuts);
+        cx.run_until_parked();
+        for id in [
+            "lanes.zoom_in",
+            "lanes.zoom_out",
+            "lanes.zoom_fit",
+            "frames.previous",
+            "frames.next",
+        ] {
+            let row: &'static str = Box::leak(format!("shortcut-row-{id}").into_boxed_str());
+            assert!(exists(cx, row), "{id}");
+        }
+        assert!(!exists(cx, "shortcut-row-perf.fetch_cpu"));
+    }
 }

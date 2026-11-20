@@ -6,7 +6,9 @@ use super::registry::{Group, commands};
 use crate::nav::{Location, Page, Selection, Tool};
 use crate::tools::network::model::status_text;
 use fdt_store::Snapshot;
-use std::collections::HashSet;
+use fdt_store::frames::{FrameRecord, FrameStatus, frame_status};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashSet};
 
 /// How many requests the palette offers.
 pub const REQUEST_ITEM_LIMIT: usize = 2_000;
@@ -96,6 +98,104 @@ pub fn request_items(snap: &Snapshot, limit: usize) -> Vec<PaletteItem> {
     out
 }
 
+/// How many of the slowest frames the palette offers.
+pub const SLOW_FRAME_ITEM_LIMIT: usize = 20;
+
+/// The frame number a query asks for: `7`, `#7`, `frame 7`, `Frame #7` or `frame7`.
+fn frame_number(query: &str) -> Option<u64> {
+    let q = query.trim();
+    let rest = match q.get(..5) {
+        Some(head) if head.eq_ignore_ascii_case("frame") => q[5..].trim_start(),
+        _ => q,
+    };
+    let digits = rest.strip_prefix('#').unwrap_or(rest);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+fn status_word(status: FrameStatus) -> &'static str {
+    match status {
+        FrameStatus::Ok => "OK",
+        FrameStatus::Slow => "Slow",
+        FrameStatus::Janky => "Janky",
+    }
+}
+
+/// `42.3 ms`, from microseconds.
+fn frame_time(us: u32) -> String {
+    format!("{:.1} ms", f64::from(us) / 1_000.0)
+}
+
+fn frame_item(f: &FrameRecord, label: String, detail: Option<String>) -> PaletteItem {
+    PaletteItem {
+        id: format!("frame.{}.{}", f.id.run.0, f.id.seq),
+        label,
+        detail,
+        keywords: Vec::new(),
+        group: Group::Data,
+        kind: ItemKind::Navigate(Location {
+            page: Page::Tool(Tool::Performance),
+            selection: Some(Selection::Frame(f.id)),
+            range: None,
+        }),
+    }
+}
+
+/// "Frame #N" when `query` is a frame number: the newest run that has that frame. Binary
+/// searches per run, so it is cheap enough for every keystroke.
+pub fn frame_items(snap: &Snapshot, query: &str) -> Vec<PaletteItem> {
+    let Some(number) = frame_number(query) else {
+        return Vec::new();
+    };
+    snap.runs
+        .iter()
+        .rev()
+        .find_map(|run| {
+            let f = snap.frames.get(snap.frames.by_number(run.id, number)?)?;
+            let status = frame_status(f.time_us(), snap.frame_budget_us(f.run));
+            let detail = format!("{} \u{b7} {}", frame_time(f.time_us()), status_word(status));
+            Some(frame_item(f, format!("Frame #{number}"), Some(detail)))
+        })
+        .into_iter()
+        .collect()
+}
+
+/// The `limit` slowest slow or janky frames, slowest first, as "Frame #N · 42.3 ms · Janky".
+///
+/// Reads every slow frame, so it runs off the UI thread.
+pub fn slow_frame_items(snap: &Snapshot, limit: usize) -> Vec<PaletteItem> {
+    let slow = snap.frames.slow();
+    // The `limit` largest by time, ties going to the newer frame.
+    let mut heap: BinaryHeap<Reverse<(u32, u32)>> = BinaryHeap::new();
+    for i in 0..slow.len() {
+        let Some(&seq) = slow.get(i) else { continue };
+        let Some(f) = snap.frames.get(seq as usize) else {
+            continue;
+        };
+        heap.push(Reverse((f.time_us(), seq)));
+        if heap.len() > limit {
+            heap.pop();
+        }
+    }
+    let mut top: Vec<(u32, u32)> = heap.into_iter().map(|Reverse(k)| k).collect();
+    top.sort_unstable_by(|a, b| b.cmp(a));
+    top.into_iter()
+        .filter_map(|(us, seq)| {
+            let f = snap.frames.get(seq as usize)?;
+            let status = frame_status(us, snap.frame_budget_us(f.run));
+            let label = format!(
+                "Frame #{} \u{b7} {} \u{b7} {}",
+                f.number,
+                frame_time(us),
+                status_word(status)
+            );
+            Some(frame_item(f, label, None))
+        })
+        .collect()
+}
+
 /// "Search logs for “query”".
 pub fn search_logs_item(query: &str) -> PaletteItem {
     PaletteItem {
@@ -115,6 +215,8 @@ pub struct PaletteModel {
     query: String,
     ranked: Vec<usize>,
     search: Option<PaletteItem>,
+    /// Items the query itself asks for (a frame number), listed before the ranked ones.
+    exact: Vec<PaletteItem>,
 }
 
 impl PaletteModel {
@@ -126,9 +228,15 @@ impl PaletteModel {
             query: String::new(),
             ranked: Vec::new(),
             search: None,
+            exact: Vec::new(),
         };
         model.set_query("", recent_ids);
         model
+    }
+
+    /// Sets the items the current query asks for; they come first, whatever the ranking says.
+    pub fn set_exact(&mut self, exact: Vec<PaletteItem>) {
+        self.exact = exact;
     }
 
     /// Re-ranks for `query`. Synchronous: it stays inside the per-keystroke budget.
@@ -145,6 +253,8 @@ impl PaletteModel {
         self.ranked = rank(query, &self.haystacks, &recent);
         let trimmed = query.trim();
         self.search = (!trimmed.is_empty()).then(|| search_logs_item(trimmed));
+        // A new query clears what the last one asked for; the caller sets it again.
+        self.exact.clear();
     }
 
     /// Adds items that arrived later (the requests) and re-ranks the current query.
@@ -153,7 +263,9 @@ impl PaletteModel {
             .extend(more.iter().map(PaletteItem::haystack));
         self.items.extend(more);
         let query = std::mem::take(&mut self.query);
+        let exact = std::mem::take(&mut self.exact);
         self.set_query(&query, recent_ids);
+        self.exact = exact;
     }
 
     pub fn query(&self) -> &str {
@@ -165,14 +277,18 @@ impl PaletteModel {
         &self.ranked
     }
 
-    /// Rows shown: the ranked items, then the "search logs" item when there is a query.
+    /// Rows shown: the items the query asks for, the ranked items, then the "search logs" item
+    /// when there is a query.
     pub fn row_count(&self) -> usize {
-        self.ranked.len() + usize::from(self.search.is_some())
+        self.exact.len() + self.ranked.len() + usize::from(self.search.is_some())
     }
 
     /// The item shown in `row`.
     pub fn item(&self, row: usize) -> &PaletteItem {
-        match self.ranked.get(row) {
+        if let Some(item) = self.exact.get(row) {
+            return item;
+        }
+        match self.ranked.get(row - self.exact.len()) {
             Some(&i) => &self.items[i],
             None => self.search.as_ref().expect("row in range"),
         }
@@ -272,5 +388,100 @@ mod tests {
         let recents = vec!["tool.logs".to_string()];
         let m = PaletteModel::new(command_items(), &recents);
         assert_eq!(m.item(0).id, "tool.logs");
+    }
+
+    /// Frames at 60 Hz in two runs. Run 1 has frames 0..=3, run 2 has frames 2 and 7.
+    fn frames_in_two_runs() -> std::sync::Arc<Snapshot> {
+        use crate::test_support::frame_at;
+        snapshot(|w, run| {
+            for (n, build) in [8u64, 20, 40, 9].into_iter().enumerate() {
+                w.push_frame(frame_at(run, n as u64, 1_000 + n as u64 * 100, build, 1));
+            }
+            w.end_run(run, fdt_store::time::SessionTime(5_000_000_000));
+            let clock = fdt_store::clock::RunClock::new(
+                0,
+                fdt_store::clock::Calibration {
+                    skew_us: 0,
+                    timeline_to_wall_us: 0,
+                },
+            );
+            let second = w.start_run(
+                crate::test_support::app_info("demo"),
+                clock,
+                fdt_store::time::SessionTime(10_000_000_000),
+            );
+            w.push_frame(frame_at(second, 2, 12_000, 30, 1));
+            w.push_frame(frame_at(second, 7, 12_100, 5, 1));
+        })
+    }
+
+    #[test]
+    fn frame_number_query_finds_the_frame() {
+        let snap = frames_in_two_runs();
+        for query in ["#1", "1", "frame 1", "Frame #1", "frame#1", "  #1 "] {
+            let items = frame_items(&snap, query);
+            assert_eq!(items.len(), 1, "{query:?}");
+            assert_eq!(items[0].label, "Frame #1");
+            assert_eq!(items[0].group, Group::Data);
+            let ItemKind::Navigate(loc) = &items[0].kind else {
+                panic!("navigates")
+            };
+            assert_eq!(loc.page, Page::Tool(Tool::Performance));
+            assert_eq!(loc.range, None);
+            let Some(Selection::Frame(id)) = loc.selection else {
+                panic!("selects a frame")
+            };
+            assert_eq!((id.run.0, id.seq), (1, 1));
+        }
+        // The newest run that has the number wins.
+        let items = frame_items(&snap, "#2");
+        let ItemKind::Navigate(loc) = &items[0].kind else {
+            panic!("navigates")
+        };
+        let Some(Selection::Frame(id)) = loc.selection else {
+            panic!("selects a frame")
+        };
+        assert_eq!(id.run.0, 2);
+        // Only a frame number is a frame query, and only a frame that exists is offered.
+        for query in ["", "frame", "#", "abc", "1a", "#99", "-1", "frames 1"] {
+            assert!(frame_items(&snap, query).is_empty(), "{query:?}");
+        }
+    }
+
+    #[test]
+    fn slow_frame_items_are_slowest_first() {
+        let snap = frames_in_two_runs();
+        let items = slow_frame_items(&snap, 20);
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Frame #2 \u{b7} 40.0 ms \u{b7} Janky",
+                "Frame #2 \u{b7} 30.0 ms \u{b7} Slow",
+                "Frame #1 \u{b7} 20.0 ms \u{b7} Slow",
+            ]
+        );
+        // Ids are unique even though two frames share a number.
+        let ids: HashSet<_> = items.iter().map(|i| i.id.clone()).collect();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(slow_frame_items(&snap, 2).len(), 2);
+        assert!(slow_frame_items(&Snapshot::empty(), 20).is_empty());
+        let ItemKind::Navigate(loc) = &items[1].kind else {
+            panic!("navigates")
+        };
+        assert!(matches!(loc.selection, Some(Selection::Frame(id)) if id.run.0 == 2));
+    }
+
+    #[test]
+    fn exact_items_come_before_ranked_ones() {
+        let snap = frames_in_two_runs();
+        let mut m = PaletteModel::new(command_items(), &[]);
+        m.set_query("#1", &[]);
+        let before = m.row_count();
+        m.set_exact(frame_items(&snap, "#1"));
+        assert_eq!(m.row_count(), before + 1);
+        assert_eq!(m.item(0).label, "Frame #1");
+        m.set_exact(Vec::new());
+        assert_eq!(m.row_count(), before);
     }
 }

@@ -229,6 +229,7 @@ pub struct LogsView {
 }
 
 impl EventEmitter<LogsEvent> for LogsView {}
+impl EventEmitter<crate::tools::OpenLocation> for LogsView {}
 
 impl LogsView {
     pub fn new(session: Entity<SessionModel>, window: &mut Window, cx: &mut Context<Self>) -> Self {

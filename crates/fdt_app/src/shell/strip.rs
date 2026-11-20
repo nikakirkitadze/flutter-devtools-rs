@@ -4,7 +4,7 @@
 use crate::nav::{Location, TimeRange};
 use crate::shell::MainWindow;
 use fdt_store::Snapshot;
-use fdt_store::frames::strip_bars;
+use fdt_store::frames::{FrameStatus, frame_status, strip_bars};
 use fdt_store::time::{RunId, SessionTime};
 use fdt_ui::theme::TokensExt as _;
 use fdt_ui::tokens::{alpha, font, layout, space};
@@ -21,10 +21,6 @@ use std::sync::Arc;
 const SEC_NS: u64 = 1_000_000_000;
 /// The shortest span the strip shows.
 const MIN_SPAN_NS: u64 = 10 * SEC_NS;
-/// A frame within this is on budget (60 Hz).
-const BUDGET_US: u32 = 16_700;
-/// A frame within this is slow; beyond it is janky. Also the full height of a bar.
-const JANK_US: u32 = 33_400;
 /// A press that moves less than this many pixels is a click, not a drag.
 const MIN_DRAG_PX: f32 = 3.0; // token-check: allow: interaction threshold, not a visual size
 /// The narrowest gap (in pixels) a "Run N" label needs.
@@ -80,24 +76,25 @@ pub struct StripLayout {
     pub dividers: Vec<(f32, RunId)>,
 }
 
-/// Lays the strip out. Visits at most about `2 * width_px` buckets, never every frame.
+/// Lays the strip out, judging each bar against the latest run's refresh-rate budget: a bar is
+/// `Ok` within the budget, `Slow` within twice it and `Janky` beyond, and twice the budget is the
+/// full height. Visits at most about `2 * width_px` buckets, never every frame.
 pub fn strip_layout(snap: &Snapshot, span: TimeRange, width_px: usize) -> StripLayout {
     let dur = span.duration_ns().max(1) as f64;
     let w = width_px as f64;
     let x_of = |t: SessionTime| (t.0.saturating_sub(span.start.0) as f64 / dur * w) as f32;
+    let budget = snap.latest_budget_us();
     let bars = strip_bars(&snap.frames, span, width_px)
         .into_iter()
         .map(|b| {
             let x = x_of(b.start);
             let width = (x_of(b.end) - x).max(1.0);
-            let kind = if b.max_us <= BUDGET_US {
-                BarKind::Ok
-            } else if b.max_us <= JANK_US {
-                BarKind::Slow
-            } else {
-                BarKind::Janky
+            let kind = match frame_status(b.max_us, budget) {
+                FrameStatus::Ok => BarKind::Ok,
+                FrameStatus::Slow => BarKind::Slow,
+                FrameStatus::Janky => BarKind::Janky,
             };
-            let h = (b.max_us as f32 / JANK_US as f32).min(1.0);
+            let h = (b.max_us as f32 / (2.0 * budget as f32)).min(1.0);
             (x, width, h, kind)
         })
         .collect();
@@ -496,7 +493,7 @@ mod tests {
     #[test]
     fn bar_kind_boundaries() {
         let snap = snapshot(|w, run| {
-            for (i, us) in [16_700u32, 16_701, 33_400, 33_401].into_iter().enumerate() {
+            for (i, us) in [16_667u32, 16_668, 33_334, 33_335].into_iter().enumerate() {
                 w.push_frame(frame(run, i as u64, 1_000 + i as u64 * 2_000, us));
             }
         });
@@ -508,6 +505,32 @@ mod tests {
             [BarKind::Ok, BarKind::Slow, BarKind::Slow, BarKind::Janky]
         );
         assert_eq!(layout.bars[2].2, 1.0);
+    }
+
+    #[test]
+    fn strip_uses_the_refresh_budget() {
+        let at = |hz: Option<f32>| {
+            snapshot(|w, run| {
+                if let Some(hz) = hz {
+                    w.set_refresh_rate(run, hz);
+                }
+                w.push_frame(crate::test_support::frame_at(run, 0, 1_000, 10, 5));
+            })
+        };
+        let bar = |snap: &Snapshot| {
+            let span = session_span(snap, None);
+            strip_layout(snap, span, 400).bars[0]
+        };
+        // 10 ms against an 8.3 ms budget is slow, and its bar is 10 / (2 x 8.333) tall.
+        let fast_screen = bar(&at(Some(120.0)));
+        assert_eq!(fast_screen.3, BarKind::Slow);
+        assert!((fast_screen.2 - 10_000.0 / 16_666.0).abs() < 0.001);
+        // The same frame at 60 Hz is on budget, at about 0.3 of the height.
+        let slow_screen = bar(&at(Some(60.0)));
+        assert_eq!(slow_screen.3, BarKind::Ok);
+        assert!((slow_screen.2 - 10_000.0 / 33_334.0).abs() < 0.001);
+        // An unknown rate counts as 60 Hz.
+        assert_eq!(bar(&at(None)).3, BarKind::Ok);
     }
 
     #[test]

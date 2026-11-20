@@ -1,12 +1,14 @@
 //! The command registry the palette, menus and cheat sheet are built from.
 
 use crate::actions::{
-    About, ClearSelection, CloseWindow, Collapse, ConnectToApp, Disconnect, Expand, FocusSearch,
-    FollowLatest, GoBack, GoForward, GoToFirst, LoadFullBody, Minimize, NewSession, NewWindow,
-    OpenDetails, OpenSettings, Quit, SearchEverywhere, SelectNext, SelectPrevious, ShowLogs,
-    ShowMemory, ShowNetwork, ShowPerformance, ShowShortcuts, ShowState, ShowTimeline, ShowWidgets,
-    StopWaiting, ToggleExpand, ToggleFrameHud, ToggleFullScreen, ToggleRecording, UseDarkTheme,
-    UseLightTheme, UseSystemTheme, Zoom,
+    About, ClearSelection, CloseWindow, Collapse, ConnectToApp, Disconnect, Expand,
+    FetchCpuSamples, FocusSearch, FollowLatest, GoBack, GoForward, GoToFirst, LoadFullBody,
+    Minimize, NewSession, NewWindow, NextFrame, NextSlowFrame, OpenDetails, OpenSettings,
+    PreviousFrame, PreviousSlowFrame, Quit, SearchEverywhere, SelectNext, SelectPrevious,
+    ShowCpuTab, ShowFramesTab, ShowLogs, ShowMemory, ShowNetwork, ShowPerformance, ShowRebuildsTab,
+    ShowShortcuts, ShowState, ShowTimeline, ShowTraceTab, ShowWidgets, StopWaiting, ToggleExpand,
+    ToggleFrameHud, ToggleFullScreen, ToggleRecording, ToggleTraceWidgetBuilds, UseDarkTheme,
+    UseLightTheme, UseSystemTheme, Zoom, ZoomIn, ZoomOut, ZoomToFit,
 };
 #[cfg(target_os = "macos")]
 use crate::actions::{Hide, HideOthers, ShowAll};
@@ -278,6 +280,97 @@ pub fn commands() -> Vec<CommandSpec> {
             action: || Box::new(GoToFirst),
         },
         CommandSpec {
+            id: "perf.frames",
+            label: "Show Frames",
+            keywords: &["performance", "frame chart", "jank"],
+            group: Group::Navigation,
+            action: || Box::new(ShowFramesTab),
+        },
+        CommandSpec {
+            id: "perf.cpu",
+            label: "Show CPU Profile",
+            keywords: &["performance", "flame", "samples"],
+            group: Group::Navigation,
+            action: || Box::new(ShowCpuTab),
+        },
+        CommandSpec {
+            id: "perf.rebuilds",
+            label: "Show Rebuilds",
+            keywords: &["performance", "widgets", "build"],
+            group: Group::Navigation,
+            action: || Box::new(ShowRebuildsTab),
+        },
+        CommandSpec {
+            id: "perf.trace",
+            label: "Show Raw Trace",
+            keywords: &["performance", "timeline", "events"],
+            group: Group::Navigation,
+            action: || Box::new(ShowTraceTab),
+        },
+        CommandSpec {
+            id: "perf.trace_builds",
+            label: "Trace Widget Builds",
+            keywords: &["performance", "rebuilds", "toggle"],
+            group: Group::View,
+            action: || Box::new(ToggleTraceWidgetBuilds),
+        },
+        CommandSpec {
+            id: "perf.next_slow",
+            label: "Next Slow Frame",
+            keywords: &["performance", "jank", "frame"],
+            group: Group::View,
+            action: || Box::new(NextSlowFrame),
+        },
+        CommandSpec {
+            id: "perf.previous_slow",
+            label: "Previous Slow Frame",
+            keywords: &["performance", "jank", "frame"],
+            group: Group::View,
+            action: || Box::new(PreviousSlowFrame),
+        },
+        CommandSpec {
+            id: "perf.fetch_cpu",
+            label: "Fetch CPU Samples Now",
+            keywords: &["performance", "profile", "refresh"],
+            group: Group::View,
+            action: || Box::new(FetchCpuSamples),
+        },
+        CommandSpec {
+            id: "lanes.zoom_in",
+            label: "Zoom In",
+            keywords: &["timeline", "time", "magnify"],
+            group: Group::View,
+            action: || Box::new(ZoomIn),
+        },
+        CommandSpec {
+            id: "lanes.zoom_out",
+            label: "Zoom Out",
+            keywords: &["timeline", "time"],
+            group: Group::View,
+            action: || Box::new(ZoomOut),
+        },
+        CommandSpec {
+            id: "lanes.zoom_fit",
+            label: "Zoom to Fit",
+            keywords: &["timeline", "time", "reset"],
+            group: Group::View,
+            action: || Box::new(ZoomToFit),
+        },
+        CommandSpec {
+            id: "frames.previous",
+            label: "Previous Frame",
+            keywords: &["performance", "left"],
+            group: Group::View,
+            action: || Box::new(PreviousFrame),
+        },
+        CommandSpec {
+            id: "frames.next",
+            label: "Next Frame",
+            keywords: &["performance", "right"],
+            group: Group::View,
+            action: || Box::new(NextFrame),
+        },
+        CommandSpec {
             id: "theme.system",
             label: "Theme: Match System",
             keywords: &["appearance"],
@@ -414,5 +507,46 @@ mod tests {
         let cmds = commands();
         let memory = cmds.iter().find(|c| c.id == "tool.memory").unwrap();
         assert_eq!(haystack(memory), "Go to Memory heap leaks gc");
+    }
+
+    #[test]
+    fn registry_lists_m3_commands() {
+        use crate::keymap::bindings;
+        use crate::menus::app_menus;
+        use gpui_kit::MenuItem;
+        let cmds = commands();
+        let bound: Vec<&str> = bindings().iter().map(|b| b.action().name()).collect();
+        let mut menu_actions = Vec::new();
+        for m in app_menus() {
+            for item in &m.items {
+                if let MenuItem::Action { action, .. } = item {
+                    menu_actions.push(action.name());
+                }
+            }
+        }
+        for (id, label, shortcut) in [
+            ("perf.frames", "Show Frames", false),
+            ("perf.cpu", "Show CPU Profile", false),
+            ("perf.rebuilds", "Show Rebuilds", false),
+            ("perf.trace", "Show Raw Trace", false),
+            ("perf.trace_builds", "Trace Widget Builds", false),
+            ("perf.next_slow", "Next Slow Frame", false),
+            ("perf.previous_slow", "Previous Slow Frame", false),
+            ("perf.fetch_cpu", "Fetch CPU Samples Now", false),
+            ("lanes.zoom_in", "Zoom In", true),
+            ("lanes.zoom_out", "Zoom Out", true),
+            ("lanes.zoom_fit", "Zoom to Fit", true),
+            ("frames.previous", "Previous Frame", true),
+            ("frames.next", "Next Frame", true),
+        ] {
+            let c = cmds
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("no {id}"));
+            assert_eq!(c.label, label);
+            let name = (c.action)().name();
+            assert_eq!(bound.contains(&name), shortcut, "{id}");
+            assert!(menu_actions.contains(&name), "{id} is not in a menu");
+        }
     }
 }

@@ -2,6 +2,15 @@
 
 pub mod logs;
 pub mod network;
+pub mod performance;
+pub mod timeline;
+
+use crate::nav::Location;
+
+/// Emitted by any tool view to open somewhere else (another tool, a record, a time range). The
+/// shell navigates there and keeps a Back step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenLocation(pub Location);
 
 use fdt_ui::theme::TokensExt as _;
 use fdt_ui::tokens::{font, space};

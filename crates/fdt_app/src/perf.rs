@@ -2,7 +2,7 @@
 //! `fdt bench-ui` can tell which parts of the window were rebuilt in a frame.
 
 /// How many counters there are.
-pub const N: usize = 9;
+pub const N: usize = 13;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Counter {
@@ -15,6 +15,10 @@ pub enum Counter {
     LogsRows,
     NetworkView,
     NetworkToolbar,
+    PerformanceView,
+    FrameChart,
+    TimelineView,
+    Lanes,
 }
 
 impl Counter {
@@ -28,6 +32,10 @@ impl Counter {
         Counter::LogsRows,
         Counter::NetworkView,
         Counter::NetworkToolbar,
+        Counter::PerformanceView,
+        Counter::FrameChart,
+        Counter::TimelineView,
+        Counter::Lanes,
     ];
 
     pub fn name(self) -> &'static str {
@@ -41,6 +49,10 @@ impl Counter {
             Counter::LogsRows => "logs_rows",
             Counter::NetworkView => "network_view",
             Counter::NetworkToolbar => "network_toolbar",
+            Counter::PerformanceView => "performance_view",
+            Counter::FrameChart => "frame_chart",
+            Counter::TimelineView => "timeline_view",
+            Counter::Lanes => "lanes",
         }
     }
 }

@@ -262,6 +262,15 @@ pub fn writer() -> (fdt_store::SessionWriter, RunId) {
 
 /// Like [`writer`], with stores that seal a chunk every `chunk` records.
 pub fn writer_with_chunk(chunk: usize) -> (fdt_store::SessionWriter, RunId) {
+    writer_in(chunk, Mode::Debug)
+}
+
+/// Like [`writer`], with the run launched in `mode`.
+pub fn writer_in_mode(mode: Mode) -> (fdt_store::SessionWriter, RunId) {
+    writer_in(fdt_store::logs::LOG_CHUNK, mode)
+}
+
+fn writer_in(chunk: usize, mode: Mode) -> (fdt_store::SessionWriter, RunId) {
     use fdt_store::clock::{Calibration, RunClock};
     use fdt_store::time::SessionTime;
     let mut w = fdt_store::SessionWriter::with_log_chunk(0, chunk);
@@ -272,8 +281,30 @@ pub fn writer_with_chunk(chunk: usize) -> (fdt_store::SessionWriter, RunId) {
             timeline_to_wall_us: 0,
         },
     );
-    let run = w.start_run(app_info("demo"), clock, SessionTime(0));
+    let mut app = app_info("demo");
+    app.mode = mode;
+    let run = w.start_run(app, clock, SessionTime(0));
     (w, run)
+}
+
+/// A frame of `run` that starts `start_ms` into the session and spends `build_ms` on the UI
+/// thread and `raster_ms` on the raster thread. Its elapsed time is the slower of the two.
+pub fn frame_at(
+    run: RunId,
+    number: u64,
+    start_ms: u64,
+    build_ms: u64,
+    raster_ms: u64,
+) -> fdt_store::frames::FrameInput {
+    fdt_store::frames::FrameInput {
+        run,
+        number,
+        start: fdt_store::time::SessionTime(start_ms * 1_000_000),
+        elapsed_us: (build_ms.max(raster_ms) * 1_000) as u32,
+        build_us: (build_ms * 1_000) as u32,
+        raster_us: (raster_ms * 1_000) as u32,
+        vsync_overhead_us: 0,
+    }
 }
 
 /// A log record at `ms` milliseconds.

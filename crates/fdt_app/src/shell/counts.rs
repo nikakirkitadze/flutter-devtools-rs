@@ -1,8 +1,9 @@
-//! Range-aware sidebar counts for Logs and Network, computed off the UI thread.
+//! Range-aware sidebar counts for Logs, Network and Performance, computed off the UI thread.
 
 use crate::nav::{TimeRange, Tool};
 use crate::shell::{MainWindow, ToolCount};
 use fdt_store::Snapshot;
+use fdt_store::frames::{FrameStatus, frame_status};
 use fdt_store::logs::LogLevel;
 use fdt_store::net_query::{NetFilter, NetTab, count_requests};
 use gpui_kit::{AppContext as _, Context};
@@ -18,13 +19,15 @@ pub(super) struct CountsKey {
     range: Option<TimeRange>,
 }
 
-/// The Logs and Network counts of `snap` within `range`. O(records); not for the UI thread.
+/// The Logs, Network and Performance counts of `snap` within `range`. O(records); not for the UI
+/// thread.
 ///
+/// Performance counts the slow and janky frames, and wants attention when any is janky.
 /// With no range, a count of zero is left off; with a range, zero is shown.
 pub fn range_counts(
     snap: &Snapshot,
     range: Option<TimeRange>,
-) -> (Option<ToolCount>, Option<ToolCount>) {
+) -> (Option<ToolCount>, Option<ToolCount>, Option<ToolCount>) {
     let shown = |value: u64, attention: bool| {
         (value > 0 || range.is_some()).then_some(ToolCount { value, attention })
     };
@@ -42,7 +45,38 @@ pub fn range_counts(
         count_requests(&snap.net, &all) as u64,
         count_requests(&snap.net, &errors) > 0,
     );
-    (logs, net)
+    let (slow, janky) = slow_frames(snap, range);
+    (logs, net, shown(slow, janky))
+}
+
+/// How many slow and janky frames start in `range` (all of them with no range), and whether any
+/// is janky. Reads only the slow frames, not every frame.
+fn slow_frames(snap: &Snapshot, range: Option<TimeRange>) -> (u64, bool) {
+    let frames = &snap.frames;
+    let slow = frames.slow();
+    let window = range.map_or(0..frames.len(), |r| frames.range(r));
+    // The slow list is ascending, so the frames in `window` are one run of it.
+    let first = |bound: usize| {
+        let (mut lo, mut hi) = (0, slow.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if slow.get(mid).is_some_and(|&s| (s as usize) < bound) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    };
+    let (lo, hi) = (first(window.start), first(window.end));
+    let janky = (lo..hi).any(|i| {
+        slow.get(i)
+            .and_then(|&seq| frames.get(seq as usize))
+            .is_some_and(|f| {
+                frame_status(f.time_us(), snap.frame_budget_us(f.run)) == FrameStatus::Janky
+            })
+    });
+    ((hi - lo) as u64, janky)
 }
 
 impl MainWindow {
@@ -93,6 +127,7 @@ impl MainWindow {
                         let mut all = this.counts;
                         all[Tool::Logs.index()] = counts.0;
                         all[Tool::Network.index()] = counts.1;
+                        all[Tool::Performance.index()] = counts.2;
                         this.set_counts(all, cx);
                     }
                 });
@@ -206,7 +241,7 @@ mod tests {
             request(w, run, 9, 404);
         });
         let range = Some(TimeRange::new(SessionTime(4 * SEC), SessionTime(6 * SEC)));
-        let (_, net) = range_counts(&snap, range);
+        let (_, net, _) = range_counts(&snap, range);
         assert_eq!(
             net,
             Some(ToolCount {
@@ -214,7 +249,7 @@ mod tests {
                 attention: true
             })
         );
-        let (_, net) = range_counts(&snap, None);
+        let (_, net, _) = range_counts(&snap, None);
         assert_eq!(
             net,
             Some(ToolCount {
@@ -223,7 +258,7 @@ mod tests {
             })
         );
         let ok_only = Some(TimeRange::new(SessionTime(SEC), SessionTime(3 * SEC)));
-        let (_, net) = range_counts(&snap, ok_only);
+        let (_, net, _) = range_counts(&snap, ok_only);
         assert_eq!(
             net,
             Some(ToolCount {
@@ -235,7 +270,70 @@ mod tests {
 
     #[test]
     fn range_counts_without_a_range_hides_zero() {
-        let (logs, net) = range_counts(&Snapshot::empty(), None);
-        assert!(logs.is_none() && net.is_none());
+        let (logs, net, perf) = range_counts(&Snapshot::empty(), None);
+        assert!(logs.is_none() && net.is_none() && perf.is_none());
+    }
+
+    /// Frames at 60 Hz: 10 ms (ok), 20 ms (slow), 40 ms (janky), 25 ms (slow), one a second.
+    fn frames_snapshot() -> std::sync::Arc<Snapshot> {
+        snapshot(|w, run| {
+            for (i, ms) in [10u64, 20, 40, 25].into_iter().enumerate() {
+                let start = (i as u64 + 1) * 1_000;
+                w.push_frame(crate::test_support::frame_at(run, i as u64, start, ms, 1));
+            }
+        })
+    }
+
+    #[test]
+    fn performance_count_counts_slow_frames_in_range() {
+        let snap = frames_snapshot();
+        let (_, _, all) = range_counts(&snap, None);
+        assert_eq!(
+            all,
+            Some(ToolCount {
+                value: 3,
+                attention: true
+            })
+        );
+        // Only the 20 ms frame: slow, not janky.
+        let slow_only = Some(TimeRange::new(
+            SessionTime(1_500 * 1_000_000),
+            SessionTime(2_500 * 1_000_000),
+        ));
+        let (_, _, one) = range_counts(&snap, slow_only);
+        assert_eq!(
+            one,
+            Some(ToolCount {
+                value: 1,
+                attention: false
+            })
+        );
+        // A range with only the on-time frame shows zero, with no attention.
+        let ok_only = Some(TimeRange::new(
+            SessionTime(500 * 1_000_000),
+            SessionTime(1_500 * 1_000_000),
+        ));
+        let (_, _, none) = range_counts(&snap, ok_only);
+        assert_eq!(
+            none,
+            Some(ToolCount {
+                value: 0,
+                attention: false
+            })
+        );
+        // With no range, no slow frames means no count at all.
+        let calm = snapshot(|w, run| {
+            w.push_frame(crate::test_support::frame_at(run, 0, 1_000, 5, 5));
+        });
+        assert_eq!(range_counts(&calm, None).2, None);
+    }
+
+    #[gpui_kit::test]
+    fn the_sidebar_shows_the_performance_count(cx: &mut gpui_kit::TestAppContext) {
+        let (shell, cx) = open_shell_snapshot(cx, frames_snapshot());
+        cx.run_until_parked();
+        let perf = shell.read_with(cx, |s, _| s.counts()[Tool::Performance.index()]);
+        assert_eq!(perf.map(|c| c.value), Some(3));
+        assert!(crate::test_support::exists(cx, "sidebar-count-performance"));
     }
 }

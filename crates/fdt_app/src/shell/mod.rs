@@ -20,6 +20,10 @@ use crate::actions::{
     ToggleExpand, ToggleFrameHud, ToggleFullScreen, ToggleRecording, UseDarkTheme, UseLightTheme,
     UseSystemTheme, Zoom,
 };
+use crate::actions::{
+    FetchCpuSamples, NextSlowFrame, PreviousSlowFrame, ShowCpuTab, ShowFramesTab, ShowRebuildsTab,
+    ShowTraceTab, ToggleTraceWidgetBuilds,
+};
 use crate::capture_host::{CaptureControl, CaptureHost, CaptureHostFailure};
 use crate::keymap::SHELL_CONTEXT;
 use crate::nav::{Location, NavHistory, Page, Selection, Tool};
@@ -27,8 +31,11 @@ use crate::palette::items::PaletteModel;
 use crate::palette::view::open_palette;
 use crate::session_model::{SessionEvent, SessionModel};
 use crate::settings::{settings, update_settings};
+use crate::tools::OpenLocation;
 use crate::tools::logs::{LogsEvent, LogsView};
 use crate::tools::network::{NetworkEvent, NetworkView};
+use crate::tools::performance::{PerfTab, PerformanceView, adjacent_slow};
+use crate::tools::timeline::TimelineView;
 use fdt_capture::ConnStatus;
 use fdt_ui::hud::FrameHud;
 use fdt_ui::theme::{self, ThemePreference, TokensExt as _};
@@ -91,6 +98,10 @@ pub struct MainWindow {
     logs: Entity<LogsView>,
     /// The Network table, kept for the life of the window.
     network: Entity<NetworkView>,
+    /// The Performance page, kept for the life of the window.
+    performance: Entity<PerformanceView>,
+    /// The Timeline page, kept for the life of the window.
+    timeline: Entity<TimelineView>,
     _host_wait: Option<gpui_kit::Subscription>,
     _host_failed_wait: Option<gpui_kit::Subscription>,
     /// Whether the last status seen was `Connected`, so only a new connection leaves Start.
@@ -98,7 +109,7 @@ pub struct MainWindow {
     /// The session the window last saw, to notice when a new one replaces it.
     session_id: u64,
     _appearance: gpui_kit::Subscription,
-    _session_subs: [gpui_kit::Subscription; 4],
+    _session_subs: Vec<gpui_kit::Subscription>,
 }
 
 impl MainWindow {
@@ -166,6 +177,31 @@ impl MainWindow {
                 }
             }
         });
+        let performance = cx.new(|cx| PerformanceView::new(session.clone(), window, cx));
+        let timeline = cx.new(|cx| TimelineView::new(session.clone(), window, cx));
+        // Any tool view can ask to open somewhere else; the shell keeps a Back step.
+        let open =
+            |this: &mut Self, event: &OpenLocation, window: &mut Window, cx: &mut Context<Self>| {
+                this.navigate(event.0.clone(), window, cx)
+            };
+        let opens = vec![
+            cx.subscribe_in(&logs, window, move |this, _, e: &OpenLocation, w, cx| {
+                open(this, e, w, cx)
+            }),
+            cx.subscribe_in(&network, window, move |this, _, e: &OpenLocation, w, cx| {
+                open(this, e, w, cx)
+            }),
+            cx.subscribe_in(
+                &performance,
+                window,
+                move |this, _, e: &OpenLocation, w, cx| open(this, e, w, cx),
+            ),
+            cx.subscribe_in(
+                &timeline,
+                window,
+                move |this, _, e: &OpenLocation, w, cx| open(this, e, w, cx),
+            ),
+        ];
         let host_wait = (!cx.has_global::<CaptureHost>()).then(|| {
             cx.observe_global_in::<CaptureHost>(window, |this, window, cx| {
                 this.apps_from_host(window, cx);
@@ -193,12 +229,18 @@ impl MainWindow {
             start: None,
             logs,
             network,
+            performance,
+            timeline,
             _host_wait: host_wait,
             _host_failed_wait: host_failed_wait,
             was_connected,
             session_id,
             _appearance: appearance,
-            _session_subs: [observed, connected, selected, net_selected],
+            _session_subs: {
+                let mut subs = vec![observed, connected, selected, net_selected];
+                subs.extend(opens);
+                subs
+            },
         };
         this.apps_from_host(window, cx);
         this.refresh_counts(cx);
@@ -290,6 +332,73 @@ impl MainWindow {
         self.logs
             .update(cx, |logs, cx| logs.set_location(loc.range, selection, cx));
         self.sync_network(cx);
+        self.sync_frames_tools(cx);
+    }
+
+    /// Whether the Performance and Timeline pages show their views: the store has frames, or
+    /// an app is connected.
+    fn frames_routed(&self, cx: &App) -> bool {
+        let session = self.session.read(cx);
+        !session.snapshot().frames.is_empty()
+            || matches!(session.status(), ConnStatus::Connected { .. })
+    }
+
+    /// Hands the location's range, and the selected frame, to the Performance and Timeline
+    /// pages.
+    fn sync_frames_tools(&mut self, cx: &mut Context<Self>) {
+        let loc = self.current().clone();
+        let frame = match loc.selection {
+            Some(Selection::Frame(id)) => Some(id),
+            _ => None,
+        };
+        self.performance
+            .update(cx, |perf, cx| perf.set_location(loc.range, frame, cx));
+        self.timeline
+            .update(cx, |timeline, cx| timeline.set_location(loc.range, cx));
+    }
+
+    /// Shows a Performance tab, going to the page first.
+    fn show_perf_tab(&mut self, tab: PerfTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.show(Tool::Performance, window, cx);
+        self.performance
+            .update(cx, |perf, cx| perf.set_tab(tab, cx));
+    }
+
+    /// Selects the next (or previous) slow frame after the selected one, inside the range if
+    /// there is one.
+    fn step_slow_frame(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let snap = self.session.read(cx).snapshot().clone();
+        let loc = self.current().clone();
+        let from = match loc.selection {
+            Some(Selection::Frame(id)) => Some(id.seq as usize),
+            _ => None,
+        };
+        let within = loc.range.map(|r| snap.frames.range(r));
+        let Some(frame) =
+            adjacent_slow(&snap, from, within, forward).and_then(|seq| snap.frames.get(seq))
+        else {
+            return;
+        };
+        let to = Location {
+            page: Page::Tool(Tool::Performance),
+            selection: Some(Selection::Frame(frame.id)),
+            range: loc.range,
+        };
+        self.navigate(to, window, cx);
+    }
+
+    /// Turns widget-build tracing in the app on or off. The latest run says what it is now; with
+    /// no run to ask, the setting's default stands in.
+    fn toggle_trace_widget_builds(&mut self, cx: &mut Context<Self>) {
+        let session = self.session.read(cx);
+        let connected = matches!(session.status(), ConnStatus::Connected { .. });
+        let now = session
+            .snapshot()
+            .runs
+            .last()
+            .filter(|_| connected)
+            .map_or(settings(cx).trace_widget_builds, |run| run.tracing);
+        self.with_control(cx, |c| c.set_trace_widget_builds(!now));
     }
 
     /// Whether the Network page shows the table: there are requests, or an app is connected.
@@ -606,6 +715,16 @@ impl Render for MainWindow {
                 tool_page::render_with(Tool::Network, strip, self.network.clone())
                     .into_any_element()
             }
+            Page::Tool(Tool::Timeline) if self.frames_routed(cx) => {
+                let strip = self.strip_view();
+                tool_page::render_with(Tool::Timeline, strip, self.timeline.clone())
+                    .into_any_element()
+            }
+            Page::Tool(Tool::Performance) if self.frames_routed(cx) => {
+                let strip = self.strip_view();
+                tool_page::render_with(Tool::Performance, strip, self.performance.clone())
+                    .into_any_element()
+            }
             Page::Tool(tool) => {
                 let strip = self.strip_view();
                 tool_page::render(tool, strip, cx).into_any_element()
@@ -639,6 +758,32 @@ impl Render for MainWindow {
             .on_action(cx.listener(|this, _: &ShowLogs, w, cx| this.show(Tool::Logs, w, cx)))
             .on_action(cx.listener(|this, _: &ShowWidgets, w, cx| this.show(Tool::Widgets, w, cx)))
             .on_action(cx.listener(|this, _: &ShowState, w, cx| this.show(Tool::State, w, cx)))
+            .on_action(cx.listener(|this, _: &ShowFramesTab, w, cx| {
+                this.show_perf_tab(PerfTab::Frames, w, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &ShowCpuTab, w, cx| this.show_perf_tab(PerfTab::Cpu, w, cx)),
+            )
+            .on_action(cx.listener(|this, _: &ShowRebuildsTab, w, cx| {
+                this.show_perf_tab(PerfTab::Rebuilds, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowTraceTab, w, cx| {
+                this.show_perf_tab(PerfTab::Trace, w, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &NextSlowFrame, w, cx| this.step_slow_frame(true, w, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &PreviousSlowFrame, w, cx| {
+                    this.step_slow_frame(false, w, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &FetchCpuSamples, _, cx| {
+                this.with_control(cx, |c| c.fetch_cpu_samples());
+            }))
+            .on_action(cx.listener(|this, _: &ToggleTraceWidgetBuilds, _, cx| {
+                this.toggle_trace_widget_builds(cx)
+            }))
             .on_action(cx.listener(|this, _: &SelectNext, _, cx| {
                 this.with_logs(cx, |v, cx| v.select_next(cx));
                 this.with_network(cx, |v, cx| v.select_next(cx));
@@ -1183,5 +1328,300 @@ mod tests {
         assert!(changed(Counter::Strip) >= 1, "the strip shows the range");
         assert!(changed(Counter::TitleBar) >= 1, "the range chip appeared");
         assert_eq!(changed(Counter::Sidebar), 0, "no sidebar input changed");
+    }
+
+    // ---- Performance and Timeline ----
+
+    use crate::actions::{
+        FetchCpuSamples, NextSlowFrame, PreviousSlowFrame, ShowCpuTab, ShowFramesTab,
+        ShowRebuildsTab, ShowTraceTab, ToggleTraceWidgetBuilds,
+    };
+    use crate::test_support::{
+        connected, frame_at, open_shell_fake, open_shell_snapshot, snapshot,
+    };
+    use crate::tools::OpenLocation;
+    use crate::tools::performance::PerfTab;
+    use fdt_store::run::Mode;
+
+    /// Frames at 60 Hz: ok, slow (20 ms), janky (40 ms), ok, slow (25 ms).
+    fn five_frames() -> Arc<fdt_store::Snapshot> {
+        snapshot(|w, run| {
+            for (i, ms) in [8u64, 20, 40, 9, 25].into_iter().enumerate() {
+                w.push_frame(frame_at(run, i as u64, 1_000 + i as u64 * 100, ms, 1));
+            }
+        })
+    }
+
+    fn selected_frame(
+        shell: &Entity<MainWindow>,
+        cx: &mut gpui_kit::VisualTestContext,
+    ) -> Option<u64> {
+        shell.read_with(cx, |s, _| match s.current().selection {
+            Some(Selection::Frame(id)) => Some(id.seq),
+            _ => None,
+        })
+    }
+
+    #[gpui_kit::test]
+    fn performance_and_timeline_route_when_connected(cx: &mut TestAppContext) {
+        let (_shell, cx, fake) = open_shell_fake(cx);
+        press(cx, "cmd-1", "ctrl-1");
+        assert!(exists(cx, "empty-state-timeline"));
+        assert!(!exists(cx, "timeline-view"));
+        press(cx, "cmd-2", "ctrl-2");
+        assert!(exists(cx, "empty-state-performance"));
+        assert!(!exists(cx, "performance-view"));
+        fake.status.send(connected("demo", true)).unwrap();
+        cx.run_until_parked();
+        press(cx, "cmd-1", "ctrl-1");
+        assert!(exists(cx, "timeline-view"));
+        assert!(!exists(cx, "empty-state-timeline"));
+        press(cx, "cmd-2", "ctrl-2");
+        assert!(exists(cx, "performance-view"));
+        assert!(exists(cx, "perf-tabs"));
+        assert!(!exists(cx, "empty-state-performance"));
+        // Memory, Widgets and State are still not built.
+        press(cx, "cmd-3", "ctrl-3");
+        assert!(exists(cx, "empty-state-memory"));
+    }
+
+    #[gpui_kit::test]
+    fn performance_and_timeline_route_when_the_store_has_frames(cx: &mut TestAppContext) {
+        let (_shell, cx) = open_shell_snapshot(cx, five_frames());
+        press(cx, "cmd-1", "ctrl-1");
+        assert!(exists(cx, "timeline-view"));
+        press(cx, "cmd-2", "ctrl-2");
+        assert!(exists(cx, "performance-view"));
+    }
+
+    #[gpui_kit::test]
+    fn new_session_resets_performance_and_timeline(cx: &mut TestAppContext) {
+        let (shell, cx, fake) = open_shell_fake(cx);
+        let old = five_frames();
+        fake.snaps.send(old.clone()).unwrap();
+        fake.status.send(connected("demo", true)).unwrap();
+        cx.run_until_parked();
+        press(cx, "cmd-2", "ctrl-2");
+        let id = old.frames.get(2).unwrap().id;
+        let to = Location {
+            page: Page::Tool(Tool::Performance),
+            selection: Some(Selection::Frame(id)),
+            range: Some(range()),
+        };
+        cx.update(|window, cx| shell.update(cx, |s, cx| s.navigate(to, window, cx)));
+        let (perf, timeline) =
+            shell.read_with(cx, |s, _| (s.performance.clone(), s.timeline.clone()));
+        assert_eq!(
+            perf.read_with(cx, |v, _| (v.range(), v.selection())),
+            (Some(range()), Some(id))
+        );
+        assert_eq!(timeline.read_with(cx, |v, _| v.range()), Some(range()));
+        press(cx, "cmd-n", "ctrl-n");
+        fake.snaps.send(snapshot(|_, _| {})).unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            perf.read_with(cx, |v, _| (v.range(), v.selection())),
+            (None, None)
+        );
+        assert_eq!(timeline.read_with(cx, |v, _| v.range()), None);
+        shell.read_with(cx, |s, _| {
+            assert_eq!(s.current().page, Page::Tool(Tool::Performance));
+            assert!(!s.history().can_go_back());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn debug_banner_shows_only_in_debug(cx: &mut TestAppContext) {
+        let frames = |mode| {
+            let (mut w, run) = crate::test_support::writer_in_mode(mode);
+            w.push_frame(frame_at(run, 0, 1_000, 5, 5));
+            w.publish()
+        };
+        let (shell, cx, fake) = open_shell_fake(cx);
+        fake.snaps.send(frames(Mode::Debug)).unwrap();
+        fake.status.send(connected("demo", true)).unwrap();
+        cx.run_until_parked();
+        press(cx, "cmd-2", "ctrl-2");
+        assert!(exists(cx, "perf-debug-banner"));
+        // It does not block: the tabs are there too, and the banner says what to do.
+        assert!(exists(cx, "perf-tabs"));
+        let label =
+            cx.update(|window, _| window.find("perf-debug-banner").label().map(str::to_string));
+        assert_eq!(
+            label.as_deref(),
+            Some(
+                "Debug mode timings aren't representative. Run the app with flutter run --profile for real numbers."
+            )
+        );
+        fake.snaps.send(frames(Mode::Profile)).unwrap();
+        cx.run_until_parked();
+        assert!(!exists(cx, "perf-debug-banner"));
+        assert!(exists(cx, "perf-tabs"));
+        fake.snaps.send(frames(Mode::Unknown)).unwrap();
+        cx.run_until_parked();
+        assert!(!exists(cx, "perf-debug-banner"));
+        let _ = shell;
+    }
+
+    #[gpui_kit::test]
+    fn open_location_navigates_with_a_back_step(cx: &mut TestAppContext) {
+        let snap = five_frames();
+        let (shell, cx) = open_shell_snapshot(cx, snap.clone());
+        press(cx, "cmd-5", "ctrl-5");
+        let before = shell.read_with(cx, |s, _| s.history().back_len());
+        let to = Location {
+            page: Page::Tool(Tool::Performance),
+            selection: Some(Selection::Frame(snap.frames.get(1).unwrap().id)),
+            range: None,
+        };
+        let logs = shell.read_with(cx, |s, _| s.logs_view().clone());
+        logs.update(cx, |_, cx| cx.emit(OpenLocation(to.clone())));
+        cx.run_until_parked();
+        shell.read_with(cx, |s, _| {
+            assert_eq!(s.current(), &to);
+            assert_eq!(s.history().back_len(), before + 1);
+        });
+        press(cx, "cmd-[", "ctrl-[");
+        assert_eq!(page(&shell, cx), Page::Tool(Tool::Logs));
+        // Every tool view can emit it.
+        let (net, perf, timeline) = shell.read_with(cx, |s, _| {
+            (
+                s.network_view().clone(),
+                s.performance.clone(),
+                s.timeline.clone(),
+            )
+        });
+        let to = Location::at(Page::Tool(Tool::Network));
+        perf.update(cx, |_, cx| cx.emit(OpenLocation(to.clone())));
+        cx.run_until_parked();
+        assert_eq!(page(&shell, cx), Page::Tool(Tool::Network));
+        let to = Location::at(Page::Tool(Tool::Timeline));
+        net.update(cx, |_, cx| cx.emit(OpenLocation(to)));
+        cx.run_until_parked();
+        assert_eq!(page(&shell, cx), Page::Tool(Tool::Timeline));
+        let to = Location::at(Page::Tool(Tool::Performance));
+        timeline.update(cx, |_, cx| cx.emit(OpenLocation(to)));
+        cx.run_until_parked();
+        assert_eq!(page(&shell, cx), Page::Tool(Tool::Performance));
+    }
+
+    #[gpui_kit::test]
+    fn the_tab_commands_open_their_tabs(cx: &mut TestAppContext) {
+        let (shell, cx) = open_shell_snapshot(cx, five_frames());
+        let tab = |shell: &Entity<MainWindow>, cx: &mut gpui_kit::VisualTestContext| {
+            let perf = shell.read_with(cx, |s, _| s.performance.clone());
+            perf.read_with(cx, |v, _| v.tab())
+        };
+        assert_eq!(tab(&shell, cx), PerfTab::Frames);
+        cx.dispatch_action(ShowCpuTab);
+        assert_eq!(page(&shell, cx), Page::Tool(Tool::Performance));
+        assert_eq!(tab(&shell, cx), PerfTab::Cpu);
+        cx.dispatch_action(ShowRebuildsTab);
+        assert_eq!(tab(&shell, cx), PerfTab::Rebuilds);
+        cx.dispatch_action(ShowTraceTab);
+        assert_eq!(tab(&shell, cx), PerfTab::Trace);
+        cx.dispatch_action(ShowFramesTab);
+        assert_eq!(tab(&shell, cx), PerfTab::Frames);
+    }
+
+    #[gpui_kit::test]
+    fn slow_frame_commands_step_through_slow_frames(cx: &mut TestAppContext) {
+        let (shell, cx) = open_shell_snapshot(cx, five_frames());
+        // Slow and janky frames are #1, #2 and #4.
+        cx.dispatch_action(NextSlowFrame);
+        assert_eq!(page(&shell, cx), Page::Tool(Tool::Performance));
+        assert_eq!(selected_frame(&shell, cx), Some(1));
+        cx.dispatch_action(NextSlowFrame);
+        assert_eq!(selected_frame(&shell, cx), Some(2));
+        cx.dispatch_action(NextSlowFrame);
+        assert_eq!(selected_frame(&shell, cx), Some(4));
+        cx.dispatch_action(NextSlowFrame);
+        assert_eq!(
+            selected_frame(&shell, cx),
+            Some(4),
+            "no wrap past the last one"
+        );
+        cx.dispatch_action(PreviousSlowFrame);
+        assert_eq!(selected_frame(&shell, cx), Some(2));
+        cx.dispatch_action(PreviousSlowFrame);
+        cx.dispatch_action(PreviousSlowFrame);
+        assert_eq!(
+            selected_frame(&shell, cx),
+            Some(1),
+            "none before the first one"
+        );
+        // Previous with nothing selected starts from the end.
+        let to = shell.read_with(cx, |s, _| {
+            s.current().with_page(Page::Tool(Tool::Performance))
+        });
+        cx.update(|window, cx| shell.update(cx, |s, cx| s.navigate(to, window, cx)));
+        cx.dispatch_action(PreviousSlowFrame);
+        assert_eq!(selected_frame(&shell, cx), Some(4));
+    }
+
+    #[gpui_kit::test]
+    fn slow_frame_commands_stay_inside_the_range(cx: &mut TestAppContext) {
+        let (shell, cx) = open_shell_snapshot(cx, five_frames());
+        // Frames start at 1.0, 1.1, 1.2, 1.3 and 1.4 s; the range holds #2 and #3 only.
+        let range = TimeRange::new(SessionTime(1_150_000_000), SessionTime(1_350_000_000));
+        let mut to = Location::at(Page::Tool(Tool::Performance));
+        to.range = Some(range);
+        cx.update(|window, cx| shell.update(cx, |s, cx| s.navigate(to, window, cx)));
+        cx.dispatch_action(NextSlowFrame);
+        assert_eq!(selected_frame(&shell, cx), Some(2));
+        cx.dispatch_action(NextSlowFrame);
+        assert_eq!(selected_frame(&shell, cx), Some(2));
+        assert_eq!(shell.read_with(cx, |s, _| s.current().range), Some(range));
+    }
+
+    #[gpui_kit::test]
+    fn fetching_cpu_samples_and_toggling_tracing_reach_the_capture(cx: &mut TestAppContext) {
+        let (_shell, cx, fake) = open_shell_fake(cx);
+        fake.status.send(connected("demo", true)).unwrap();
+        cx.run_until_parked();
+        cx.dispatch_action(FetchCpuSamples);
+        assert!(fake.commands().contains(&"fetch_cpu".to_string()));
+        // No run has reported its tracing state yet: the setting's default (off) is flipped.
+        cx.dispatch_action(ToggleTraceWidgetBuilds);
+        assert_eq!(
+            fake.commands().last().map(String::as_str),
+            Some("trace_builds true")
+        );
+        // Once the latest run reports it, that state is flipped.
+        let (mut w, run) = crate::test_support::writer();
+        w.set_tracing(run, true);
+        fake.snaps.send(w.publish()).unwrap();
+        cx.run_until_parked();
+        cx.dispatch_action(ToggleTraceWidgetBuilds);
+        assert_eq!(
+            fake.commands().last().map(String::as_str),
+            Some("trace_builds false")
+        );
+        w.set_tracing(run, false);
+        fake.snaps.send(w.publish()).unwrap();
+        cx.run_until_parked();
+        cx.dispatch_action(ToggleTraceWidgetBuilds);
+        assert_eq!(
+            fake.commands().last().map(String::as_str),
+            Some("trace_builds true")
+        );
+    }
+
+    #[gpui_kit::test]
+    fn the_strip_key_includes_the_refresh_budget(cx: &mut TestAppContext) {
+        let at_60 = five_frames();
+        let mut at_120 = (*at_60).clone();
+        let mut runs = at_120.runs.to_vec();
+        runs[0].refresh_hz = Some(120.0);
+        at_120.runs = Arc::from(runs);
+        assert_eq!(at_60.generation, at_120.generation);
+        let (shell, cx, fake) = open_shell_fake(cx);
+        fake.snaps.send(at_60).unwrap();
+        cx.run_until_parked();
+        let a = cx.update(|_, cx| shell.read_with(cx, chrome::strip_key));
+        fake.snaps.send(Arc::new(at_120)).unwrap();
+        cx.run_until_parked();
+        let b = cx.update(|_, cx| shell.read_with(cx, chrome::strip_key));
+        assert_ne!(a, b);
     }
 }
