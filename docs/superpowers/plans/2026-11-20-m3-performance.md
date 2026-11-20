@@ -404,7 +404,7 @@ crates/fdt_store/src/
   cpu.rs             (new)                   function table, call-stack trie, samples by time, CpuSnapshot
   lanes.rs           (new)                   level-of-detail for log and request lanes, navigation index
   run.rs, session.rs                         refresh rate and tracing per run; new snapshot fields
-  synth.rs                                   timeline, cpu, perf_session
+  synth.rs                                   perf (frames + timeline), cpu, stress_session
   benches/store.rs                           + timeline lanes, cpu
 crates/fdt_vm/src/
   timeline.rs        (new)                   flags, getVMTimeline, TraceEvent decode, streamCancel
