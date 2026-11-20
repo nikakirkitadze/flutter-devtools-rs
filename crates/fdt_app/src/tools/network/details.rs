@@ -10,7 +10,7 @@ use super::view::NetworkView;
 use crate::nav::{Location, Page, Selection, Tool};
 use crate::settings::settings;
 use crate::tools::OpenLocation;
-use crate::tools::related::{Kind, RelatedState};
+use crate::tools::related::{Kind, RelatedState, link};
 use fdt_capture::ConnStatus;
 use fdt_store::net::{Body, BodyKind, BodyState, HttpRecord};
 use fdt_store::time::{EntryId, RunId};
@@ -318,20 +318,6 @@ impl NetworkView {
         let Some(view) = self.details.related.view(session, rec.id) else {
             return div().into_any_element();
         };
-        let link = |id: SharedString, text: String| {
-            div()
-                .id(id)
-                .test_support()
-                .aria_label(SharedString::from(text.clone()))
-                .w_full()
-                .truncate()
-                .px(space::S4)
-                .rounded(radius::CONTROL)
-                .text_color(Hsla::from(t.accent))
-                .cursor_pointer()
-                .hover(|s| s.bg(Hsla::from(t.elevated)))
-                .child(text)
-        };
         let mut body = div().flex().flex_col().gap(space::S2);
         match view.frame {
             Some(f) => {
@@ -340,6 +326,7 @@ impl NetworkView {
                     link(
                         "net-related-frame".into(),
                         format!("Frame that processed the response: #{}", f.number),
+                        &t,
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.open_related(Tool::Performance, Selection::Frame(id), cx)
@@ -370,7 +357,7 @@ impl NetworkView {
             for (i, l) in view.logs.iter().enumerate() {
                 let id = l.id;
                 body = body.child(
-                    link(sid(format!("net-related-log-{i}")), l.text.clone()).on_click(
+                    link(sid(format!("net-related-log-{i}")), l.text.clone(), &t).on_click(
                         cx.listener(move |this, _, _, cx| {
                             this.open_related(Tool::Logs, Selection::Log(id), cx)
                         }),

@@ -285,3 +285,85 @@ fn a_frame_that_arrives_later_still_shows_up(cx: &mut TestAppContext) {
     );
     assert!(!present(cx, "logs-related-empty"));
 }
+
+#[gpui_kit::test]
+fn related_result_for_a_previous_selection_is_dropped(cx: &mut TestAppContext) {
+    let snap = session();
+    let (shell, cx) = select_log(cx, snap.clone(), 0, None);
+    // Log 0's job has not landed; log 1 is selected.
+    let b = snap.logs.get_row(1).unwrap().id;
+    let to = Location {
+        page: Page::Tool(Tool::Logs),
+        selection: Some(Selection::Log(b)),
+        range: None,
+    };
+    go(&shell, cx, to);
+    cx.run_until_parked();
+    let logs = shell.read_with(cx, |s, _| s.logs_view().clone());
+    assert_eq!(logs.read_with(cx, |v, _| v.related_runs()), 2);
+    assert_eq!(
+        label(cx, "logs-related-empty").as_deref(),
+        Some("No frame at this moment.")
+    );
+    assert!(!present(cx, "logs-related-frame"));
+    assert!(!present(cx, "logs-related-request-0"));
+}
+
+#[gpui_kit::test]
+fn new_session_with_colliding_entry_id_does_not_show_old_related(cx: &mut TestAppContext) {
+    let (shell, cx, fake) = crate::test_support::open_shell_fake(cx);
+    let old = session();
+    let id = old.logs.get_row(0).unwrap().id;
+    let req = old.net.get(0).unwrap().id;
+    fake.snaps.send(old.clone()).unwrap();
+    fake.status
+        .send(crate::test_support::connected("demo", true))
+        .unwrap();
+    cx.run_until_parked();
+    cx.dispatch_action(ShowLogs);
+    cx.run_until_parked();
+    let at = |page, selection| Location {
+        page: Page::Tool(page),
+        selection: Some(selection),
+        range: None,
+    };
+    go(&shell, cx, at(Tool::Logs, Selection::Log(id)));
+    let logs = shell.read_with(cx, |s, _| s.logs_view().clone());
+    logs.update(cx, |v, cx| v.open_details(cx));
+    cx.run_until_parked();
+    assert!(present(cx, "logs-related-frame"));
+    go(&shell, cx, at(Tool::Network, Selection::Request(req)));
+    let net = shell.read_with(cx, |s, _| s.network_view().clone());
+    net.update(cx, |v, cx| v.open_details(cx));
+    cx.run_until_parked();
+    assert!(present(cx, "net-related-frame"));
+    // A new session whose record has the same id but no frames at all.
+    let fresh = snapshot(|w, run| {
+        w.push_log(log_at(run, 110, LogLevel::Info));
+        request(w, run, "GET", "http://b.com/y", Some(200), 90, Some(120));
+    });
+    assert_eq!(fresh.logs.get_row(0).unwrap().id, id);
+    assert_eq!(fresh.net.get(0).unwrap().id, req);
+    fake.snaps.send(fresh).unwrap();
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(300)); // token-check: allow: test clock
+    cx.run_until_parked();
+    // Select the colliding request again.
+    go(&shell, cx, at(Tool::Network, Selection::Request(req)));
+    net.update(cx, |v, cx| v.open_details(cx));
+    cx.run_until_parked();
+    assert!(!present(cx, "net-related-frame"));
+    assert_eq!(
+        label(cx, "net-related-empty").as_deref(),
+        Some("No frame processed the response.")
+    );
+    go(&shell, cx, at(Tool::Logs, Selection::Log(id)));
+    logs.update(cx, |v, cx| v.open_details(cx));
+    cx.run_until_parked();
+    assert!(!present(cx, "logs-related-frame"));
+    assert!(
+        label(cx, "logs-related-request-0").is_some_and(|t| t.contains("/y")),
+        "only the new session's request shows"
+    );
+}

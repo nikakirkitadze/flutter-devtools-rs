@@ -5,7 +5,7 @@ use super::model::{line_at, line_starts, shown_highlights};
 use super::view::{LogsView, format_time, level_color};
 use crate::nav::{Location, Page, Selection, Tool};
 use crate::tools::OpenLocation;
-use crate::tools::related::{Kind, RelatedState, RelatedView, status_label};
+use crate::tools::related::{Kind, RelatedState, RelatedView, link, status_label};
 use fdt_store::logs::LogRow;
 use fdt_store::time::EntryId;
 use fdt_ui::theme::TokensExt as _;
@@ -80,6 +80,11 @@ pub(super) fn record_json(rec: &LogRow<'_>) -> String {
 }
 
 impl LogsView {
+    #[cfg(test)]
+    pub(crate) fn related_runs(&self) -> usize {
+        self.details.related.runs()
+    }
+
     /// Starts (or skips) the correlation for the selected record while the pane is open.
     pub(super) fn sync_related(&mut self, cx: &mut Context<Self>) {
         let target = self
@@ -121,20 +126,6 @@ impl LogsView {
         t: &fdt_ui::tokens::Palette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let link = |id: SharedString, text: String| {
-            div()
-                .id(id)
-                .test_support()
-                .aria_label(SharedString::from(text.clone()))
-                .w_full()
-                .truncate()
-                .px(space::S4)
-                .rounded(radius::CONTROL)
-                .text_color(Hsla::from(t.accent))
-                .cursor_pointer()
-                .hover(|s| s.bg(Hsla::from(t.elevated)))
-                .child(text)
-        };
         let muted = |id: &'static str, text: &'static str| {
             div()
                 .id(id)
@@ -160,6 +151,7 @@ impl LogsView {
                     link(
                         "logs-related-frame".into(),
                         format!("Frame #{} \u{b7} {}", f.number, status_label(f.status)),
+                        t,
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.open_related(Tool::Performance, Selection::Frame(id), cx)
@@ -182,11 +174,14 @@ impl LogsView {
             for (i, r) in view.requests.iter().enumerate() {
                 let id = r.id;
                 block = block.child(
-                    link(format!("logs-related-request-{i}").into(), r.text.clone()).on_click(
-                        cx.listener(move |this, _, _, cx| {
-                            this.open_related(Tool::Network, Selection::Request(id), cx)
-                        }),
-                    ),
+                    link(
+                        format!("logs-related-request-{i}").into(),
+                        r.text.clone(),
+                        t,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_related(Tool::Network, Selection::Request(id), cx)
+                    })),
                 );
             }
         }

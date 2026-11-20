@@ -10,7 +10,11 @@ use fdt_analysis::correlate::{related_to_log, related_to_request};
 use fdt_store::Snapshot;
 use fdt_store::frames::{FrameStatus, frame_status};
 use fdt_store::time::EntryId;
-use gpui_kit::{AppContext as _, Context, Task};
+use fdt_ui::tokens::{Palette, radius, space};
+use gpui_kit::{
+    AppContext as _, Context, Hsla, InteractiveElement as _, IntoElement, ParentElement,
+    SharedString, StatefulInteractiveElement, Styled, Task, TestSupportExt as _, div,
+};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,6 +23,26 @@ pub const SHOWN: usize = 5;
 /// The shortest time between two runs for the same record, as in the frame details.
 const REFRESH_INTERVAL: Duration = Duration::from_millis(250); // token-check: allow: throttle, not a visual duration
 const DASH: &str = "\u{2014}";
+
+/// A clickable row in a Related block: accent text, pointer cursor, hover background.
+pub fn link(
+    id: SharedString,
+    text: String,
+    t: &Palette,
+) -> impl IntoElement + Styled + ParentElement + StatefulInteractiveElement {
+    div()
+        .id(id)
+        .test_support()
+        .aria_label(SharedString::from(text.clone()))
+        .w_full()
+        .truncate()
+        .px(space::S4)
+        .rounded(radius::CONTROL)
+        .text_color(Hsla::from(t.accent))
+        .cursor_pointer()
+        .hover(|s| s.bg(Hsla::from(t.elevated)))
+        .child(text)
+}
 
 pub fn status_label(status: FrameStatus) -> &'static str {
     match status {
@@ -162,6 +186,19 @@ impl RelatedState {
     pub fn runs(&self) -> usize {
         self.runs
     }
+
+    #[cfg(test)]
+    fn with_result(session: u64, id: EntryId, view: RelatedView) -> Self {
+        let key = Key {
+            session,
+            id,
+            generation: 1,
+        };
+        Self {
+            result: Some((key, Arc::new(view))),
+            ..Self::default()
+        }
+    }
 }
 
 impl RelatedState {
@@ -230,5 +267,24 @@ impl RelatedState {
             })
             .ok();
         }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fdt_store::time::RunId;
+
+    #[test]
+    fn a_result_is_only_shown_for_its_session_and_record() {
+        let id = EntryId {
+            run: RunId(1),
+            seq: 5,
+        };
+        let st = RelatedState::with_result(1, id, RelatedView::default());
+        assert!(st.view(1, id).is_some());
+        // A new session reuses the id: the old result must not show.
+        assert!(st.view(2, id).is_none());
+        assert!(st.view(1, EntryId { seq: 6, ..id }).is_none());
     }
 }
