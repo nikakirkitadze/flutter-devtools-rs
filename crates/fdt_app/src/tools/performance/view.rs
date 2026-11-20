@@ -3,6 +3,7 @@
 //! The page keeps the shared range and the selected frame the shell hands it, so each tab shows
 //! the same slice of the session.
 
+use super::details::DetailsState;
 use super::frame_chart::{ChartEvent, FrameChart};
 use super::frames_table::{FramesList, ListEvent};
 use crate::nav::{EntryId, Location, Page, Selection, TimeRange, Tool};
@@ -67,10 +68,12 @@ impl PerfTab {
 }
 
 pub struct PerformanceView {
-    session: Entity<SessionModel>,
+    pub(super) session: Entity<SessionModel>,
     tab: PerfTab,
-    range: Option<TimeRange>,
-    selection: Option<EntryId>,
+    pub(super) range: Option<TimeRange>,
+    pub(super) selection: Option<EntryId>,
+    /// The frame details pane.
+    pub(super) details: DetailsState,
     chart: Entity<FrameChart>,
     list: Entity<FramesList>,
     /// The frame under the pointer and where, for the tooltip.
@@ -91,6 +94,7 @@ impl PerformanceView {
         let observe = cx.observe(&session, |this, session, cx| {
             let snap = session.read(cx).snapshot().clone();
             this.chart.update(cx, |c, cx| c.set_snapshot(snap, cx));
+            this.sync_details(cx);
             cx.notify();
         });
         let snap = session.read(cx).snapshot().clone();
@@ -107,6 +111,7 @@ impl PerformanceView {
             tab: PerfTab::Frames,
             range: None,
             selection: None,
+            details: DetailsState::default(),
             chart,
             list,
             hover: None,
@@ -252,6 +257,7 @@ impl PerformanceView {
                 l.set_range(range, cx);
                 l.set_selection(seq, cx);
             });
+            self.sync_details(cx);
             cx.notify();
         }
     }
@@ -325,7 +331,7 @@ impl PerformanceView {
 
 impl PerformanceView {
     /// The Frames tab: the chart over the table, or the empty state.
-    fn render_frames(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_frames(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let t = *cx.tokens();
         let snap = self.session.read(cx).snapshot().clone();
         if snap.frames.is_empty() {
@@ -405,7 +411,7 @@ impl PerformanceView {
                 .with_priority(1),
             )
         });
-        div()
+        let main = div()
             .flex_1()
             .min_h_0()
             .flex()
@@ -435,7 +441,8 @@ impl PerformanceView {
                 ),
             )
             .children(tooltip)
-            .into_any_element()
+            .into_any_element();
+        self.with_details(main, cx)
     }
 }
 

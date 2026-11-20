@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 fdt_ui = { path = "../fdt_ui" }
 fdt_store = { path = "../fdt_store" }
+fdt_analysis = { path = "../fdt_analysis" }
 fdt_capture = { path = "../fdt_capture" }
 fdt_vm = { path = "../fdt_vm" }
 tokio = { workspace = true }

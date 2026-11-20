@@ -1745,6 +1745,7 @@ dependencies = [
  "anyhow",
  "criterion",
  "dirs 6.0.0",
+ "fdt_analysis",
  "fdt_capture",
  "fdt_store",
  "fdt_ui",
