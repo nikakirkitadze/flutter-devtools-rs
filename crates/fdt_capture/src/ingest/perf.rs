@@ -359,7 +359,13 @@ struct CpuState {
     pending: bool,
     /// The profiler is off: no more fetches on this connection.
     off: bool,
+    /// Consecutive server errors on `error_isolate`.
+    errors: u8,
+    error_isolate: String,
 }
+
+/// Server errors in a row, on one isolate, that mark the profiler off.
+const OFF_AFTER_ERRORS: u8 = 3;
 
 /// One CPU fetch. Returns false when the connection closed.
 async fn fetch_cpu(
@@ -395,16 +401,26 @@ async fn fetch_cpu(
             }
             st.next = now + 1;
             st.pending = false;
+            st.errors = 0;
             let batch = cpu_batch(&sink, profile, window.period_us, now);
             sink.send(Ingest::Cpu(batch));
         }
         Err(RpcError::Closed) => return false,
         // The window stays: the next tick asks for it again, and more.
         Err(RpcError::Timeout) => log::warn!("getPerfettoCpuSamples timed out; retrying"),
+        // One error is not "off": the isolate may be gone in a hot restart. The window stays.
         Err(e @ RpcError::Server { .. }) => {
-            log::info!("CPU sampling is off: {e}");
-            st.off = true;
-            sink.send(Ingest::CpuStatus(sink.run, CpuStatus::Off(CPU_OFF.into())));
+            log::debug!("getPerfettoCpuSamples failed on {isolate}: {e}");
+            if st.error_isolate != isolate {
+                st.error_isolate = isolate;
+                st.errors = 0;
+            }
+            st.errors += 1;
+            if st.errors >= OFF_AFTER_ERRORS {
+                log::info!("CPU sampling is off: {e}");
+                st.off = true;
+                sink.send(Ingest::CpuStatus(sink.run, CpuStatus::Off(CPU_OFF.into())));
+            }
         }
         // An answer that cannot be read would be unreadable again: move past it.
         Err(e) => {
@@ -431,6 +447,8 @@ async fn run(
         next: cfg.start_us,
         pending: false,
         off: false,
+        errors: 0,
+        error_isolate: String::new(),
     };
     let mut pipe = Pipeline::new();
     let mut next = cfg.start_us;

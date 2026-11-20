@@ -708,6 +708,16 @@ fn profiler_off_marks_status_and_stops() {
         let cap = start(&server, cpu_config(), &rt);
         common::settle(&cap, Duration::from_millis(50), Duration::from_secs(5)).await;
         server.notify("streamNotify", frame_event(1, BASE + 100, 100));
+        // One frame is enough: a failed fetch is retried on the next tick.
+        common::eventually(Duration::from_secs(5), "two errors", || {
+            cpu_calls(&server).len() >= 2
+        })
+        .await;
+        let snap = cap.snapshots().borrow().clone();
+        assert!(
+            !matches!(snap.cpu.status(snap.runs[0].id), CpuStatus::Off(_)),
+            "off after fewer than 3 errors"
+        );
         let snap = common::wait_for(&cap, Duration::from_secs(5), "profiler off", |s| {
             s.runs
                 .first()
@@ -724,7 +734,7 @@ fn profiler_off_marks_status_and_stops() {
         }
         cap.fetch_cpu_samples();
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(cpu_calls(&server).len(), 1, "no CPU ticks after off");
+        assert_eq!(cpu_calls(&server).len(), 3, "no CPU ticks after off");
     });
 }
 
@@ -815,5 +825,57 @@ fn replay_cpu_has_the_heavy_build_function() {
             .expect("_HeavyBuildPanelState.build");
         assert!(heavy.library.is_some());
         assert_eq!(snap.cpu.status(snap.runs[0].id), &CpuStatus::On);
+    });
+}
+
+#[test]
+fn hot_restart_error_does_not_disable_cpu() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let sim = CpuSim::new();
+        let server = sim.server();
+        let cfg = CaptureConfig {
+            cpu_poll: Duration::from_secs(60),
+            ..cpu_config()
+        };
+        let cap = start(&server, cfg, &rt);
+        common::settle(&cap, Duration::from_millis(50), Duration::from_secs(5)).await;
+        let fetch = |n: usize| {
+            cap.fetch_cpu_samples();
+            let server = &server;
+            async move {
+                common::eventually(Duration::from_secs(5), "a fetch", || {
+                    cpu_calls(server).len() >= n
+                })
+                .await
+            }
+        };
+        fetch(1).await;
+        common::wait_for(&cap, Duration::from_secs(5), "samples", |s| {
+            s.cpu.samples().len() == 5
+        })
+        .await;
+        // Two errors on the old isolate, then the app restarts.
+        *sim.error.lock().unwrap() = Some((-32000, "isolate is gone".into()));
+        fetch(2).await;
+        fetch(3).await;
+        let isolate = json!({"type": "@Isolate", "id": "isolates/2", "name": "main",
+            "isSystemIsolate": false});
+        server.notify(
+            "streamNotify",
+            json!({"streamId": "Isolate", "event": {"kind": "IsolateStart", "isolate": isolate}}),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // A third error in a row, but on a new isolate: the count started over.
+        fetch(4).await;
+        *sim.error.lock().unwrap() = None;
+        fetch(5).await;
+        let snap = common::wait_for(&cap, Duration::from_secs(5), "new samples", |s| {
+            s.cpu.samples().len() == 10
+        })
+        .await;
+        assert_eq!(snap.cpu.status(snap.runs[0].id), &CpuStatus::On);
+        let calls = cpu_calls(&server);
+        assert_eq!(calls[3].0, "isolates/2");
     });
 }
