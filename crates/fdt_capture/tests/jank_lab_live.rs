@@ -14,7 +14,6 @@
 
 mod common;
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fdt_analysis::explain::{Cause, Explanation, explain};
@@ -92,13 +91,28 @@ fn janky_frames(s: &Snapshot, from: usize) -> Vec<usize> {
     v
 }
 
-/// The slowest janky frame whose build phase is most of its UI time. The slowest of all can be
-/// a one-off stall (e.g. the VM serving the CPU-samples fetch), which no build code explains.
-fn build_janky(s: &Snapshot, from: usize) -> Option<usize> {
-    janky_frames(s, from).into_iter().find(|&i| {
-        let ui = s.frames.get(i).unwrap().ui.unwrap();
-        u64::from(ui.build_us) * 2 >= u64::from(ui.ui_us)
-    })
+/// The janky frames whose build phase is at least half their UI time. The single slowest frame
+/// can be a one-off stall (e.g. the VM serving the CPU-samples fetch), which no build code
+/// explains, so the checks look at all of these and require most to be explained.
+fn build_janky(s: &Snapshot, from: usize) -> Vec<usize> {
+    janky_frames(s, from)
+        .into_iter()
+        .filter(|&i| {
+            let ui = s.frames.get(i).unwrap().ui.unwrap();
+            u64::from(ui.build_us) * 2 >= u64::from(ui.ui_us)
+        })
+        .collect()
+}
+
+/// The janky frames dominated by raster.
+fn raster_janky(s: &Snapshot, from: usize) -> Vec<usize> {
+    janky_frames(s, from)
+        .into_iter()
+        .filter(|&i| {
+            let f = s.frames.get(i).unwrap();
+            f.raster_us > s.frame_budget_us(f.run) && f.raster_us > f.build_us
+        })
+        .collect()
 }
 
 fn with_phases(s: &Snapshot, from: usize) -> usize {
@@ -110,40 +124,62 @@ fn with_phases(s: &Snapshot, from: usize) -> usize {
         .count()
 }
 
-/// Polls (fetching CPU samples each round) until `pick` finds a frame from `from` on whose
-/// explanation it accepts. Returns the sentence and the explanation, and prints the sentence.
-async fn explained(
+/// Observes for `window`, fetching CPU samples each round, then explains every frame `pick`
+/// returns from `from` on. Requires at least 5 such frames and at least 80 % of them accepted
+/// by `ok`. Prints the fraction and the slowest accepted frame's sentence.
+#[allow(clippy::too_many_arguments)]
+async fn attributed(
     cap: &Capture,
     vm: &VmService,
     iso: &str,
     from: usize,
     what: &str,
-    pick: impl Fn(&Snapshot, usize) -> Option<usize>,
+    window: Duration,
+    pick: impl Fn(&Snapshot, usize) -> Vec<usize>,
     ok: impl Fn(&Explanation) -> bool,
-) -> (Arc<Snapshot>, usize, Explanation) {
-    let deadline = Instant::now() + Duration::from_secs(25);
-    let mut last = String::from("no candidate frame");
-    loop {
+) -> String {
+    let end = Instant::now() + window;
+    while Instant::now() < end {
         // A background window may stop drawing; `list` schedules a frame.
         let _ = vm
             .call_extension("ext.jank_lab.run", iso, json!({"action": "list"}))
             .await;
         cap.fetch_cpu_samples();
         sleep(Duration::from_millis(700)).await;
-        let snap = cap.snapshots().borrow().clone();
-        if let Some(seq) = pick(&snap, from) {
-            let e = explain(&snap, seq);
-            if ok(&e) {
-                println!("{what}: frame {seq}: {}", e.sentence);
-                return (snap, seq, e);
-            }
-            last = format!("frame {seq}: {} / {:?}", e.sentence, e.cause);
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{what}: no matching explanation; last: {last}"
-        );
     }
+    cap.fetch_cpu_samples();
+    sleep(Duration::from_millis(1000)).await;
+    let snap = cap.snapshots().borrow().clone();
+    let frames = pick(&snap, from);
+    let mut good = 0;
+    let mut sentence = None;
+    let mut wrong = Vec::new();
+    for &seq in &frames {
+        let e = explain(&snap, seq);
+        if ok(&e) {
+            good += 1;
+            sentence.get_or_insert(e.sentence);
+        } else if wrong.len() < 3 {
+            wrong.push(format!("frame {seq}: {}", e.sentence));
+        }
+    }
+    println!(
+        "{what}: {good}/{} frames attributed correctly ({:.0}%); {}",
+        frames.len(),
+        100.0 * good as f64 / frames.len().max(1) as f64,
+        sentence.as_deref().unwrap_or("-")
+    );
+    assert!(
+        frames.len() >= 5,
+        "{what}: only {} candidate frames",
+        frames.len()
+    );
+    assert!(
+        good * 5 >= frames.len() * 4,
+        "{what}: {good}/{} attributed; wrong e.g. {wrong:?}",
+        frames.len()
+    );
+    format!("{good}/{}", frames.len())
 }
 
 fn frames_len(cap: &Capture) -> usize {
@@ -176,28 +212,29 @@ async fn perf_checks(cap: &Capture, vm: &VmService, iso: &str) {
         with_phases(&snap, from),
         t.elapsed().as_millis()
     );
-    let (_, _, e) = explained(
+    attributed(
         cap,
         vm,
         iso,
         from,
         "jank (cpu)",
+        Duration::from_secs(3),
         build_janky,
         |e| matches!(&e.cause, Cause::HotFunction { function, .. } if function.contains("_HeavyBuildPanelState.build")),
     )
     .await;
-    assert!(matches!(e.cause, Cause::HotFunction { .. }));
 
     // Jank with tracing: the widget is named.
     cap.set_trace_widget_builds(true);
     sleep(Duration::from_secs(2)).await;
     let from2 = frames_len(cap);
-    let (_, _, _) = explained(
+    attributed(
         cap,
         vm,
         iso,
         from2,
         "jank (tracing)",
+        Duration::from_secs(3),
         build_janky,
         |e| matches!(&e.cause, Cause::WidgetBuild { widget, .. } if &**widget == "HeavyBuildPanel"),
     )
@@ -220,36 +257,14 @@ async fn perf_checks(cap: &Capture, vm: &VmService, iso: &str) {
     act(vm, iso, "raster_on").await;
     sleep(Duration::from_secs(3)).await;
     let from3 = frames_len(cap);
-    sleep(Duration::from_secs(2)).await;
-    {
-        let snap = cap.snapshots().borrow().clone();
-        let mut v: Vec<_> = (from3..snap.frames.len())
-            .map(|i| {
-                let f = snap.frames.get(i).unwrap();
-                (f.raster_us, f.build_us, f.elapsed_us)
-            })
-            .collect();
-        v.sort();
-        v.reverse();
-        v.truncate(8);
-        println!(
-            "raster diag: frames={} budget={} top (raster,build,elapsed) us={v:?}",
-            snap.frames.len() - from3,
-            snap.latest_budget_us()
-        );
-    }
-    let (_, _, _) = explained(
+    attributed(
         cap,
         vm,
         iso,
         from3,
         "raster",
-        |s, f| {
-            janky_frames(s, f).into_iter().find(|&i| {
-                let fr = s.frames.get(i).unwrap();
-                fr.raster_us > s.frame_budget_us(fr.run) && fr.raster_us > fr.build_us
-            })
-        },
+        Duration::from_secs(3),
+        raster_janky,
         |e| matches!(e.cause, Cause::Raster { save_layers } if save_layers >= 10),
     )
     .await;

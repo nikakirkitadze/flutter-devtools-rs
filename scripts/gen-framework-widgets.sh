@@ -39,7 +39,7 @@ names="$(cat "$lib"/widgets/*.dart "$lib"/material/*.dart "$lib"/cupertino/*.dar
   echo "//!"
   echo "//! Generated from Flutter $version. Regenerate with:"
   echo "//!"
-  echo "//! `scripts/gen-framework-widgets.sh [flutter-sdk-dir]`"
+  echo '//! `scripts/gen-framework-widgets.sh [flutter-sdk-dir]`'
   echo
   echo "/// Sorted bytewise, for a binary search."
   echo "pub static FRAMEWORK_WIDGETS: &[&str] = &["
@@ -84,5 +84,5 @@ mod tests {
 }
 RS
 } >"$out"
-rustfmt --edition 2024 "$out" 2>/dev/null || true
+rustfmt --edition 2024 "$out"
 echo "wrote $(grep -c '^    "' "$out") widgets to $out (Flutter $version)"

@@ -57,6 +57,16 @@ fn ui_lanes(snap: &Snapshot, run: RunId) -> &[LaneSnapshot] {
 }
 
 pub fn frame_rebuilds(snap: &Snapshot, frame_seq: usize) -> Option<FrameRebuilds> {
+    frame_rebuilds_with(snap, frame_seq, &user_classes(snap))
+}
+
+/// [`frame_rebuilds`] with the CPU user-class set from [`user_classes`], for callers that look at
+/// many frames of one snapshot.
+pub fn frame_rebuilds_with(
+    snap: &Snapshot,
+    frame_seq: usize,
+    user: &HashSet<String>,
+) -> Option<FrameRebuilds> {
     let frame = snap.frames.get(frame_seq)?;
     let ui = frame.ui?;
     let lanes = ui_lanes(snap, frame.run);
@@ -141,8 +151,14 @@ pub fn frame_rebuilds(snap: &Snapshot, frame_seq: usize) -> Option<FrameRebuilds
             largest_of[p] = Some(c);
         }
     }
-    let user = user_classes(snap);
-    let is_user = |name: &str| user.contains(name) || !is_framework_widget(name);
+    // One verdict per distinct name: a frame has far fewer names than nodes.
+    let mut verdicts: HashMap<NameId, bool> = HashMap::new();
+    let mut is_user = |id: NameId| -> bool {
+        *verdicts.entry(id).or_insert_with(|| {
+            let name = snap.timeline.name(id);
+            user.contains(name) || !is_framework_widget(name)
+        })
+    };
     let mut child_count = vec![0u32; nodes.len()];
     let mut depth = vec![0u32; nodes.len()];
     let mut root_of: Vec<usize> = (0..nodes.len()).collect();
@@ -156,7 +172,7 @@ pub fn frame_rebuilds(snap: &Snapshot, frame_seq: usize) -> Option<FrameRebuilds
     // Per root, the user widget below it with the largest subtree; ties go to the shallowest.
     let mut user_best: Vec<Option<usize>> = vec![None; nodes.len()];
     for (i, n) in nodes.iter().enumerate().filter(|(_, n)| n.parent.is_some()) {
-        if !is_user(snap.timeline.name(n.name)) {
+        if !is_user(n.name) {
             continue;
         }
         let r = root_of[i];
@@ -213,7 +229,7 @@ pub fn frame_rebuilds(snap: &Snapshot, frame_seq: usize) -> Option<FrameRebuilds
 
 /// Class names of the app's own code, from the CPU function table (`Class.method` in a user
 /// library). A State class also gives its widget: `_FooState` adds `Foo`.
-fn user_classes(snap: &Snapshot) -> HashSet<String> {
+pub fn user_classes(snap: &Snapshot) -> HashSet<String> {
     let mut set = HashSet::new();
     for i in 0..snap.cpu.function_count() {
         let f = snap.cpu.function(FunctionId(i as u32));
@@ -252,6 +268,7 @@ pub fn range_rebuilds(
     cancel: &AtomicBool,
 ) -> Option<Vec<WidgetCount>> {
     let seqs = range.map_or(0..snap.frames.len(), |r| snap.frames.range(r));
+    let user = user_classes(snap);
     let merged = seqs
         .into_par_iter()
         .filter(|&i| {
@@ -262,7 +279,7 @@ pub fn range_rebuilds(
         })
         .fold(HashMap::<Arc<str>, WidgetCount>::new, |mut acc, i| {
             if !cancel.load(Ordering::Relaxed)
-                && let Some(fr) = frame_rebuilds(snap, i)
+                && let Some(fr) = frame_rebuilds_with(snap, i, &user)
             {
                 for w in fr.widgets {
                     merge(&mut acc, w);

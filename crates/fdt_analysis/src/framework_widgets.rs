@@ -2,7 +2,7 @@
 //!
 //! Generated from Flutter 3.47.9. Regenerate with:
 //!
-//!
+//! `scripts/gen-framework-widgets.sh [flutter-sdk-dir]`
 
 /// Sorted bytewise, for a binary search.
 pub static FRAMEWORK_WIDGETS: &[&str] = &[
