@@ -32,6 +32,7 @@ use fdt_capture::ConnStatus;
 use fdt_store::run::{AppInfo, Mode};
 use fdt_store::time::{EntryId, RunId, SessionTime};
 use fdt_ui::assets::FdtAssets;
+use fdt_ui::viewport::Viewport;
 use gpui_kit::profiler::{FrameEvent, FrameTimingCollector, set_trace_enabled};
 use gpui_kit::{
     App, Entity, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
@@ -437,7 +438,30 @@ pub struct Script {
     /// `cpu-tree`: levels expanded so far, and the rows once expanded.
     levels: usize,
     tree_len: usize,
+    /// What the scenario did, for the end-of-run check that it did what its name says.
+    seen: Seen,
     outcome: Outcome,
+}
+
+/// Motion observed while a scenario ran.
+#[derive(Clone, Debug, Default)]
+struct Seen {
+    /// Zoom scenarios: the narrowest span, the span when the zoom-out ended, and whether a pan
+    /// step moved the view start.
+    min_span: Option<u64>,
+    returned_span: Option<u64>,
+    pan_moved: bool,
+    /// `frame-chart`: the bar width at the start and its widest, and whether panning hit the end.
+    bar0: f32,
+    bar_max: f32,
+    reached_end: bool,
+    /// `live-perf`: frames in the chart at the start and the latest, and whether it followed the
+    /// newest frame at every step.
+    rows0: usize,
+    rows: usize,
+    followed: bool,
+    /// `cpu-tree`: the furthest the tree's own scroll position got, in pixels.
+    top_max: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -447,6 +471,10 @@ enum ZoomPhase {
     Pan,
 }
 
+/// How much of the starting span a zoom-out must regain before the pan, and how much the check
+/// at the end demands.
+const RETURN_TO: f64 = 0.99;
+const RETURN_AT_LEAST: f64 = 0.9;
 /// The zoom factor of one step.
 const ZOOM_FACTOR: f32 = 1.25;
 /// Where zooms anchor, in pixels from the plot's left edge.
@@ -490,6 +518,10 @@ impl Script {
             pans: 0,
             levels: 0,
             tree_len: 0,
+            seen: Seen {
+                followed: true,
+                ..Seen::default()
+            },
             outcome: Outcome::default(),
         }
     }
@@ -535,6 +567,9 @@ impl Script {
                     Scenario::CpuTree => self.tree_step(shell, cx),
                 }
                 self.outcome.steps += 1;
+                if self.phase == Phase::Done && self.outcome.error.is_none() {
+                    self.verify(shell, cx);
+                }
             }
             Phase::Done => {}
         }
@@ -558,6 +593,8 @@ impl Script {
             && self.scenario_ready(shell, cx)
         {
             self.phase = Phase::Running;
+            // Setup is outside the measured window: `started` is taken after it.
+            self.setup(shell, cx);
             self.started = Some(Instant::now());
             self.frame = 0;
         }
@@ -599,9 +636,111 @@ impl Script {
         }
     }
 
+    /// One-time work the measured steps then do not pay for: the targets of `frame-details`, the
+    /// chart at its oldest frame, the zoom scenarios' starting span.
+    fn setup(&mut self, shell: &Entity<MainWindow>, cx: &mut App) {
+        let perf = shell.read(cx).performance_view().clone();
+        match self.scenario {
+            Scenario::FrameDetails => {
+                let snap = shell.read(cx).session().read(cx).snapshot().clone();
+                let mut all: Vec<(u32, EntryId)> = (0..snap.frames.len())
+                    .filter_map(|i| snap.frames.get(i))
+                    .map(|f| (f.time_us(), f.id))
+                    .collect();
+                all.sort_by_key(|a| std::cmp::Reverse(a.0));
+                self.targets = all.into_iter().take(self.len).map(|(_, id)| id).collect();
+                if self.targets.is_empty() {
+                    self.fail("the session has no frames to select");
+                    return;
+                }
+                self.len = self.targets.len();
+            }
+            Scenario::FrameChart => {
+                // The chart opens on the newest frame; start from the oldest.
+                let chart = perf.read(cx).chart().clone();
+                chart.update(cx, |c, cx| c.pan_px(-1.0e9, cx));
+                self.seen.bar0 = chart.read(cx).bar_px();
+                self.seen.bar_max = self.seen.bar0;
+            }
+            Scenario::TimelineZoom | Scenario::TraceZoom | Scenario::FlameZoom => {
+                self.fit_span = Some(self.viewport(shell, cx).span_ns);
+            }
+            Scenario::LivePerf => {
+                self.seen.rows0 = perf.read(cx).chart().read(cx).len();
+            }
+            _ => {}
+        }
+    }
+
+    /// Fails the run when the scenario did not do what its name says.
+    fn verify(&mut self, shell: &Entity<MainWindow>, cx: &mut App) {
+        let seen = self.seen.clone();
+        let verdict = match self.scenario {
+            Scenario::FrameChart => {
+                let chart = shell.read(cx).performance_view().read(cx).chart().clone();
+                let end = chart.read(cx).bar_px();
+                if !seen.reached_end {
+                    Err("the pan never reached the newest frame".to_string())
+                } else if seen.bar_max <= seen.bar0 || end >= seen.bar_max {
+                    Err(format!(
+                        "the bars did not zoom in and back out (start {}, widest {}, end {end})",
+                        seen.bar0, seen.bar_max
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            Scenario::TimelineZoom | Scenario::TraceZoom | Scenario::FlameZoom => {
+                let fit = self.fit_span.unwrap_or(0);
+                match (seen.min_span, seen.returned_span) {
+                    (Some(min), _) if min > TARGET_SPAN_NS => Err(format!(
+                        "the zoom reached only {min} ns, not {TARGET_SPAN_NS} ns"
+                    )),
+                    (_, Some(back)) if (back as f64) < fit as f64 * RETURN_AT_LEAST => Err(
+                        format!("the zoom-out came back to {back} ns of the starting {fit} ns"),
+                    ),
+                    (_, None) => Err("the zoom never came back out; use more --frames".to_string()),
+                    _ if !seen.pan_moved => Err("panning did not move the view".to_string()),
+                    _ => Ok(()),
+                }
+            }
+            Scenario::LivePerf => {
+                let chart = shell.read(cx).performance_view().read(cx).chart().read(cx);
+                let grown = seen.rows.saturating_sub(seen.rows0);
+                let expected = self.started.map_or(0, |t| {
+                    (t.elapsed().as_millis() / LIVE_EVERY.as_millis()) as usize
+                });
+                let want = LIVE_FRAMES.max(LIVE_FRAMES * expected / 10);
+                if grown < want {
+                    Err(format!(
+                        "the session grew by {grown} frames, expected at least {want}"
+                    ))
+                } else if !seen.followed || !chart.following() || !chart.at_end() {
+                    Err("the chart did not follow the newest frame".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+            Scenario::CpuTree => {
+                if self.tree_len > 50 && seen.top_max <= 0.0 {
+                    Err("the tree was scrolled but its scroll position never moved".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Ok(()),
+        };
+        if let Err(message) = verdict {
+            self.fail(&message);
+        }
+    }
+
     fn live_perf_step(&mut self, shell: &Entity<MainWindow>, cx: &mut App) {
         let perf = shell.read(cx).performance_view().read(cx);
-        self.outcome.last_position = Some(perf.chart().read(cx).len());
+        let chart = perf.chart().read(cx);
+        self.seen.rows = chart.len();
+        self.seen.followed &= chart.following();
+        self.outcome.last_position = Some(chart.len());
         self.next_frame();
     }
 
@@ -609,10 +748,6 @@ impl Script {
     fn chart_step(&mut self, shell: &Entity<MainWindow>, cx: &mut App) {
         let chart = shell.read(cx).performance_view().read(cx).chart().clone();
         let pan_steps = (self.len * 5 / 6).max(1);
-        if self.frame == 0 {
-            // The chart opens on the newest frame; start from the oldest.
-            chart.update(cx, |c, cx| c.pan_px(-1.0e9, cx));
-        }
         if self.frame < pan_steps {
             let (total, bar) = {
                 let c = chart.read(cx);
@@ -626,27 +761,16 @@ impl Script {
             let factor = if k < half { 1.15 } else { 1.0 / 1.15 };
             chart.update(cx, |c, cx| c.zoom_about(400.0, factor, cx));
         }
-        self.outcome.last_position = Some(chart.read(cx).first());
+        let c = chart.read(cx);
+        self.seen.reached_end |= self.frame < pan_steps && c.at_end();
+        self.seen.bar_max = self.seen.bar_max.max(c.bar_px());
+        self.outcome.last_position = Some(c.first());
         self.next_frame();
     }
 
     /// Selects the next of the slowest frames once the previous one's sentence was seen.
     fn details_step(&mut self, shell: &Entity<MainWindow>, window: &mut Window, cx: &mut App) {
         let now = Instant::now();
-        if self.targets.is_empty() {
-            let snap = shell.read(cx).session().read(cx).snapshot().clone();
-            let mut all: Vec<(u32, EntryId)> = (0..snap.frames.len())
-                .filter_map(|i| snap.frames.get(i))
-                .map(|f| (f.time_us(), f.id))
-                .collect();
-            all.sort_by_key(|a| std::cmp::Reverse(a.0));
-            self.targets = all.into_iter().take(self.len).map(|(_, id)| id).collect();
-            if self.targets.is_empty() {
-                self.fail("the session has no frames to select");
-                return;
-            }
-            self.len = self.targets.len();
-        }
         if let Some(p) = &self.pending {
             let id = self.targets[self.switches - 1];
             let ready = shell.read(cx).performance_view().read(cx).details_ready(id);
@@ -683,17 +807,17 @@ impl Script {
         }
     }
 
-    /// The viewport span of the view the zoom scenario works on.
-    fn span(&self, shell: &Entity<MainWindow>, cx: &App) -> u64 {
+    /// The viewport of the view the zoom scenario works on.
+    fn viewport(&self, shell: &Entity<MainWindow>, cx: &App) -> Viewport {
         match self.scenario {
-            Scenario::TimelineZoom => shell.read(cx).timeline_view().read(cx).viewport().span_ns,
+            Scenario::TimelineZoom => shell.read(cx).timeline_view().read(cx).viewport(),
             Scenario::TraceZoom => {
                 let perf = shell.read(cx).performance_view().read(cx);
-                perf.trace().read(cx).viewport().span_ns
+                perf.trace().read(cx).viewport()
             }
             _ => {
                 let perf = shell.read(cx).performance_view().read(cx);
-                perf.cpu().read(cx).flame().read(cx).viewport().span_ns
+                perf.cpu().read(cx).flame().read(cx).viewport()
             }
         }
     }
@@ -735,14 +859,18 @@ impl Script {
 
     /// In to [`TARGET_SPAN_NS`], back out to the starting span, then one deep zoom and pans.
     fn zoom_step(&mut self, shell: &Entity<MainWindow>, cx: &mut App) {
-        let span = self.span(shell, cx);
-        let fit = *self.fit_span.get_or_insert(span);
+        let before = self.viewport(shell, cx);
+        let span = before.span_ns;
+        let fit = self.fit_span.unwrap_or(span);
+        self.seen.min_span = Some(self.seen.min_span.map_or(span, |m| m.min(span)));
         if self.zoom == ZoomPhase::In && span <= TARGET_SPAN_NS {
             self.zoom = ZoomPhase::Out;
         }
-        if self.zoom == ZoomPhase::Out && span >= fit / 100 * 99 {
+        if self.zoom == ZoomPhase::Out && span as f64 >= fit as f64 * RETURN_TO {
             self.zoom = ZoomPhase::Pan;
+            self.seen.returned_span = Some(span);
         }
+        let mut panned = false;
         match self.zoom {
             ZoomPhase::In => self.move_view(shell, cx, Some(ZOOM_FACTOR), 0.0),
             ZoomPhase::Out => self.move_view(shell, cx, Some(1.0 / ZOOM_FACTOR), 0.0),
@@ -758,13 +886,17 @@ impl Script {
                 };
                 self.pans += 1;
                 self.move_view(shell, cx, None, dir * PAN_PX);
+                panned = true;
             }
         }
-        self.outcome.last_position = Some(self.span(shell, cx).min(usize::MAX as u64) as usize);
+        let after = self.viewport(shell, cx);
+        self.seen.pan_moved |= panned && after.start_ns != before.start_ns;
+        self.seen.min_span = self.seen.min_span.map(|m| m.min(after.span_ns));
+        self.outcome.last_position = Some(after.start_ns.min(usize::MAX as u64) as usize);
         self.next_frame();
     }
 
-    /// Opens one more level of the top-down tree per step, then selects rows down the list.
+    /// Opens one more level of the top-down tree per step, then scrolls down the list.
     fn tree_step(&mut self, shell: &Entity<MainWindow>, cx: &mut App) {
         let cpu = shell.read(cx).performance_view().read(cx).cpu().clone();
         if self.levels < TREE_LEVELS {
@@ -780,7 +912,8 @@ impl Script {
                 }
             }
             let i = ((self.frame - TREE_LEVELS) * TREE_STRIDE).min(self.tree_len - 1);
-            cpu.update(cx, |c, cx| c.select_row(i, cx));
+            cpu.update(cx, |c, cx| c.scroll_tree_to(i, cx));
+            self.seen.top_max = self.seen.top_max.max(cpu.read(cx).tree_scroll_px(cx));
             self.outcome.last_position = Some(i);
         }
         self.next_frame();
@@ -1239,8 +1372,8 @@ fn tick(driver: Rc<RefCell<Driver>>, window: &mut Window, cx: &mut App) {
     };
     match scenario {
         // These work in views that notify themselves; the shell's notify below draws the frame.
-        Scenario::ToolSwitch => {}
-        _ if matches!(scenario.home(), Tool::Performance | Tool::Timeline) => {}
+        _ if scenario == Scenario::ToolSwitch
+            || matches!(scenario.home(), Tool::Performance | Tool::Timeline) => {}
         _ if scenario.home() == Tool::Network => {
             cx.notify(shell.read(cx).network_view().entity_id())
         }
@@ -1702,7 +1835,6 @@ mod tests {
             (Scenario::TraceZoom, 200),
             (Scenario::FlameZoom, 200),
             (Scenario::CpuTree, 60),
-            (Scenario::LivePerf, 8),
         ] {
             let (shell, vcx) = open_shell_with(cx, |_| {
                 SessionModel::fixed(perf_snapshot(), connected("stress", true))
@@ -1747,5 +1879,95 @@ mod tests {
         for tool in [Tool::Network, Tool::Performance, Tool::Timeline, Tool::Logs] {
             assert!(shown.contains(&Page::Tool(tool)), "{tool:?} was visited");
         }
+    }
+
+    /// Steps `LivePerf` over a session a [`fdt_store::synth::PerfFeed`] keeps growing by
+    /// `per_step` frames before each step.
+    fn run_live_perf(cx: &mut TestAppContext, per_step: usize, len: usize) -> Script {
+        use crate::test_support::open_shell_fake;
+        let (shell, vcx, handle) = open_shell_fake(cx);
+        let (mut w, run) = fdt_store::synth::writer(3, 0, 0, 0);
+        fdt_store::synth::perf(&mut w, run, 600, 3, 120);
+        w.set_refresh_rate(run, 120.0);
+        let mut feed = fdt_store::synth::PerfFeed::new(&mut w, run, SEED, 120);
+        handle.snaps.send(w.publish()).unwrap();
+        vcx.run_until_parked();
+        let mut script = Script::new(Scenario::LivePerf, Some(len));
+        for _ in 0..3_000 {
+            if per_step > 0 {
+                handle.snaps.send(feed.append(&mut w, per_step)).unwrap();
+            }
+            vcx.update(|window, cx| {
+                window.render_frame(cx);
+                script.step(&shell, window, cx);
+            });
+            vcx.run_until_parked();
+            if script.is_done() {
+                break;
+            }
+        }
+        script
+    }
+
+    #[gpui_kit::test]
+    fn live_perf_checks_that_the_session_grew_and_the_chart_followed(cx: &mut TestAppContext) {
+        let s = run_live_perf(cx, LIVE_FRAMES, 10);
+        assert!(s.is_done());
+        assert_eq!(s.outcome().error, None);
+        let rows = s.outcome().last_position.unwrap();
+        // 600 frames to begin with; the warm-up and the 10 steps each added two.
+        assert!(rows >= 600 + 10 * LIVE_FRAMES, "{rows} frames");
+        assert!(s.seen.rows - s.seen.rows0 >= 10 * LIVE_FRAMES);
+        assert!(s.seen.followed);
+    }
+
+    #[gpui_kit::test]
+    fn live_perf_fails_when_nothing_is_published(cx: &mut TestAppContext) {
+        let s = run_live_perf(cx, 0, 10);
+        assert!(s.is_done());
+        let error = s.outcome().error.clone().unwrap_or_default();
+        assert!(error.contains("grew by 0 frames"), "{error}");
+    }
+
+    #[gpui_kit::test]
+    fn a_zoom_scenario_that_never_gets_back_out_fails(cx: &mut TestAppContext) {
+        let (shell, vcx) = open_shell_with(cx, |_| {
+            SessionModel::fixed(perf_snapshot(), connected("stress", true))
+        });
+        // Too few steps to zoom in, come back and pan.
+        let mut script = Script::new(Scenario::TimelineZoom, Some(5));
+        for _ in 0..3_000 {
+            vcx.update(|window, cx| {
+                window.render_frame(cx);
+                script.step(&shell, window, cx);
+            });
+            vcx.run_until_parked();
+            if script.is_done() {
+                break;
+            }
+        }
+        let error = script.outcome().error.clone().unwrap_or_default();
+        assert!(error.contains("zoom reached only"), "{error}");
+    }
+
+    #[gpui_kit::test]
+    fn setup_runs_before_the_measured_window(cx: &mut TestAppContext) {
+        let (shell, vcx) = open_shell_with(cx, |_| {
+            SessionModel::fixed(perf_snapshot(), connected("stress", true))
+        });
+        let mut script = Script::new(Scenario::FrameDetails, Some(5));
+        for _ in 0..3_000 {
+            vcx.update(|window, cx| script.step(&shell, window, cx));
+            vcx.run_until_parked();
+            if script.measuring_since().is_some() {
+                break;
+            }
+        }
+        assert_eq!(
+            script.targets.len(),
+            5,
+            "the targets exist when measuring starts"
+        );
+        assert_eq!(script.outcome().steps, 0);
     }
 }

@@ -433,7 +433,8 @@ impl PerfFeed {
         }
     }
 
-    /// Appends `n` frames (with phases) and the slices under them, and publishes.
+    /// Appends `n` frames (with phases) and the slices under them, and publishes. The slicer
+    /// reads the new frames from a snapshot, so this publishes twice; the first is discarded.
     pub fn append(&mut self, w: &mut SessionWriter, n: usize) -> std::sync::Arc<crate::Snapshot> {
         let first = self.next;
         push_frames(w, self.run, &mut self.frame_rng, first as u64, n, self.hz);
@@ -678,27 +679,6 @@ pub fn stress_session(seed: u64) -> std::sync::Arc<crate::Snapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_perf_feed_appends_frames_with_phases_and_slices() {
-        let (mut w, run) = writer_for_perf();
-        let mut feed = PerfFeed::new(&mut w, run, 7, 120);
-        let before = w.publish();
-        let (frames, slices) = (before.frames.len(), before.timeline.slice_count());
-        let after = feed.append(&mut w, 2);
-        assert_eq!(after.frames.len(), frames + 2);
-        let last = after.frames.get(frames + 1).unwrap();
-        assert!(last.ui.is_some() && last.raster.is_some());
-        assert_eq!(last.number, frames as u64 + 1);
-        let added = after.timeline.slice_count() - slices;
-        assert!((60..=300).contains(&added), "{added} slices for two frames");
-    }
-
-    fn writer_for_perf() -> (SessionWriter, RunId) {
-        let (mut w, run) = super::writer(3, 0, 0, 0);
-        perf(&mut w, run, 200, 3, 120);
-        (w, run)
-    }
     use crate::logs::testkit::writer;
     use crate::net::StatusClass;
 
@@ -729,5 +709,74 @@ mod tests {
             .filter(|&i| s.net.request(i).method == "POST")
             .count();
         assert!((3_000..5_000).contains(&posts));
+    }
+
+    /// FNV-1a over the bytes fed to it, so the pin below does not depend on a hasher's version.
+    struct Fnv(u64);
+    impl Fnv {
+        fn put(&mut self, bytes: &[u8]) {
+            for b in bytes {
+                self.0 = (self.0 ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        fn num(&mut self, n: u64) {
+            self.put(&n.to_le_bytes());
+        }
+    }
+
+    /// `(frames, slices, hash)` of everything `perf` stores: every frame with its phases, every
+    /// track, and every slice of every lane as (track, depth, start, dur, name, category).
+    fn perf_fingerprint(frames: usize, seed: u64) -> (usize, u64, u64) {
+        let (mut w, run) = super::writer(seed, 0, 0, 0);
+        perf(&mut w, run, frames, seed, 120);
+        let snap = w.publish();
+        let mut h = Fnv(0xcbf2_9ce4_8422_2325);
+        for i in 0..snap.frames.len() {
+            h.put(format!("{:?}", snap.frames.get(i).unwrap()).as_bytes());
+        }
+        for (t, info) in snap.timeline.tracks().iter().enumerate() {
+            h.put(format!("{info:?}").as_bytes());
+            for (depth, lane) in snap.timeline.lanes(info.id).iter().enumerate() {
+                for i in 0..lane.len() {
+                    let s = lane.get(i);
+                    h.num(t as u64);
+                    h.num(depth as u64);
+                    h.num(s.start.0);
+                    h.num(s.dur_ns);
+                    h.put(snap.timeline.name(s.name).as_bytes());
+                    h.put(format!("{:?}", s.cat).as_bytes());
+                }
+            }
+        }
+        (snap.frames.len(), snap.timeline.slice_count(), h.0)
+    }
+
+    const PERF_PIN: (usize, u64, u64) = (2_000, 137_658, 271_936_546_378_956_273);
+
+    #[test]
+    fn perf_output_is_unchanged_by_the_generator_split() {
+        // Recorded from `perf` as of commit 16ee413, before PerfSlicer was split out.
+        assert_eq!(perf_fingerprint(2_000, 42), PERF_PIN);
+    }
+
+    #[test]
+    fn the_perf_feed_appends_frames_with_phases_and_slices() {
+        let (mut w, run) = perf_writer();
+        let mut feed = PerfFeed::new(&mut w, run, 7, 120);
+        let before = w.publish();
+        let (frames, slices) = (before.frames.len(), before.timeline.slice_count());
+        let after = feed.append(&mut w, 2);
+        assert_eq!(after.frames.len(), frames + 2);
+        let last = after.frames.get(frames + 1).unwrap();
+        assert!(last.ui.is_some() && last.raster.is_some());
+        assert_eq!(last.number, frames as u64 + 1);
+        let added = after.timeline.slice_count() - slices;
+        assert!((60..=300).contains(&added), "{added} slices for two frames");
+    }
+
+    fn perf_writer() -> (SessionWriter, RunId) {
+        let (mut w, run) = super::writer(3, 0, 0, 0);
+        perf(&mut w, run, 200, 3, 120);
+        (w, run)
     }
 }

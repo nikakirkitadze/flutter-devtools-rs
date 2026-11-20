@@ -528,6 +528,21 @@ impl CpuTab {
         self.rebuild_items(cx);
     }
 
+    /// Scrolls the tree so row `ix` is at the top; the list applies it when next drawn.
+    pub fn scroll_tree_to(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.tree_state.update(cx, |s, cx| {
+            s.scroll_to_item(ix, gpui_kit::ScrollStrategy::Top);
+            cx.notify();
+        });
+    }
+
+    /// How far the tree's list is scrolled, in pixels (it applies a scroll when drawn).
+    pub fn tree_scroll_px(&self, cx: &App) -> f32 {
+        let handle = self.tree_state.read(cx).scroll_handle().clone();
+        let offset = handle.0.borrow().base_handle.offset();
+        -f32::from(offset.y)
+    }
+
     /// How many rows the tree shows.
     pub fn tree_len(&self, cx: &App) -> usize {
         let state = self.tree_state.read(cx);
@@ -629,6 +644,7 @@ impl CpuTab {
     }
 
     /// Selects tree row `ix`.
+    #[cfg(test)]
     pub fn select_row(&mut self, ix: usize, cx: &mut Context<Self>) {
         self.tree_state
             .update(cx, |s, cx| s.set_selected_index(Some(ix), cx));

@@ -203,6 +203,11 @@ impl FrameChart {
         self.rows.is_empty()
     }
 
+    /// Whether the newest frame is in view.
+    pub fn at_end(&self) -> bool {
+        self.first >= self.max_first()
+    }
+
     pub fn bar_px(&self) -> f32 {
         self.bar_px
     }
