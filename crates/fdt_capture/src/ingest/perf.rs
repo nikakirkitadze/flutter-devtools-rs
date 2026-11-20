@@ -6,19 +6,23 @@
 //! sends the result to the session task as one [`TimelineBatch`].
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fdt_store::SessionWriter;
 use fdt_store::clock::RunClock;
+use fdt_store::cpu::{CpuSample, CpuStatus, FunctionId};
 use fdt_store::frames::{RasterPhase, UiPhases};
 use fdt_store::time::{RunId, SessionTime};
 use fdt_store::timeline::{Slice, SliceCat, TrackId, TrackKind};
+use fdt_vm::perfetto::CpuProfile;
 use fdt_vm::rpc::RpcError;
 use fdt_vm::service::VmService;
 use fdt_vm::timeline::{Category, TraceEvent};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::{Instant, MissedTickBehavior, interval, interval_at};
 
 use super::assemble::{AssembledBatch, Assembler, AssemblerStats, TrackKeyRaw};
 use super::{Ingest, SharedSink, Sink};
@@ -199,6 +203,8 @@ impl Pipeline {
 pub(crate) struct PerfConfig {
     pub(crate) poll: Duration,
     pub(crate) call_timeout: Duration,
+    pub(crate) cpu_poll: Duration,
+    pub(crate) cpu_call_timeout: Duration,
     /// The first window starts here (timeline µs).
     pub(crate) start_us: i64,
 }
@@ -206,11 +212,64 @@ pub(crate) struct PerfConfig {
 enum Msg {
     Events(Vec<TraceEvent>),
     StreamMode(bool),
+    FetchCpuNow,
+}
+
+/// What the CPU shows when the profiler is off.
+const CPU_OFF: &str = "CPU sampling is off in this app.";
+
+/// One fetch of CPU samples, in session time. Functions and stacks index into this batch only;
+/// the session interns them.
+#[derive(Debug)]
+pub(crate) struct CpuBatch {
+    pub(crate) run: RunId,
+    pub(crate) period_us: u32,
+    /// `(name, library)`; no library is a native function.
+    pub(crate) functions: Vec<(String, Option<String>)>,
+    /// Root first; indices into `functions`.
+    pub(crate) stacks: Vec<Vec<u32>>,
+    /// Sorted by time; the index is into `stacks`.
+    pub(crate) samples: Vec<(SessionTime, u32)>,
+    /// The samples cover the run up to here.
+    pub(crate) coverage_end: SessionTime,
+}
+
+/// Maps a decoded profile onto session time. Samples from before the session began are dropped,
+/// and the rest are sorted, because the VM does not order them.
+fn cpu_batch(sink: &Sink, profile: CpuProfile, period_us: i64, window_end_us: i64) -> CpuBatch {
+    let mut samples: Vec<(SessionTime, u32)> = profile
+        .samples
+        .iter()
+        .filter_map(|s| {
+            let st = sink.clock.from_timeline_us((s.ts_ns / 1000) as i64);
+            (!st.clamped).then_some((st.time, s.stack))
+        })
+        .collect();
+    samples.sort_by_key(|s| s.0);
+    CpuBatch {
+        run: sink.run,
+        period_us: period_us.clamp(1, i64::from(u32::MAX)) as u32,
+        functions: profile
+            .functions
+            .into_iter()
+            .map(|f| (f.name, f.library))
+            .collect(),
+        stacks: profile.stacks,
+        samples,
+        coverage_end: sink.clock.from_timeline_us(window_end_us).time,
+    }
 }
 
 /// The session's handle for commands to the poller task.
 pub(crate) struct PerfControl {
     tx: mpsc::UnboundedSender<Msg>,
+}
+
+impl PerfControl {
+    /// Fetches CPU samples at once, whether or not frames were drawn.
+    pub(crate) fn fetch_now(&self) {
+        let _ = self.tx.send(Msg::FetchCpuNow);
+    }
 }
 
 impl PerfControl {
@@ -225,13 +284,48 @@ impl PerfControl {
 pub(crate) struct PerfHub {
     tx: mpsc::UnboundedSender<Msg>,
     task: JoinHandle<()>,
+    /// The main isolate, which the router updates at a hot restart.
+    main: Arc<Mutex<String>>,
+    /// `Flutter.Frame` events seen since the task last looked.
+    frames: Arc<AtomicU64>,
 }
 
 impl PerfHub {
-    pub(crate) fn new(shared: SharedSink, svc: VmService, cfg: PerfConfig) -> PerfHub {
+    pub(crate) fn new(
+        shared: SharedSink,
+        svc: VmService,
+        cfg: PerfConfig,
+        main_isolate: String,
+    ) -> PerfHub {
         let (tx, rx) = mpsc::unbounded_channel();
-        let task = tokio::spawn(run(shared, svc, cfg, rx));
-        PerfHub { tx, task }
+        let main = Arc::new(Mutex::new(main_isolate));
+        let frames = Arc::new(AtomicU64::new(0));
+        let task = tokio::spawn(run(
+            shared,
+            svc,
+            cfg,
+            rx,
+            Cpu {
+                main: main.clone(),
+                frames: frames.clone(),
+            },
+        ));
+        PerfHub {
+            tx,
+            task,
+            main,
+            frames,
+        }
+    }
+
+    /// A hot restart: CPU samples come from the new isolate.
+    pub(crate) fn set_main_isolate(&self, id: &str) {
+        *self.main.lock().unwrap() = id.to_string();
+    }
+
+    /// A frame was drawn; the next CPU tick fetches.
+    pub(crate) fn frame_drawn(&self) {
+        self.frames.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn control(&self) -> std::sync::Arc<PerfControl> {
@@ -252,14 +346,92 @@ impl Drop for PerfHub {
     }
 }
 
+/// What the router shares with the task.
+struct Cpu {
+    main: Arc<Mutex<String>>,
+    frames: Arc<AtomicU64>,
+}
+
+/// The CPU side of the task: where the next window starts and whether a fetch is owed.
+struct CpuState {
+    next: i64,
+    /// Frames were drawn and no fetch has covered them yet (kept across a timeout).
+    pending: bool,
+    /// The profiler is off: no more fetches on this connection.
+    off: bool,
+}
+
+/// One CPU fetch. Returns false when the connection closed.
+async fn fetch_cpu(
+    shared: &SharedSink,
+    svc: &VmService,
+    cfg: &PerfConfig,
+    cpu: &Cpu,
+    st: &mut CpuState,
+) -> bool {
+    let now = match svc.get_vm_timeline_micros().await {
+        Ok(n) => n,
+        Err(RpcError::Closed) => return false,
+        Err(e) => {
+            log::debug!("getVMTimelineMicros failed: {e}");
+            return true;
+        }
+    };
+    if now < st.next {
+        return true;
+    }
+    let isolate = cpu.main.lock().unwrap().clone();
+    let result = svc
+        .get_perfetto_cpu_samples(&isolate, st.next, now - st.next, cfg.cpu_call_timeout)
+        .await;
+    let sink = shared.get();
+    match result {
+        Ok((profile, window)) => {
+            if profile.skipped_samples > 0 {
+                log::debug!(
+                    "skipped {} CPU samples with unknown ids",
+                    profile.skipped_samples
+                );
+            }
+            st.next = now + 1;
+            st.pending = false;
+            let batch = cpu_batch(&sink, profile, window.period_us, now);
+            sink.send(Ingest::Cpu(batch));
+        }
+        Err(RpcError::Closed) => return false,
+        // The window stays: the next tick asks for it again, and more.
+        Err(RpcError::Timeout) => log::warn!("getPerfettoCpuSamples timed out; retrying"),
+        Err(e @ RpcError::Server { .. }) => {
+            log::info!("CPU sampling is off: {e}");
+            st.off = true;
+            sink.send(Ingest::CpuStatus(sink.run, CpuStatus::Off(CPU_OFF.into())));
+        }
+        // An answer that cannot be read would be unreadable again: move past it.
+        Err(e) => {
+            log::warn!("getPerfettoCpuSamples failed; skipping the window: {e}");
+            st.next = now + 1;
+            st.pending = false;
+        }
+    }
+    true
+}
+
 async fn run(
     shared: SharedSink,
     svc: VmService,
     cfg: PerfConfig,
     mut rx: mpsc::UnboundedReceiver<Msg>,
+    cpu: Cpu,
 ) {
     let mut tick = interval(cfg.poll);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut cpu_tick = interval_at(Instant::now() + cfg.cpu_poll, cfg.cpu_poll);
+    cpu_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut cs = CpuState {
+        next: cfg.start_us,
+        pending: false,
+        off: false,
+    };
     let mut pipe = Pipeline::new();
     let mut next = cfg.start_us;
     let mut stream_mode = false;
@@ -296,9 +468,23 @@ async fn run(
                     sink.send(Ingest::Timeline(b));
                 }
             }
+            _ = cpu_tick.tick(), if !cs.off => {
+                if cpu.frames.swap(0, Ordering::Relaxed) > 0 {
+                    cs.pending = true;
+                }
+                if cs.pending && !fetch_cpu(&shared, &svc, &cfg, &cpu, &mut cs).await {
+                    return;
+                }
+            }
             msg = rx.recv() => match msg {
                 None => return,
                 Some(Msg::StreamMode(on)) => stream_mode = on,
+                Some(Msg::FetchCpuNow) => {
+                    cpu.frames.store(0, Ordering::Relaxed);
+                    if !cs.off && !fetch_cpu(&shared, &svc, &cfg, &cpu, &mut cs).await {
+                        return;
+                    }
+                }
                 Some(Msg::Events(events)) => {
                     let sink = shared.get();
                     if let Some(b) = pipe.feed(&sink, events, None) {
@@ -346,6 +532,40 @@ pub(crate) fn store(w: &mut SessionWriter, batch: TimelineBatch, recording: bool
     for (n, r) in batch.raster {
         w.set_frame_raster(run, n, r);
     }
+}
+
+/// Writes a fetch into the store: interns its functions and stacks, then the samples (only while
+/// recording), the coverage, the period and `On`.
+pub(crate) fn store_cpu(w: &mut SessionWriter, batch: CpuBatch, recording: bool) {
+    let run = batch.run;
+    w.set_cpu_period(run, batch.period_us);
+    w.set_cpu_status(run, CpuStatus::On);
+    if !recording {
+        return;
+    }
+    let functions: Vec<FunctionId> = batch
+        .functions
+        .iter()
+        .map(|(name, lib)| w.intern_function(name, lib.as_deref()))
+        .collect();
+    let leaves: Vec<_> = batch
+        .stacks
+        .iter()
+        .map(|stack| {
+            let ids: Vec<FunctionId> = stack.iter().map(|&i| functions[i as usize]).collect();
+            w.intern_stack(&ids)
+        })
+        .collect();
+    let samples = batch
+        .samples
+        .into_iter()
+        .map(|(time, stack)| CpuSample {
+            time,
+            leaf: leaves[stack as usize],
+        })
+        .collect();
+    w.push_cpu_samples(run, samples);
+    w.set_cpu_coverage(run, batch.coverage_end);
 }
 
 #[cfg(test)]

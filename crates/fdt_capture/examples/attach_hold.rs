@@ -1,8 +1,10 @@
 //! Attaches the real capture to a running app and holds the connection, with no window.
 //!
 //! ```text
-//! cargo run --release -p fdt_capture --example attach_hold -- --uri ws://127.0.0.1:PORT/TOKEN/ws [--seconds 60]
+//! cargo run --release -p fdt_capture --example attach_hold -- --uri ws://127.0.0.1:PORT/TOKEN/ws [--seconds 60] [--cpu-poll 5]
 //! ```
+//!
+//! `--cpu-poll` sets how often CPU samples are fetched (seconds; default: the capture's own).
 //!
 //! Used to measure what a connected `fdt` costs the app when no display is available: the
 //! capture is the only part of `fdt` that talks to the app. Prints `connected` once attached and
@@ -32,7 +34,11 @@ fn main() {
     let seconds: u64 = arg("--seconds").and_then(|v| v.parse().ok()).unwrap_or(60);
     let rt = CaptureRuntime::new().expect("runtime");
     rt.handle().block_on(async {
-        let cap = Capture::start(rt.handle(), CaptureConfig::default(), None);
+        let mut cfg = CaptureConfig::default();
+        if let Some(secs) = arg("--cpu-poll").and_then(|v| v.parse::<f64>().ok()) {
+            cfg.cpu_poll = Duration::from_secs_f64(secs);
+        }
+        let cap = Capture::start(rt.handle(), cfg, None);
         cap.connect(Target::Uri(uri));
         let mut status = cap.status();
         tokio::time::timeout(
@@ -45,6 +51,11 @@ fn main() {
         println!("connected");
         tokio::time::sleep(Duration::from_secs(seconds)).await;
         let snap = cap.snapshots().borrow().clone();
-        println!("done logs={} frames={}", snap.logs.len(), snap.frames.len());
+        println!(
+            "done logs={} frames={} cpu_samples={}",
+            snap.logs.len(),
+            snap.frames.len(),
+            snap.cpu.samples().len()
+        );
     });
 }

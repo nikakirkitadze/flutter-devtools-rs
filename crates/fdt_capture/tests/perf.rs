@@ -526,3 +526,294 @@ fn replay_profile_perf() {
         assert!(checked >= 5);
     });
 }
+
+// ---- CPU samples ----
+
+use fdt_store::cpu::CpuStatus;
+use fdt_vm::perfetto::encode::{Response, cpu_samples};
+
+/// A VM like [`Sim`], serving `getPerfettoCpuSamples`. Each call returns 5 samples, newer than
+/// those of the call before.
+struct CpuSim {
+    micros: AtomicI64,
+    calls: AtomicI64,
+    /// `Some`: `getPerfettoCpuSamples` fails with this server error.
+    error: Mutex<Option<(i64, String)>>,
+}
+
+impl CpuSim {
+    fn new() -> Arc<CpuSim> {
+        Arc::new(CpuSim {
+            micros: AtomicI64::new(BASE),
+            calls: AtomicI64::new(0),
+            error: Mutex::default(),
+        })
+    }
+
+    fn server(self: &Arc<CpuSim>) -> ScriptedServer {
+        let sim = self.clone();
+        ScriptedServer::start(move |m, p| {
+            let iso = p["isolateId"].as_str().unwrap_or("isolates/1");
+            match m {
+                "getVM" => Ok(
+                    json!({"type": "VM", "pid": 7, "startTime": 99, "operatingSystem": "macos",
+                    "isolates": [{"id": "isolates/1", "name": "main", "isSystemIsolate": false}]}),
+                ),
+                "getIsolate" => Ok(json!({"type": "Isolate", "id": iso, "name": "main",
+                    "extensionRPCs": [], "rootLib": {"uri": "package:demo/main.dart"}})),
+                "streamListen" | "setVMTimelineFlags" => Ok(json!({"type": "Success"})),
+                "getVMTimelineMicros" => Ok(json!({"type": "Timestamp",
+                    "timestamp": sim.micros.fetch_add(STEP, Ordering::SeqCst)})),
+                "getVMTimelineFlags" => Ok(json!({"type": "TimelineFlags",
+                    "availableStreams": ["Dart", "Embedder", "GC"],
+                    "recordedStreams": ["Dart", "Embedder", "GC"]})),
+                "getVMTimeline" => Ok(json!({"type": "Timeline", "traceEvents": [],
+                    "timeOriginMicros": 0, "timeExtentMicros": 0})),
+                "getPerfettoCpuSamples" => {
+                    if let Some((code, message)) = sim.error.lock().unwrap().clone() {
+                        return Err((code, message));
+                    }
+                    let n = sim.calls.fetch_add(1, Ordering::SeqCst);
+                    let at = BASE + LATER + n * 100_000;
+                    let samples: Vec<(u64, u32, usize)> = (0..5)
+                        .map(|i| (((at + i * 1_000) * 1_000) as u64, 259, 0))
+                        .collect();
+                    let bytes = cpu_samples(&[Response {
+                        functions: &[
+                            ("main", Some("package:demo/main.dart")),
+                            (
+                                "_HeavyBuildPanelState.build",
+                                Some("package:demo/heavy.dart"),
+                            ),
+                            ("mach_continuous_time", None),
+                        ],
+                        stacks: &[&[0, 1, 2]],
+                        samples: &samples,
+                    }]);
+                    use base64::Engine;
+                    Ok(json!({"type": "PerfettoCpuSamples", "samplePeriod": 250,
+                        "sampleCount": 5, "timeOriginMicros": p["timeOriginMicros"],
+                        "timeExtentMicros": p["timeExtentMicros"],
+                        "samples": base64::engine::general_purpose::STANDARD.encode(bytes)}))
+                }
+                _ => Err((-32601, "Method not found".into())),
+            }
+        })
+    }
+}
+
+fn cpu_config() -> CaptureConfig {
+    CaptureConfig {
+        cpu_poll: Duration::from_millis(20),
+        cpu_call_timeout: Duration::from_millis(300),
+        ..config()
+    }
+}
+
+fn cpu_calls(server: &ScriptedServer) -> Vec<(String, i64, i64)> {
+    server
+        .received()
+        .into_iter()
+        .filter(|(m, _)| m == "getPerfettoCpuSamples")
+        .map(|(_, p)| {
+            (
+                p["isolateId"].as_str().unwrap().to_string(),
+                p["timeOriginMicros"].as_i64().unwrap(),
+                p["timeExtentMicros"].as_i64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn cpu_fetch_waits_for_frames() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let server = CpuSim::new().server();
+        let cap = start(&server, cpu_config(), &rt);
+        common::settle(&cap, Duration::from_millis(50), Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(cpu_calls(&server).is_empty(), "no frames, so no fetch");
+        server.notify("streamNotify", frame_event(1, BASE + 100, 100));
+        common::eventually(Duration::from_secs(5), "a fetch", || {
+            !cpu_calls(&server).is_empty()
+        })
+        .await;
+        let snap = common::wait_for(&cap, Duration::from_secs(5), "samples", |s| {
+            s.cpu.samples().len() == 5
+        })
+        .await;
+        assert_eq!(snap.cpu.status(snap.runs[0].id), &CpuStatus::On);
+        assert_eq!(snap.cpu.period_us(snap.runs[0].id), 250);
+        assert!(snap.cpu.coverage_end(snap.runs[0].id).is_some());
+        // The one frame is spent: nothing more is fetched.
+        let n = cpu_calls(&server).len();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(cpu_calls(&server).len(), n);
+    });
+}
+
+#[test]
+fn fetch_now_fetches_immediately() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let server = CpuSim::new().server();
+        let cfg = CaptureConfig {
+            cpu_poll: Duration::from_secs(60),
+            ..cpu_config()
+        };
+        let cap = start(&server, cfg, &rt);
+        common::settle(&cap, Duration::from_millis(50), Duration::from_secs(5)).await;
+        assert!(cpu_calls(&server).is_empty());
+        cap.fetch_cpu_samples();
+        common::wait_for(&cap, Duration::from_secs(5), "samples", |s| {
+            s.cpu.samples().len() == 5
+        })
+        .await;
+        assert_eq!(cpu_calls(&server).len(), 1);
+    });
+}
+
+#[test]
+fn cpu_windows_are_contiguous() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let server = CpuSim::new().server();
+        let cap = start(&server, cpu_config(), &rt);
+        common::settle(&cap, Duration::from_millis(50), Duration::from_secs(5)).await;
+        let mut n = 0;
+        while cpu_calls(&server).len() < 4 {
+            n += 1;
+            server.notify("streamNotify", frame_event(n, BASE + 100, 100));
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert!(n < 300, "four fetches never happened");
+        }
+        let calls = cpu_calls(&server);
+        // The first window starts at the connect.
+        assert_eq!(calls[0].1, BASE);
+        for w in calls.windows(2) {
+            assert_eq!(w[1].1, w[0].1 + w[0].2 + 1, "{calls:?}");
+        }
+        drop(cap);
+    });
+}
+
+#[test]
+fn profiler_off_marks_status_and_stops() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let sim = CpuSim::new();
+        *sim.error.lock().unwrap() = Some((-32000, "profiler is disabled".into()));
+        let server = sim.server();
+        let cap = start(&server, cpu_config(), &rt);
+        common::settle(&cap, Duration::from_millis(50), Duration::from_secs(5)).await;
+        server.notify("streamNotify", frame_event(1, BASE + 100, 100));
+        let snap = common::wait_for(&cap, Duration::from_secs(5), "profiler off", |s| {
+            s.runs
+                .first()
+                .is_some_and(|r| matches!(s.cpu.status(r.id), CpuStatus::Off(_)))
+        })
+        .await;
+        assert_eq!(
+            snap.cpu.status(snap.runs[0].id),
+            &CpuStatus::Off("CPU sampling is off in this app.".into())
+        );
+        for n in 2..6 {
+            server.notify("streamNotify", frame_event(n, BASE + 100, 100));
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        cap.fetch_cpu_samples();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(cpu_calls(&server).len(), 1, "no CPU ticks after off");
+    });
+}
+
+#[test]
+fn cpu_timeout_retries_on_the_next_tick() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let server = CpuSim::new().server();
+        let cfg = CaptureConfig {
+            cpu_call_timeout: Duration::from_millis(60),
+            ..cpu_config()
+        };
+        let cap = start(&server, cfg, &rt);
+        common::settle(&cap, Duration::from_millis(50), Duration::from_secs(5)).await;
+        server.notify("streamNotify", frame_event(1, BASE + 100, 100));
+        common::wait_for(&cap, Duration::from_secs(5), "first samples", |s| {
+            s.cpu.samples().len() == 5
+        })
+        .await;
+        server.silence("getPerfettoCpuSamples");
+        // A frame arrived before the timeout; the retry must not need another one.
+        server.notify("streamNotify", frame_event(2, BASE + 100, 100));
+        common::eventually(Duration::from_secs(5), "two timed-out calls", || {
+            cpu_calls(&server).len() >= 3
+        })
+        .await;
+        let calls = cpu_calls(&server);
+        assert_eq!(
+            calls[1].1, calls[2].1,
+            "the window is not advanced: {calls:?}"
+        );
+        let snap = cap.snapshots().borrow().clone();
+        assert_eq!(snap.cpu.status(snap.runs[0].id), &CpuStatus::On);
+    });
+}
+
+#[test]
+fn hot_restart_moves_cpu_to_the_new_isolate() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let server = CpuSim::new().server();
+        let cap = start(&server, cpu_config(), &rt);
+        common::settle(&cap, Duration::from_millis(50), Duration::from_secs(5)).await;
+        server.notify("streamNotify", frame_event(1, BASE + 100, 100));
+        common::eventually(Duration::from_secs(5), "a fetch", || {
+            !cpu_calls(&server).is_empty()
+        })
+        .await;
+        assert_eq!(cpu_calls(&server)[0].0, "isolates/1");
+        let isolate = json!({"type": "@Isolate", "id": "isolates/2", "name": "main",
+            "isSystemIsolate": false});
+        server.notify(
+            "streamNotify",
+            json!({"streamId": "Isolate", "event": {"kind": "IsolateStart", "isolate": isolate}}),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        server.notify("streamNotify", frame_event(2, BASE + 100, 100));
+        common::eventually(Duration::from_secs(5), "a fetch on the new isolate", || {
+            cpu_calls(&server).iter().any(|c| c.0 == "isolates/2")
+        })
+        .await;
+    });
+}
+
+#[test]
+fn replay_cpu_has_the_heavy_build_function() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let server = ReplayServer::start(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/recordings/jank_lab-perf.jsonl"),
+        );
+        let uri = VmServiceUri::parse(server.ws_uri().as_str()).unwrap();
+        let cfg = CaptureConfig {
+            timeline_poll: Duration::from_millis(10),
+            cpu_poll: Duration::from_millis(10),
+            ..CaptureConfig::default()
+        };
+        let cap = Capture::start(rt.handle(), cfg, None);
+        cap.connect(Target::Uri(uri));
+        let snap = common::wait_for(&cap, Duration::from_secs(15), "CPU samples", |s| {
+            s.cpu.samples().len() >= 100
+        })
+        .await;
+        let heavy = (0..snap.cpu.function_count())
+            .map(|i| snap.cpu.function(fdt_store::cpu::FunctionId(i as u32)))
+            .find(|f| &*f.name == "_HeavyBuildPanelState.build")
+            .expect("_HeavyBuildPanelState.build");
+        assert!(heavy.library.is_some());
+        assert_eq!(snap.cpu.status(snap.runs[0].id), &CpuStatus::On);
+    });
+}

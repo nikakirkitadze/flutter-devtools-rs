@@ -27,6 +27,7 @@ pub trait CaptureControl: 'static {
     fn load_full_body(&self, id: EntryId, kind: BodyKind);
     fn set_free_app_http_memory(&self, on: bool);
     fn set_body_limits(&self, limits: BodyLimits);
+    fn fetch_cpu_samples(&self);
     fn status(&self) -> watch::Receiver<ConnStatus>;
     fn snapshots(&self) -> watch::Receiver<Arc<Snapshot>>;
 }
@@ -55,6 +56,9 @@ impl CaptureControl for Capture {
     }
     fn set_body_limits(&self, limits: BodyLimits) {
         Capture::set_body_limits(self, limits);
+    }
+    fn fetch_cpu_samples(&self) {
+        Capture::fetch_cpu_samples(self);
     }
     fn status(&self) -> watch::Receiver<ConnStatus> {
         Capture::status(self)
@@ -171,6 +175,13 @@ mod tests {
         assert_eq!(find_dart(Some(&joined)), Some(second.path().join(name)));
         std::fs::write(first.path().join(name), "").unwrap();
         assert_eq!(find_dart(Some(&joined)), Some(first.path().join(name)));
+    }
+
+    #[test]
+    fn fake_capture_logs_a_cpu_fetch() {
+        let (fake, handle) = crate::test_support::fake_capture();
+        CaptureControl::fetch_cpu_samples(&fake);
+        assert_eq!(handle.commands(), vec!["fetch_cpu".to_string()]);
     }
 
     #[test]

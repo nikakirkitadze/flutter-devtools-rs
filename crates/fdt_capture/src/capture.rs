@@ -37,6 +37,7 @@ pub(crate) enum Command {
     LoadFullBody(EntryId, BodyKind),
     SetFreeAppHttpMemory(bool),
     SetBodyLimits(BodyLimits),
+    FetchCpuNow,
     /// Sent when the `Capture` is dropped.
     Shutdown,
 }
@@ -113,6 +114,11 @@ impl Capture {
         self.command(Command::SetBodyLimits(limits));
     }
 
+    /// Fetches CPU samples now, whether or not frames were drawn since the last fetch.
+    pub fn fetch_cpu_samples(&self) {
+        self.command(Command::FetchCpuNow);
+    }
+
     pub fn status(&self) -> watch::Receiver<ConnStatus> {
         self.status.clone()
     }
@@ -149,7 +155,6 @@ pub(crate) struct Session {
     pub(crate) free_app_memory: Arc<AtomicBool>,
     pub(crate) life: Lifecycle,
     /// The live connection's timeline task, for commands.
-    #[allow(dead_code)] // Used by the profiling commands that follow.
     pub(crate) perf: Option<Arc<PerfControl>>,
 }
 
@@ -272,6 +277,11 @@ impl Session {
                 }
             }
             Command::Shutdown => {} // handled by the run loop
+            Command::FetchCpuNow => {
+                if let Some(p) = &self.perf {
+                    p.fetch_now();
+                }
+            }
             Command::Disconnect => self.disconnect(),
             Command::StopWaiting => self.stop_waiting(),
             Command::SetRecording(on) => self.set_recording(on),
@@ -325,6 +335,8 @@ impl Session {
             }
             Ingest::NetReady(f) => self.net.set_fetcher(Some(f)),
             Ingest::Timeline(b) => perf::store(w, b, recording),
+            Ingest::Cpu(b) => perf::store_cpu(w, b, recording),
+            Ingest::CpuStatus(run, status) => w.set_cpu_status(run, status),
             Ingest::PerfReady(p) => self.perf = Some(p),
             Ingest::HttpPoll {
                 isolate,

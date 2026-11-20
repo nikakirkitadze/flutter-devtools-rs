@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fdt_store::clock::{Calibration, RunClock};
+use fdt_store::cpu::CpuStatus;
 use fdt_store::frames::FrameInput;
 use fdt_store::logs::{LogInput, LogLevel, LogSource};
 use fdt_store::net::{HttpUpdate, SocketUpdate};
@@ -72,6 +73,10 @@ pub(crate) enum Ingest {
     Sockets(Vec<SocketUpdate>),
     /// Slices and frame phases assembled from the VM timeline.
     Timeline(perf::TimelineBatch),
+    /// CPU samples fetched from the app.
+    Cpu(perf::CpuBatch),
+    /// The CPU profiler is off in this run's app.
+    CpuStatus(RunId, CpuStatus),
     /// The connection's timeline controls, for commands.
     PerfReady(Arc<perf::PerfControl>),
     /// An isolate exited (a hot restart, or the app ending it): its unfinished requests end.
@@ -256,6 +261,7 @@ impl Router {
             StreamEvent::IsolateStart { isolate }
                 if isolate.name == "main" && !isolate.is_system_isolate =>
             {
+                self.perf.set_main_isolate(&isolate.id);
                 self.main_isolate = isolate.id;
             }
             StreamEvent::ServiceExtensionAdded { isolate, rpc } if rpc == http::ENABLE_RPC => {
@@ -281,6 +287,7 @@ impl Router {
                 }
             }
             "Flutter.Frame" => {
+                self.perf.frame_drawn();
                 let sink = self.sink.get();
                 if let Some(f) = frames::frame_input(&sink, data) {
                     sink.send(Ingest::Frame(f));

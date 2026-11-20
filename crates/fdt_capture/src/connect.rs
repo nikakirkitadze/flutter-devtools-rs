@@ -338,8 +338,11 @@ async fn connect_and_ingest(
         PerfConfig {
             poll: cfg.timeline_poll,
             call_timeout: cfg.timeline_call_timeout,
+            cpu_poll: cfg.cpu_poll,
+            cpu_call_timeout: cfg.cpu_call_timeout,
             start_us: connect_timeline_us,
         },
+        main.clone(),
     );
     sink.get().send(Ingest::PerfReady(perf.control()));
     let mut router = Router::new(

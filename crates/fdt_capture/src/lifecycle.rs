@@ -486,7 +486,8 @@ impl Session {
         // Everything else from a connection that is no longer current is dropped. Listed so a
         // new variant makes this match fail to compile.
         match i {
-            Ingest::Timeline(_) | Ingest::PerfReady(_) => {}
+            Ingest::Timeline(_) | Ingest::Cpu(_) | Ingest::CpuStatus(..) | Ingest::PerfReady(_) => {
+            }
             Ingest::StartRun { .. }
             | Ingest::Failed { .. }
             | Ingest::Closed

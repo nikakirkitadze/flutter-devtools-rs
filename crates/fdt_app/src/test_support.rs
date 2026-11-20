@@ -200,6 +200,9 @@ impl CaptureControl for FakeCapture {
     fn set_body_limits(&self, _limits: BodyLimits) {
         self.record("set_body_limits");
     }
+    fn fetch_cpu_samples(&self) {
+        self.record("fetch_cpu");
+    }
     fn status(&self) -> watch::Receiver<ConnStatus> {
         self.status.clone()
     }

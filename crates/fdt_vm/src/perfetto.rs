@@ -33,6 +33,8 @@ pub struct CpuProfile {
     pub stacks: Vec<Vec<u32>>,
     /// In wire order (not time-sorted).
     pub samples: Vec<PerfSampleRec>,
+    /// Samples left out because their callstack, frame or function-name iid was not defined.
+    pub skipped_samples: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -283,7 +285,8 @@ impl Interned {
 
 /// Decodes a `Trace` holding CPU samples. Interning restarts whenever a packet has
 /// `sequence_flags & 1`; functions are deduplicated by `(name, library)` across the whole input.
-/// Truncated or malformed input is an error; unknown fields are skipped.
+/// Truncated or malformed input is an error; unknown fields are skipped. A sample with an unknown
+/// callstack, frame or function-name iid is skipped and counted in [`CpuProfile::skipped_samples`].
 pub fn decode_cpu_samples(bytes: &[u8]) -> Result<CpuProfile, String> {
     let mut state = Interned::default();
     let mut out = Builder::default();
@@ -318,7 +321,11 @@ pub fn decode_cpu_samples(bytes: &[u8]) -> Result<CpuProfile, String> {
                     _ => {}
                 }
             }
-            let stack = state.stack_of(callstack, &mut out)?;
+            // One bad iid costs that sample only, not the hundreds of good ones.
+            let Ok(stack) = state.stack_of(callstack, &mut out) else {
+                out.profile.skipped_samples += 1;
+                continue;
+            };
             out.profile.samples.push(PerfSampleRec {
                 ts_ns: ts,
                 tid: tid as u32,
@@ -613,20 +620,41 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sample_with_unknown_callstack_is_an_error() {
-        // One packet: a perf_sample with callstack iid 5, never defined.
-        let mut sample = Vec::new();
-        sample.extend_from_slice(&[0x20, 0x05]);
-        let mut packet = vec![0x92, 0x04, sample.len() as u8];
+    /// A perf_sample packet (timestamp `ts`) whose callstack iid is `iid`.
+    fn sample_packet(ts: u8, iid: u8) -> Vec<u8> {
+        let sample = [0x20, iid];
+        let mut packet = vec![0x40, ts, 0x92, 0x04, sample.len() as u8];
         packet.extend_from_slice(&sample);
         let mut trace = vec![0x0a, packet.len() as u8];
         trace.extend_from_slice(&packet);
-        assert!(
-            decode_cpu_samples(&trace)
-                .unwrap_err()
-                .contains("callstack")
-        );
+        trace
+    }
+
+    #[test]
+    fn samples_with_unknown_ids_are_skipped_and_counted() {
+        // A callstack iid that is never defined, ahead of a good response.
+        let mut trace = sample_packet(1, 5);
+        trace.extend(sample_bytes());
+        trace.extend(sample_packet(2, 6));
+        let p = decode_cpu_samples(&trace).unwrap();
+        assert_eq!(p.skipped_samples, 2);
+        assert_eq!(p.samples.len(), 3 + 1, "the good samples survive");
+        // A frame that is not defined: a callstack naming it loses only its samples.
+        let bad = {
+            let mut cs = vec![0x08, 0x01, 0x10, 0x63]; // iid 1, frame 99
+            let mut d = vec![0x3a, cs.len() as u8];
+            d.append(&mut cs);
+            let mut sample = vec![0x20, 0x01];
+            let mut packet = vec![0x40, 3, 0x62, d.len() as u8];
+            packet.extend_from_slice(&d);
+            packet.extend_from_slice(&[0x92, 0x04, sample.len() as u8]);
+            packet.append(&mut sample);
+            let mut t = vec![0x0a, packet.len() as u8];
+            t.extend_from_slice(&packet);
+            t
+        };
+        let p = decode_cpu_samples(&bad).unwrap();
+        assert_eq!((p.samples.len(), p.skipped_samples), (0, 1));
     }
 
     #[tokio::test]

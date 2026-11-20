@@ -11,6 +11,10 @@ pub struct CaptureConfig {
     pub timeline_poll: Duration,
     /// One `getVMTimeline` call gives up after this long.
     pub timeline_call_timeout: Duration,
+    /// How often CPU samples are fetched while frames are being drawn.
+    pub cpu_poll: Duration,
+    /// One `getPerfettoCpuSamples` call gives up after this long.
+    pub cpu_call_timeout: Duration,
     /// The refresh-rate read and the timeline-flags calls of the connect sequence wait this long.
     pub refresh_timeout: Duration,
     pub body_limits: BodyLimits,
@@ -36,6 +40,8 @@ impl Default for CaptureConfig {
             socket_poll: Duration::from_secs(2),
             timeline_poll: Duration::from_millis(500),
             timeline_call_timeout: Duration::from_secs(5),
+            cpu_poll: Duration::from_secs(5),
+            cpu_call_timeout: Duration::from_secs(5),
             refresh_timeout: Duration::from_secs(1),
             body_limits: BodyLimits::default(),
             auto_fetch_limit: 4 << 20,
