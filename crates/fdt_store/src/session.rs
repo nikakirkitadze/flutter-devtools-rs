@@ -189,8 +189,9 @@ impl SessionWriter {
     /// The track for `(run, kind, key)`, created on first use. A non-empty name replaces an
     /// empty one.
     pub fn timeline_track(&mut self, run: RunId, kind: TrackKind, key: u64, name: &str) -> TrackId {
-        self.dirty = true;
-        self.timeline.track(run, kind, key, name)
+        let id = self.timeline.track(run, kind, key, name);
+        self.dirty |= self.timeline.tracks_changed();
+        id
     }
 
     pub fn set_track_order(&mut self, track: TrackId, order: u32) {

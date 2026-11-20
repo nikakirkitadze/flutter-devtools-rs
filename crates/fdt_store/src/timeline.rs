@@ -19,6 +19,12 @@ pub const LANE_LOD_LEVELS: usize = 20;
 /// The most widget-build slices a session keeps.
 pub const RAW_BUILD_CAP: u64 = 8_000_000;
 
+/// A slice adds at most this many cells to any one level. A level where it would span more (or
+/// where its index does not fit `u32`) skips it and counts `TimelineDrops::lod_coarse`; coarser
+/// levels still hold it. At level 0 this is about 17 s, so finer levels under-report coverage
+/// for slices longer than that; `cells()` at a zoomed-out width reads a level that holds it.
+pub const MAX_CELLS_PER_SLICE: u64 = 4_096;
+
 const SLICE_CHUNK: usize = 1024;
 const CELL_CHUNK: usize = 256;
 
@@ -72,6 +78,8 @@ pub struct TimelineDrops {
     pub depth: u64,
     pub overlap: u64,
     pub build_cap: u64,
+    /// Level insertions skipped because the slice spanned too many cells or its index overflowed.
+    pub lod_coarse: u64,
 }
 
 /// One sparse cell of a lane level: `(index, slices touching it, nanoseconds covered)`.
@@ -111,17 +119,23 @@ impl Lane {
         }
     }
 
-    fn push(&mut self, s: Slice) {
+    /// Adds the slice to the lane and its levels; returns how many levels skipped it (see
+    /// [`MAX_CELLS_PER_SLICE`]).
+    fn push(&mut self, s: Slice) -> u64 {
         let end = s.end().0;
+        let mut skipped = 0;
         for (k, level) in self.levels.iter_mut().enumerate() {
             let sh = LANE_LOD_BASE_SHIFT + k as u32;
             let lo = s.start.0 >> sh;
             let hi = if s.dur_ns == 0 { lo } else { (end - 1) >> sh };
+            if hi - lo >= MAX_CELLS_PER_SLICE || u32::try_from(hi).is_err() {
+                skipped += 1;
+                continue;
+            }
             for idx in lo..=hi {
-                let Ok(cell_idx) = u32::try_from(idx) else {
-                    break;
-                };
-                let cover = end.min((idx + 1) << sh) - s.start.0.max(idx << sh).min(end);
+                let cell_idx = idx as u32;
+                let cell_end = (idx + 1).checked_shl(sh).unwrap_or(u64::MAX);
+                let cover = end.min(cell_end) - s.start.0.max(idx << sh).min(end);
                 let last = level.len().checked_sub(1);
                 match last.and_then(|i| level.get_mut(i)) {
                     Some(c) if c.idx == cell_idx => {
@@ -141,6 +155,7 @@ impl Lane {
         self.slices.push(s);
         self.end = self.end.max(end);
         self.cached = None;
+        skipped
     }
 
     fn snapshot(&mut self) -> LaneSnapshot {
@@ -193,6 +208,11 @@ impl TimelineStore {
             build_cap: RAW_BUILD_CAP,
             slices: 0,
         }
+    }
+
+    /// True while the sorted track list is stale (a track was added, renamed or reordered).
+    pub(crate) fn tracks_changed(&self) -> bool {
+        self.sorted_cache.is_none()
     }
 
     pub(crate) fn name_count(&self) -> usize {
@@ -275,7 +295,7 @@ impl TimelineStore {
         while data.lanes.len() <= depth {
             data.lanes.push(Lane::new());
         }
-        data.lanes[depth].push(s);
+        self.drops.lod_coarse += data.lanes[depth].push(s);
         data.cache = None;
         if widget_build {
             self.build_slices += 1;
@@ -570,7 +590,8 @@ mod tests {
             TimelineDrops {
                 depth: 1,
                 overlap: 2,
-                build_cap: 0
+                build_cap: 0,
+                lod_coarse: 0
             }
         );
         assert_eq!(s.timeline.slice_count(), 3);
@@ -645,6 +666,39 @@ mod tests {
         let cov: Vec<u64> = c.iter().map(|c| c.covered_ns).collect();
         assert_eq!(cov, vec![cell / 2, cell, cell, cell / 2]);
         assert!(c.iter().all(|c| c.count == 1));
+    }
+
+    #[test]
+    fn huge_slice_is_bounded_and_counted() {
+        let mut w = SessionWriter::new(0);
+        let run = begin(&mut w);
+        let t = w.timeline_track(run, TrackKind::Thread, 1, "t");
+        let n = w.intern_name("n");
+        assert!(w.push_slice(t, 0, sl(5, u64::MAX / 4, n), false));
+        let snap = w.publish();
+        let lane = &snap.timeline.lanes(t)[0];
+        assert!(snap.timeline.drops().lod_coarse > 0);
+        assert!(
+            lane.levels
+                .iter()
+                .all(|l| l.len() as u64 <= MAX_CELLS_PER_SLICE)
+        );
+        assert_eq!(lane.len(), 1);
+    }
+
+    #[test]
+    fn long_slice_lands_in_coarse_levels() {
+        let mut w = SessionWriter::new(0);
+        let run = begin(&mut w);
+        let t = w.timeline_track(run, TrackKind::Thread, 1, "t");
+        let n = w.intern_name("n");
+        let dur = 60_000_000_000u64;
+        w.push_slice(t, 0, sl(1_000_000_000, dur, n), false);
+        let snap = w.publish();
+        assert!(snap.timeline.drops().lod_coarse > 0);
+        let lane = &snap.timeline.lanes(t)[0];
+        let c = lane.cells(range(0, 70_000_000_000), 100);
+        assert_eq!(c.iter().map(|c| c.covered_ns).sum::<u64>(), dur);
     }
 
     #[test]
