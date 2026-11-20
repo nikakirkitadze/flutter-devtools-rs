@@ -9,7 +9,7 @@
 use super::lanes::{
     LaneGeometry, LaneHit, LaneKind, Spans, cell_tooltip, fetch_spans, hit_at, hue_colour,
     label_colour, lane_geometry, location_for, name_colour, resolve_cell, span_fetch_range,
-    tooltip_text, wants_spans,
+    tooltip_text, wants_spans, worst_frame,
 };
 use crate::actions::{ZoomIn, ZoomOut, ZoomToFit};
 use crate::keymap::LANES_CONTEXT;
@@ -260,7 +260,9 @@ pub struct TimelineView {
     tip_task: Option<Task<()>>,
     /// Requests fetched for the request lane's spans, and what they were fetched for.
     spans: Option<Spans>,
-    spans_key: Option<(u64, usize, TimeRange)>,
+    /// The (session, request count) the spans were fetched for.
+    spans_for: Option<(u64, usize)>,
+    spans_jobs: usize,
     spans_task: Option<Task<()>>,
     click_task: Option<Task<()>>,
     focus: FocusHandle,
@@ -297,7 +299,8 @@ impl TimelineView {
             tip_key: None,
             tip_task: None,
             spans: None,
-            spans_key: None,
+            spans_for: None,
+            spans_jobs: 0,
             spans_task: None,
             click_task: None,
             focus: cx.focus_handle(),
@@ -404,7 +407,7 @@ impl TimelineView {
             self.drag = None;
             self.clear_hover();
             self.spans = None;
-            self.spans_key = None;
+            self.spans_for = None;
             self.spans_task = None;
             self.click_task = None;
         }
@@ -432,13 +435,19 @@ impl TimelineView {
     }
 
     /// Starts a fetch of the requests around the view when the request lane would draw spans
-    /// and has none that cover it. At most one runs; a new one replaces it.
+    /// and has none that cover it. At most one runs: a pan that moves on meanwhile is picked up
+    /// when it returns (one trailing fetch for the latest view), and until then the last result
+    /// is drawn, clipped.
     fn fetch_spans(&mut self, cx: &mut Context<Self>) {
         if !self.visible.contains(&LaneKind::Network)
             || !wants_spans(&self.snap, self.viewport, self.lane_width)
         {
+            self.spans = None;
+            self.spans_for = None;
             self.spans_task = None;
-            self.spans_key = None;
+            return;
+        }
+        if self.spans_task.is_some() {
             return;
         }
         let (a, z) = self.viewport.range();
@@ -448,35 +457,46 @@ impl TimelineView {
             .as_ref()
             .is_some_and(|s| s.range.start <= view.start && s.range.end >= view.end);
         let latest = (self.snap.session, self.snap.net.len());
-        let current = self.spans_key.is_some_and(|(s, n, _)| (s, n) == latest);
-        if covered && current {
+        if covered && self.spans_for == Some(latest) {
             return;
         }
         let want = span_fetch_range(self.viewport);
-        if self
-            .spans_key
-            .is_some_and(|k| k == (latest.0, latest.1, want))
-            && self.spans_task.is_some()
-        {
-            return;
-        }
-        let key = (latest.0, latest.1, want);
-        self.spans_key = Some(key);
+        let ns_per_px = self.viewport.span_ns / (self.lane_width.max(1.0) as u64);
+        self.spans_jobs += 1;
         let snap = self.snap.clone();
         self.spans_task = Some(cx.spawn(async move |this, cx| {
             let job = snap.clone();
             let spans = cx
-                .background_spawn(async move { fetch_spans(&job, want) })
+                .background_spawn(async move { fetch_spans(&job, want, ns_per_px) })
                 .await;
             this.update(cx, |this, cx| {
-                if this.spans_key == Some(key) && this.snap.session == snap.session {
+                this.spans_task = None;
+                // Another session: the result means nothing here.
+                if this.snap.session == snap.session {
                     this.spans = Some(spans);
-                    this.spans_task = None;
-                    this.sync(cx);
+                    this.spans_for = Some((snap.session, snap.net.len()));
                 }
+                // Trailing: `sync` fetches again if the view moved on meanwhile.
+                this.sync(cx);
+                cx.notify();
             })
             .ok();
         }));
+    }
+
+    /// The fetched spans, if any.
+    pub fn spans(&self) -> Option<&Spans> {
+        self.spans.as_ref()
+    }
+
+    /// How many span fetches have been started.
+    pub fn spans_jobs(&self) -> usize {
+        self.spans_jobs
+    }
+
+    /// Whether a span fetch is under way.
+    pub fn spans_in_flight(&self) -> bool {
+        self.spans_task.is_some()
     }
 
     // Zoom and pan.
@@ -551,7 +571,11 @@ impl TimelineView {
     }
 
     fn lane_hit(&self, kind: LaneKind, x: f32, y: f32, cx: &gpui_kit::App) -> Option<LaneHit> {
-        hit_at(&*self.lane_geometry(kind, cx)?, x, y)
+        match hit_at(&*self.lane_geometry(kind, cx)?, x, y)? {
+            // Only the cell under the pointer is searched, for its worst frame.
+            LaneHit::FrameCell(r) => worst_frame(&self.snap, r).map(LaneHit::Frame),
+            hit => Some(hit),
+        }
     }
 
     /// Looks the hovered position up again, after the data or the view changed: the tooltip
@@ -994,6 +1018,7 @@ impl Render for TimelineView {
 
 #[cfg(test)]
 mod tests {
+    use super::super::lanes::span_fetch_range;
     use super::*;
     use crate::nav::{Page, Selection, Tool};
     use crate::test_support::{
@@ -1720,6 +1745,139 @@ mod tests {
         );
         // Even with every lane shown, nothing is cut: a lane layer can use its whole cap.
         const { assert!(OVERLAY_QUADS >= 200 + 6 + 2 + 2) };
+    }
+
+    /// A page fitted to 2.0-2.5 s (so the fetch range is 1.5-3.0 s), then fed `snap`, with its
+    /// first span fetch done.
+    fn open_zoomed(cx: &mut gpui_kit::TestAppContext, snap: Arc<Snapshot>) -> Opened<'_> {
+        let (v, vcx, h) = open(cx, Arc::new(Snapshot::empty()));
+        let r = TimeRange::new(SessionTime(2_000 * MS), SessionTime(2_500 * MS));
+        v.update(vcx, |v, cx| v.set_location(Some(r), cx));
+        h.snaps.send(snap).unwrap();
+        vcx.run_until_parked();
+        (v, vcx, h)
+    }
+
+    fn network_hits_are_spans(v: &Entity<TimelineView>, cx: &mut VisualTestContext) -> bool {
+        v.read_with(cx, |v, cx| {
+            let g = v.lane_geometry(LaneKind::Network, cx).unwrap();
+            g.hits.iter().all(|(_, h)| matches!(h, LaneHit::Request(_)))
+        })
+    }
+
+    #[gpui_kit::test]
+    fn spans_fetch_in_background_and_stay_during_pan(cx: &mut gpui_kit::TestAppContext) {
+        let (v, cx, _h) = open_zoomed(cx, demo());
+        let (jobs, spans) = v.read_with(cx, |v, _| (v.spans_jobs(), v.spans().cloned()));
+        assert_eq!(jobs, 1);
+        let spans = spans.expect("fetched in the background");
+        assert_eq!(
+            spans.range,
+            span_fetch_range(v.read_with(cx, |v, _| v.viewport()))
+        );
+        assert!(
+            spans
+                .items
+                .iter()
+                .all(|s| (s.row as usize) < super::super::lanes::SPAN_ROWS)
+        );
+        assert!(network_hits_are_spans(&v, cx));
+        // A pan out of the fetched range starts one fetch, and the last result is still drawn
+        // (clipped) while it runs.
+        let w = v.read_with(cx, |v, _| v.plot_width());
+        v.update(cx, |v, cx| v.pan_px(3.0 * w, cx));
+        assert!(v.read_with(cx, |v, _| v.spans_in_flight()));
+        assert!(
+            v.read_with(cx, |v, _| v.spans().is_some()),
+            "kept while fetching"
+        );
+        assert!(
+            network_hits_are_spans(&v, cx),
+            "no flip to cells during the fetch"
+        );
+        cx.run_until_parked();
+        v.read_with(cx, |v, _| {
+            assert!(!v.spans_in_flight());
+            assert_eq!(v.spans_jobs(), 2);
+            let s = v.spans().unwrap();
+            let (a, z) = v.viewport().range();
+            assert!(
+                s.range.start.0 <= a && s.range.end.0 >= z,
+                "covers the new view"
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn no_refetch_inside_margin(cx: &mut gpui_kit::TestAppContext) {
+        let (v, cx, _h) = open_zoomed(cx, demo());
+        let w = v.read_with(cx, |v, _| v.plot_width());
+        for dx in [0.2, 0.4, -0.3, 0.1, 0.5] {
+            v.update(cx, |v, cx| v.pan_px(dx * w, cx));
+            assert!(!v.read_with(cx, |v, _| v.spans_in_flight()));
+        }
+        // Zooming within the fetched range does not fetch either.
+        v.update(cx, |v, cx| v.zoom_about(w / 2.0, 1.5, cx));
+        cx.run_until_parked();
+        assert_eq!(v.read_with(cx, |v, _| v.spans_jobs()), 1);
+    }
+
+    #[gpui_kit::test]
+    fn span_jobs_coalesce_to_one_in_flight(cx: &mut gpui_kit::TestAppContext) {
+        let (v, cx, _h) = open_zoomed(cx, demo());
+        let w = v.read_with(cx, |v, _| v.plot_width());
+        // A continuous pan: many events before any fetch returns.
+        for _ in 0..30 {
+            v.update(cx, |v, cx| v.pan_px(0.5 * w, cx));
+            assert!(
+                v.read_with(cx, |v, _| v.spans_in_flight())
+                    || v.read_with(cx, |v, _| v.spans_jobs()) == 1
+            );
+        }
+        let started = v.read_with(cx, |v, _| v.spans_jobs());
+        assert_eq!(
+            started, 2,
+            "one fetch for the first uncovered view, none per event"
+        );
+        cx.run_until_parked();
+        v.read_with(cx, |v, _| {
+            // One trailing fetch for where the pan ended, then it is covered and quiet.
+            assert!(v.spans_jobs() <= 3, "{}", v.spans_jobs());
+            assert!(!v.spans_in_flight());
+            let s = v.spans().unwrap();
+            let (a, z) = v.viewport().range();
+            assert!(s.range.start.0 <= a && s.range.end.0 >= z);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn stale_span_result_is_dropped_after_session_change(cx: &mut gpui_kit::TestAppContext) {
+        let (v, cx, h) = open_zoomed(cx, demo());
+        let w = v.read_with(cx, |v, _| v.plot_width());
+        v.update(cx, |v, cx| v.pan_px(3.0 * w, cx));
+        assert!(v.read_with(cx, |v, _| v.spans_in_flight()));
+        // Another session, with 12 requests (6 of them in the fetch range), arrives before the fetch returns.
+        let small = crate::test_support::snapshot(|w, run| {
+            for i in 0..12u64 {
+                request(
+                    w,
+                    run,
+                    "GET",
+                    "http://h/n",
+                    Some(200),
+                    i * 250,
+                    Some(i * 250 + 50),
+                );
+            }
+            w.push_frame(frame_at(run, 1, 10, 4, 4));
+        });
+        h.snaps.send(small).unwrap();
+        cx.run_until_parked();
+        v.read_with(cx, |v, _| {
+            assert!(!v.spans_in_flight());
+            let s = v.spans().expect("fetched for the new session");
+            assert_eq!(s.items.len(), 6, "the new session's, not the old one's");
+        });
     }
 
     #[gpui_kit::test]

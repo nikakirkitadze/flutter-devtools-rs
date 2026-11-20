@@ -87,7 +87,13 @@ impl LaneKind {
                 .gc_lod()
                 .level(0)
                 .is_some_and(|l| !l.is_empty()),
-            LaneKind::Findings => janky_frames(snap, 0..snap.frames.len()).next().is_some(),
+            LaneKind::Findings => {
+                // Bounded: a long list of slow frames is taken to hold a janky one.
+                let slow = snap.frames.slow();
+                slow.len() > 4_096
+                    || (0..slow.len())
+                        .any(|i| slow.get(i).is_some_and(|&s| is_janky(snap, s as usize)))
+            }
         }
     }
 }
@@ -109,6 +115,9 @@ pub enum LaneHit {
     Gc(TimeRange),
     /// A janky frame, by index into the frames.
     Finding(usize),
+    /// The frames of a pixel column; the page looks up the worst of them under the pointer
+    /// ([`worst_frame`]), so the layout never reads individual frames in cell mode.
+    FrameCell(TimeRange),
 }
 
 /// What a quad is coloured by; the view maps it to a token.
@@ -164,12 +173,39 @@ pub struct LaneGeometry {
     pub hits: Vec<(Rect, LaneHit)>,
 }
 
-/// Requests fetched in the background for the request lane's spans.
+/// One request, packed for drawing by the background job that fetched it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PackedSpan {
+    pub start: SessionTime,
+    pub end: SessionTime,
+    pub seq: u32,
+    /// The row it was packed into, below [`SPAN_ROWS`].
+    pub row: u8,
+    pub error: bool,
+}
+
+/// Requests fetched and packed in the background for the request lane's spans.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Spans {
     /// What was asked for: every request overlapping this range.
     pub range: TimeRange,
-    pub seqs: Arc<[u32]>,
+    /// Sorted by start; never more than `SPAN_CAP`.
+    pub items: Arc<[PackedSpan]>,
+}
+
+/// The most spans a fetch keeps, so drawing them is bounded by this and not by the data.
+pub const SPAN_CAP: usize = 2 * SPAN_LIMIT as usize;
+
+#[cfg(test)]
+thread_local! {
+    /// Frames the lane layouts read one by one (the raw bar path, the findings).
+    pub(super) static FRAME_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn read_frame(snap: &Snapshot, i: usize) -> Option<&fdt_store::frames::FrameRecord> {
+    #[cfg(test)]
+    FRAME_READS.with(|c| c.set(c.get() + 1));
+    snap.frames.get(i)
 }
 
 fn lane_h() -> f32 {
@@ -209,29 +245,42 @@ fn cell_range(c: &StripBar) -> TimeRange {
     )
 }
 
-/// The indices of the janky frames among `frames`, ascending.
-fn janky_frames(
-    snap: &Snapshot,
-    frames: std::ops::Range<usize>,
-) -> impl Iterator<Item = usize> + '_ {
+/// The positions in the slow list of the frames with an index in `frames`.
+fn slow_bounds(snap: &Snapshot, frames: std::ops::Range<usize>) -> std::ops::Range<usize> {
     let slow = snap.frames.slow();
-    let (mut lo, mut hi) = (0, slow.len());
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        if slow.get(mid).is_some_and(|&s| (s as usize) < frames.start) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
+    let first = |at: usize| {
+        let (mut lo, mut hi) = (0, slow.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if slow.get(mid).is_some_and(|&s| (s as usize) < at) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    };
+    first(frames.start)..first(frames.end)
+}
+
+fn is_janky(snap: &Snapshot, i: usize) -> bool {
+    read_frame(snap, i).is_some_and(|f| {
+        frame_status(f.time_us(), snap.frame_budget_us(f.run)) == FrameStatus::Janky
+    })
+}
+
+/// The slowest frame with a start in `range` (the earliest among equals). Scans the frames of
+/// one cell, for one point; layouts never call it.
+pub fn worst_frame(snap: &Snapshot, range: TimeRange) -> Option<usize> {
+    let mut worst: Option<(usize, u32)> = None;
+    for i in snap.frames.range(range) {
+        if let Some(f) = snap.frames.get(i)
+            && worst.is_none_or(|(_, t)| f.time_us() > t)
+        {
+            worst = Some((i, f.time_us()));
         }
     }
-    (lo..slow.len())
-        .map_while(move |i| slow.get(i).map(|&s| s as usize))
-        .take_while(move |&s| s < frames.end)
-        .filter(|&s| {
-            snap.frames.get(s).is_some_and(|f| {
-                frame_status(f.time_us(), snap.frame_budget_us(f.run)) == FrameStatus::Janky
-            })
-        })
+    worst.map(|(i, _)| i)
 }
 
 /// Lays `kind` out in a lane `width` pixels wide, with at most `budget` quads. `spans` are the
@@ -294,7 +343,7 @@ pub fn frames_lane(snap: &Snapshot, vp: Viewport, width: f32, budget: usize) -> 
     };
     if idx.len() <= (width as usize).min(budget) {
         for i in idx {
-            let Some(f) = snap.frames.get(i) else {
+            let Some(f) = read_frame(snap, i) else {
                 continue;
             };
             let x0 = vp.x_of(f.start.0, width).max(0.0);
@@ -344,33 +393,9 @@ pub fn frames_lane(snap: &Snapshot, vp: Viewport, width: f32, budget: usize) -> 
             },
             hue: Hue::Status(frame_status(c.max_us, b)),
         });
-        // The worst frame of the cell, the earliest among equals.
-        let mut worst: Option<(usize, u32)> = None;
-        for i in snap.frames.range(cell_range(c)) {
-            if let Some(f) = snap.frames.get(i)
-                && worst.is_none_or(|(_, t)| f.time_us() > t)
-            {
-                worst = Some((i, f.time_us()));
-            }
-        }
-        if let Some((i, _)) = worst {
-            g.hits.push((full, LaneHit::Frame(i)));
-        }
+        g.hits.push((full, LaneHit::FrameCell(cell_range(c))));
     }
     g
-}
-
-/// Whether the request lane draws spans for this view, which it does while there are few
-/// enough requests in view to tell apart.
-pub fn wants_spans(snap: &Snapshot, vp: Viewport, width: f32) -> bool {
-    if snap.net.is_empty() || !(width.is_finite() && width >= 1.0) {
-        return false;
-    }
-    let total: u64 = lane_cells(snap.net.lod(), range_of(vp), width as usize)
-        .iter()
-        .map(|c| u64::from(c.count))
-        .sum();
-    total <= SPAN_LIMIT
 }
 
 /// The range to fetch requests for, so a pan or a small zoom does not need a new fetch: the view
@@ -383,23 +408,66 @@ pub fn span_fetch_range(vp: Viewport) -> TimeRange {
     )
 }
 
-/// Fetches the requests overlapping `range`. Runs off the UI thread.
-pub fn fetch_spans(snap: &Snapshot, range: TimeRange) -> Spans {
-    let seqs = filter_requests(
+/// Whether the request lane draws spans: the requests over the whole fetch range (three views
+/// wide, so at three times the pixels) are few enough to tell apart.
+pub fn wants_spans(snap: &Snapshot, vp: Viewport, width: f32) -> bool {
+    if snap.net.is_empty() || !(width.is_finite() && width >= 1.0) {
+        return false;
+    }
+    let total: u64 = lane_cells(snap.net.lod(), span_fetch_range(vp), width as usize * 3)
+        .iter()
+        .map(|c| u64::from(c.count))
+        .sum();
+    total <= SPAN_LIMIT
+}
+
+/// Fetches the requests overlapping `range` and packs them into rows, one pixel (`ns_per_px`
+/// nanoseconds) apart. Runs off the UI thread; the result holds at most `SPAN_CAP` requests.
+pub fn fetch_spans(snap: &Snapshot, range: TimeRange, ns_per_px: u64) -> Spans {
+    let mut seqs = filter_requests(
         &snap.net,
         &NetFilter {
             range: Some(range),
             ..NetFilter::default()
         },
     );
+    seqs.truncate(SPAN_CAP);
+    let latest = snap.net.latest();
+    let mut found: Vec<PackedSpan> = seqs
+        .into_iter()
+        .filter_map(|seq| {
+            let r = snap.net.get(seq as usize)?;
+            Some(PackedSpan {
+                start: r.start,
+                end: r.end.unwrap_or(latest).max(r.start),
+                seq,
+                row: 0,
+                error: r.is_error(),
+            })
+        })
+        .collect();
+    found.sort_by_key(|s| (s.start, s.seq));
+    let gap = ns_per_px.max(1);
+    let mut ends = [0u64; SPAN_ROWS];
+    let mut used = [false; SPAN_ROWS];
+    for s in &mut found {
+        // The first row that is free, else the one that frees up first.
+        let row = (0..SPAN_ROWS)
+            .find(|&r| !used[r] || ends[r].saturating_add(gap) <= s.start.0)
+            .unwrap_or_else(|| (0..SPAN_ROWS).min_by_key(|&r| ends[r]).unwrap_or(0));
+        used[row] = true;
+        ends[row] = s.end.0.max(s.start.0 + gap);
+        s.row = row as u8;
+    }
     Spans {
         range,
-        seqs: seqs.into(),
+        items: found.into(),
     }
 }
 
-/// Cells of the request lane (red where one holds an error), or, with few requests in view and
-/// `spans` that cover it, one span each packed into `SPAN_ROWS` rows.
+/// Cells of the request lane (red where one holds an error), or, with `spans` (which the page
+/// fetches only while few requests are around), one span each in the rows they were packed
+/// into. Spans that do not cover the whole view (a fetch is under way) are drawn clipped.
 pub fn network_lane(
     snap: &Snapshot,
     vp: Viewport,
@@ -407,13 +475,8 @@ pub fn network_lane(
     budget: usize,
     spans: Option<&Spans>,
 ) -> LaneGeometry {
-    let range = range_of(vp);
-    if let Some(spans) = spans
-        && spans.range.start <= range.start
-        && spans.range.end >= range.end
-        && wants_spans(snap, vp, width)
-    {
-        return spans_lane(snap, vp, width, budget, spans);
+    if let Some(spans) = spans {
+        return spans_lane(vp, width, budget, spans);
     }
     cells_lane(
         snap.net.lod(),
@@ -431,57 +494,33 @@ pub fn network_lane(
     )
 }
 
-fn spans_lane(
-    snap: &Snapshot,
-    vp: Viewport,
-    width: f32,
-    budget: usize,
-    spans: &Spans,
-) -> LaneGeometry {
+/// Clips the packed spans to the view and stops at the budget: bounded by `SPAN_CAP`.
+fn spans_lane(vp: Viewport, width: f32, budget: usize, spans: &Spans) -> LaneGeometry {
     let mut g = LaneGeometry::default();
     let range = range_of(vp);
-    let latest = snap.net.latest();
-    let mut found: Vec<(SessionTime, SessionTime, u32)> = spans
-        .seqs
-        .iter()
-        .filter_map(|&seq| {
-            let r = snap.net.get(seq as usize)?;
-            let end = r.end.unwrap_or(latest).max(r.start);
-            range.overlaps(r.start, end).then_some((r.start, end, seq))
-        })
-        .collect();
-    found.sort_by_key(|&(start, _, seq)| (start, seq));
     let gap = pad();
     let row_h = ((lane_h() - gap * (SPAN_ROWS as f32 + 1.0)) / SPAN_ROWS as f32).max(1.0);
-    let mut ends = [f32::NEG_INFINITY; SPAN_ROWS];
-    for (start, end, seq) in found.into_iter().take(budget) {
-        let x0 = vp.x_of(start.0, width).max(0.0);
-        let x1 = vp.x_of(end.0, width).min(width);
+    for s in spans
+        .items
+        .iter()
+        .filter(|s| range.overlaps(s.start, s.end))
+        .take(budget)
+    {
+        let x0 = vp.x_of(s.start.0, width).max(0.0);
+        let x1 = vp.x_of(s.end.0, width).min(width);
         if !(x0.is_finite() && x1.is_finite()) || x0 > width {
             continue;
         }
         let w = (x1 - x0).max(1.0).min(width - x0).max(f32::MIN_POSITIVE);
-        // The first row that is free, else the one that frees up first.
-        let row = (0..SPAN_ROWS)
-            .find(|&r| ends[r] + gap <= x0)
-            .unwrap_or_else(|| {
-                (0..SPAN_ROWS)
-                    .min_by(|&a, &b| ends[a].total_cmp(&ends[b]))
-                    .unwrap_or(0)
-            });
-        ends[row] = x0 + w;
         let rect = Rect {
             x: x0,
-            y: gap + row as f32 * (row_h + gap),
+            y: gap + f32::from(s.row.min(SPAN_ROWS as u8 - 1)) * (row_h + gap),
             w,
             h: row_h,
         };
-        let hue = match snap.net.get(seq as usize) {
-            Some(r) if r.is_error() => Hue::Danger,
-            _ => Hue::Network,
-        };
+        let hue = if s.error { Hue::Danger } else { Hue::Network };
         g.quads.push(LaneQuad { rect, hue });
-        g.hits.push((rect, LaneHit::Request(seq)));
+        g.hits.push((rect, LaneHit::Request(s.seq)));
     }
     g
 }
@@ -577,7 +616,14 @@ fn first_line(text: &str) -> String {
     text.lines().next().unwrap_or("").trim().to_string()
 }
 
-/// A marker per navigation record, labelled with its route where it fits.
+/// The indices `lo..hi` taken one in `stride`, where `stride` leaves at most `cap` of them.
+fn strided(lo: usize, hi: usize, cap: usize) -> impl Iterator<Item = usize> {
+    let stride = (hi.saturating_sub(lo)).div_ceil(cap.max(1)).max(1);
+    (lo..hi).step_by(stride)
+}
+
+/// A marker per navigation record, labelled with its route where it fits. With more records in
+/// view than the lane has pixels, one in every few: bounded by the width, not by the data.
 pub fn navigation_lane(snap: &Snapshot, vp: Viewport, width: f32, budget: usize) -> LaneGeometry {
     let nav = snap.logs.navigation();
     let range = range_of(vp);
@@ -586,33 +632,45 @@ pub fn navigation_lane(snap: &Snapshot, vp: Viewport, width: f32, budget: usize)
             .and_then(|&s| snap.logs.get_row(s as usize))
             .map(|r| r.time)
     };
-    let (mut lo, mut hi) = (0, nav.len());
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        if time_of(mid).is_some_and(|t| t < range.start) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
+    let first = |keep_before: &dyn Fn(SessionTime) -> bool| {
+        let (mut lo, mut hi) = (0, nav.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if time_of(mid).is_some_and(keep_before) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
         }
-    }
-    let items = (lo..nav.len()).map_while(|i| {
+        lo
+    };
+    let lo = first(&|t| t < range.start);
+    let hi = first(&|t| t <= range.end);
+    let cap = (width as usize).min(budget).saturating_mul(2);
+    let items = strided(lo, hi, cap).filter_map(|i| {
         let seq = *nav.get(i)?;
         let row = snap.logs.get_row(seq as usize)?;
-        (row.time <= range.end).then(|| {
-            (
-                vp.x_of(row.time.0, width),
-                LaneHit::Navigation(seq),
-                first_line(row.text),
-            )
-        })
+        Some((
+            vp.x_of(row.time.0, width),
+            LaneHit::Navigation(seq),
+            first_line(row.text),
+        ))
     });
     marker_lane(items, width, budget)
 }
 
-/// A `Jank` marker per janky frame.
+/// A `Jank` marker per janky frame. With more slow frames in view than the lane has pixels, one
+/// in every few of them is looked at: bounded by the width, not by the data.
 pub fn findings_lane(snap: &Snapshot, vp: Viewport, width: f32, budget: usize) -> LaneGeometry {
     let idx = snap.frames.range(range_of(vp));
-    let items = janky_frames(snap, idx).filter_map(|i| {
+    let slow = snap.frames.slow();
+    let b = slow_bounds(snap, idx);
+    let cap = (width as usize).min(budget).saturating_mul(2);
+    let items = strided(b.start, b.end, cap).filter_map(|k| {
+        let i = *slow.get(k)? as usize;
+        if !is_janky(snap, i) {
+            return None;
+        }
         let f = snap.frames.get(i)?;
         Some((
             vp.x_of(f.start.0, width),
@@ -666,7 +724,7 @@ pub fn location_for(snap: &Snapshot, hit: &LaneHit, range: Option<TimeRange>) ->
             Some(at(Tool::Logs, Some(Selection::Log(row.id))))
         }
         LaneHit::Gc(_) => Some(at(Tool::Performance, None)),
-        LaneHit::LogCell(_) | LaneHit::RequestCell(_) => None,
+        LaneHit::LogCell(_) | LaneHit::RequestCell(_) | LaneHit::FrameCell(_) => None,
     }
 }
 
@@ -759,7 +817,7 @@ pub fn tooltip_text(snap: &Snapshot, hit: &LaneHit) -> Option<String> {
                 format_duration_ns(u64::from(worst_us) * 1_000)
             ))
         }
-        LaneHit::LogCell(_) | LaneHit::RequestCell(_) => None,
+        LaneHit::LogCell(_) | LaneHit::RequestCell(_) | LaneHit::FrameCell(_) => None,
     }
 }
 
@@ -797,7 +855,6 @@ mod tests {
     use crate::test_support::{frame_at, log_at, request, snapshot};
     use fdt_store::Snapshot;
     use fdt_store::logs::{LogLevel, LogSource};
-    use fdt_store::net_query::{NetFilter, filter_requests};
     use fdt_store::time::{SessionTime, TimeRange};
     use fdt_store::timeline::{Slice, SliceCat, TrackKind};
     use fdt_ui::canvas::CANVAS_MAX_QUADS;
@@ -907,17 +964,7 @@ mod tests {
         });
         let vp = full(&snap);
         let all = TimeRange::new(SessionTime(0), SessionTime(vp.range().1));
-        let seqs = filter_requests(
-            &snap.net,
-            &NetFilter {
-                range: Some(all),
-                ..NetFilter::default()
-            },
-        );
-        let spans = Spans {
-            range: all,
-            seqs: seqs.into(),
-        };
+        let spans = fetch_spans(&snap, all, vp.span_ns / 1400);
         let g = lane_geometry(
             LaneKind::Network,
             &snap,
@@ -939,44 +986,27 @@ mod tests {
                 .iter()
                 .all(|(_, h)| matches!(h, LaneHit::RequestCell(_)))
         );
-        // Spans fetched for a range that does not cover the view are not used either.
-        let narrow = Spans {
-            range: TimeRange::new(SessionTime(0), SessionTime(1_000 * MS)),
-            seqs: Arc::from(vec![0u32]),
-        };
+        // Spans that cover only part of the view (a fetch is under way) are drawn clipped.
+        let half = Viewport::fit(0, 2_000 * MS);
         let g = lane_geometry(
             LaneKind::Network,
             &snap,
-            vp,
-            1400.0,
-            CANVAS_MAX_QUADS,
-            Some(&narrow),
-        );
-        assert!(
-            g.hits
-                .iter()
-                .all(|(_, h)| matches!(h, LaneHit::RequestCell(_)))
-        );
-    }
-
-    #[test]
-    fn dense_requests_stay_cells_even_with_spans() {
-        let snap = stress();
-        let vp = full(&snap);
-        let all = TimeRange::new(SessionTime(0), SessionTime(vp.range().1));
-        let spans = Spans {
-            range: all,
-            seqs: (0..5_000u32).collect::<Vec<_>>().into(),
-        };
-        assert!(!wants_spans(&snap, vp, 1400.0));
-        let g = lane_geometry(
-            LaneKind::Network,
-            &snap,
-            vp,
+            half,
             1400.0,
             CANVAS_MAX_QUADS,
             Some(&spans),
         );
+        assert!(!g.quads.is_empty() && g.quads.len() < 40);
+        assert!(g.quads.iter().all(|q| q.rect.x + q.rect.w <= 1400.5));
+    }
+
+    #[test]
+    fn dense_requests_stay_cells_and_fetches_are_capped() {
+        let snap = stress();
+        let vp = full(&snap);
+        let all = TimeRange::new(SessionTime(0), SessionTime(vp.range().1));
+        assert!(!wants_spans(&snap, vp, 1400.0));
+        let g = lane_geometry(LaneKind::Network, &snap, vp, 1400.0, CANVAS_MAX_QUADS, None);
         assert!(
             g.hits
                 .iter()
@@ -986,6 +1016,114 @@ mod tests {
             g.quads.iter().any(|q| q.hue == Hue::Danger),
             "errors show in the cells"
         );
+        // Whatever it is asked for, a fetch returns a bounded, sorted, packed set, and drawing
+        // it reads no more than that.
+        let spans = fetch_spans(&snap, all, vp.span_ns / 1400);
+        assert!(spans.items.len() <= SPAN_CAP);
+        assert!(spans.items.windows(2).all(|w| w[0].start <= w[1].start));
+        assert!(spans.items.iter().all(|s| (s.row as usize) < SPAN_ROWS));
+        let g = lane_geometry(LaneKind::Network, &snap, vp, 1400.0, 50, Some(&spans));
+        assert_eq!(g.quads.len(), 50);
+    }
+
+    #[test]
+    fn a_dense_burst_in_the_fetch_margin_turns_spans_off() {
+        // 30 requests in the view and 1,000 more in its second half, but another 1,500 in the
+        // margin after it, which the fetch also reads.
+        let snap = snapshot(|w, run| {
+            for i in 0..30u64 {
+                request(
+                    w,
+                    run,
+                    "GET",
+                    "http://h/a",
+                    Some(200),
+                    i * 30,
+                    Some(i * 30 + 5),
+                );
+            }
+            for i in 0..2_500u64 {
+                request(
+                    w,
+                    run,
+                    "GET",
+                    "http://h/b",
+                    Some(200),
+                    1_000 + i,
+                    Some(1_010 + i),
+                );
+            }
+        });
+        let vp = Viewport::fit(0, 2_000 * MS);
+        let in_view: u64 = lane_cells(snap.net.lod(), range_of(vp), 1000)
+            .iter()
+            .map(|c| u64::from(c.count))
+            .sum();
+        assert!(
+            in_view <= SPAN_LIMIT,
+            "the view alone would have asked for spans"
+        );
+        assert!(!wants_spans(&snap, vp, 1000.0));
+        // Zoomed in on the sparse part, the fetch range holds few enough.
+        assert!(wants_spans(&snap, Viewport::fit(0, 300 * MS), 1000.0));
+    }
+
+    #[test]
+    fn frames_cells_do_no_per_frame_work() {
+        let snap = stress();
+        let vp = full(&snap);
+        FRAME_READS.with(|c| c.set(0));
+        let g = lane_geometry(LaneKind::Frames, &snap, vp, 1400.0, CANVAS_MAX_QUADS, None);
+        assert!(!g.hits.is_empty());
+        assert!(
+            g.hits
+                .iter()
+                .all(|(_, h)| matches!(h, LaneHit::FrameCell(_)))
+        );
+        assert_eq!(
+            FRAME_READS.with(|c| c.get()),
+            0,
+            "cells come from the level of detail"
+        );
+        // A cell's worst frame is looked up on demand, for the one point.
+        let LaneHit::FrameCell(r) = g.hits[3].1 else {
+            unreachable!()
+        };
+        let worst = worst_frame(&snap, r).unwrap();
+        let t = |i: usize| snap.frames.get(i).unwrap().time_us();
+        assert!(snap.frames.range(r).all(|i| t(i) <= t(worst)));
+    }
+
+    #[test]
+    fn marker_lanes_stop_at_their_cap() {
+        // 50k route changes and 50k slow frames in view: the layouts read a few per pixel.
+        let snap = snapshot(|w, run| {
+            for i in 0..50_000u64 {
+                w.push_frame(frame_at(run, i + 1, i * 4, 40, 4));
+                let mut l = log_at(run, i * 4, LogLevel::Info);
+                l.source = LogSource::Navigation;
+                w.push_log(l);
+            }
+        });
+        let vp = full(&snap);
+        FRAME_READS.with(|c| c.set(0));
+        let f = lane_geometry(LaneKind::Findings, &snap, vp, 800.0, CANVAS_MAX_QUADS, None);
+        assert!(!f.quads.is_empty() && f.quads.len() <= 800);
+        assert!(
+            FRAME_READS.with(|c| c.get()) <= 2 * 800 + 2,
+            "reads per pixel, not per frame"
+        );
+        let n = lane_geometry(
+            LaneKind::Navigation,
+            &snap,
+            vp,
+            800.0,
+            CANVAS_MAX_QUADS,
+            None,
+        );
+        assert!(!n.quads.is_empty() && n.quads.len() <= 800);
+        let n = lane_geometry(LaneKind::Navigation, &snap, vp, 800.0, 20, None);
+        assert_eq!(n.quads.len(), 20);
     }
 
     #[test]
