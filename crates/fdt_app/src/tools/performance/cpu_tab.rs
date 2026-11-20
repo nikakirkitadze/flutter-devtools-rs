@@ -469,6 +469,71 @@ impl CpuTab {
         self.mode
     }
 
+    /// The flame chart.
+    pub fn flame(&self) -> &Entity<FlameChart> {
+        &self.flame
+    }
+
+    /// Whether the latest result is for what the tab shows now (its mode, range and filter).
+    pub fn is_settled(&self) -> bool {
+        self.active
+            && self.result.as_ref().is_some_and(|r| r.key == self.key())
+            && (self.mode != CpuMode::Flame || self.flame_data.is_some())
+    }
+
+    /// Opens the first `fanout` nodes of every level above `depth` in the top-down tree, so its
+    /// rows reach `depth + 1` levels. What opening nodes by hand does, in one go.
+    pub fn expand_to_depth(&mut self, depth: usize, fanout: usize, cx: &mut Context<Self>) {
+        fn walk(
+            data: &TreeData,
+            nodes: &[u32],
+            parent: Option<&str>,
+            level: usize,
+            (depth, fanout): (usize, usize),
+            open: &mut HashSet<SharedString>,
+        ) {
+            for &n in nodes.iter().take(fanout) {
+                let node = &data.tree.nodes[n as usize];
+                let id = match parent {
+                    Some(p) => format!("{p}/{}", node.function.0),
+                    None => node.function.0.to_string(),
+                };
+                if level < depth && !node.children.is_empty() {
+                    walk(
+                        data,
+                        &node.children,
+                        Some(&id),
+                        level + 1,
+                        (depth, fanout),
+                        open,
+                    );
+                    open.insert(id.into());
+                }
+            }
+        }
+        let Some(result) = self.result.clone() else {
+            return;
+        };
+        let Body::Tree(data) = &result.body else {
+            return;
+        };
+        walk(
+            data,
+            &data.tree.roots,
+            None,
+            0,
+            (depth, fanout),
+            &mut self.open,
+        );
+        self.rebuild_items(cx);
+    }
+
+    /// How many rows the tree shows.
+    pub fn tree_len(&self, cx: &App) -> usize {
+        let state = self.tree_state.read(cx);
+        (0..).map_while(|ix| state.entry(ix)).count()
+    }
+
     /// How many times a recompute was started.
     #[cfg(test)]
     pub fn runs(&self) -> usize {
@@ -564,7 +629,6 @@ impl CpuTab {
     }
 
     /// Selects tree row `ix`.
-    #[cfg(test)]
     pub fn select_row(&mut self, ix: usize, cx: &mut Context<Self>) {
         self.tree_state
             .update(cx, |s, cx| s.set_selected_index(Some(ix), cx));

@@ -234,9 +234,14 @@ pub fn requests(w: &mut SessionWriter, run: RunId, n: usize, seed: u64) {
 /// 1 % janky (over 2x budget), where budget is `1/hz`.
 pub fn frames(w: &mut SessionWriter, run: RunId, n: usize, seed: u64, hz: u32) {
     let mut r = Rng(seed.wrapping_mul(0xA24B_AED4_963E_E407) | 1);
+    push_frames(w, run, &mut r, 0, n, hz);
+}
+
+/// Frames `first..first + n`, drawing their timings from `r`.
+fn push_frames(w: &mut SessionWriter, run: RunId, r: &mut Rng, first: u64, n: usize, hz: u32) {
     let hz = hz.max(1) as u64;
     let budget = (1_000_000 / hz).max(4);
-    for i in 0..n as u64 {
+    for i in first..first + n as u64 {
         let elapsed = match r.below(100) {
             0 => 2 * budget + 1 + r.below(2 * budget),
             1..=3 => budget + r.below(budget),
@@ -289,76 +294,153 @@ pub fn frames(w: &mut SessionWriter, run: RunId, n: usize, seed: u64, hz: u32) {
 pub fn perf(w: &mut SessionWriter, run: RunId, n: usize, seed: u64, hz: u32) {
     frames(w, run, n, seed, hz);
     let snap = w.publish();
-    let mut r = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
-    let ui = w.timeline_track(run, TrackKind::Thread, 1, "io.flutter.ui");
-    w.set_track_order(ui, 0);
-    let raster = w.timeline_track(run, TrackKind::Thread, 2, "io.flutter.raster");
-    w.set_track_order(raster, 1);
-    let frame_row = w.timeline_track(run, TrackKind::Async, 3, "Frame");
-    let pipeline = w.timeline_track(run, TrackKind::Async, 4, "PipelineItem");
-    let worker = w.timeline_track(run, TrackKind::Thread, 5, "DartWorker");
-    let mut ends = [0u64; 4];
-    for i in 0..snap.frames.len() {
-        let f = snap.frames.get(i).expect("frame in range");
-        let (Some(u), Some(rs)) = (f.ui, f.raster) else {
-            continue;
-        };
-        let (frame_start, frame_end) = (f.start.0, f.end().0);
-        if u.begin.0 >= ends[0] {
-            ends[0] = ui_slices(w, ui, &mut r, &u);
+    let mut slicer = PerfSlicer::new(w, run, seed, [0; 4]);
+    slicer.slice_frames(w, &snap, 0..snap.frames.len());
+}
+
+/// The tracks and state that put slices under frames, one frame at a time.
+struct PerfSlicer {
+    r: Rng,
+    ui: TrackId,
+    raster: TrackId,
+    frame_row: TrackId,
+    pipeline: TrackId,
+    worker: TrackId,
+    /// Where the last slice of each lane (UI, raster, Frame, PipelineItem) ends.
+    ends: [u64; 4],
+}
+
+impl PerfSlicer {
+    fn new(w: &mut SessionWriter, run: RunId, seed: u64, ends: [u64; 4]) -> Self {
+        let r = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
+        let ui = w.timeline_track(run, TrackKind::Thread, 1, "io.flutter.ui");
+        w.set_track_order(ui, 0);
+        let raster = w.timeline_track(run, TrackKind::Thread, 2, "io.flutter.raster");
+        w.set_track_order(raster, 1);
+        Self {
+            r,
+            ui,
+            raster,
+            frame_row: w.timeline_track(run, TrackKind::Async, 3, "Frame"),
+            pipeline: w.timeline_track(run, TrackKind::Async, 4, "PipelineItem"),
+            worker: w.timeline_track(run, TrackKind::Thread, 5, "DartWorker"),
+            ends,
         }
-        if rs.start.0 >= ends[1] {
-            ends[1] = raster_slices(
-                w,
-                raster,
-                &mut r,
-                rs.start.0,
-                u64::from(rs.raster_us) * 1_000,
-            );
+    }
+
+    /// Slices for the frames of `snap` whose seq is in `range`.
+    fn slice_frames(
+        &mut self,
+        w: &mut SessionWriter,
+        snap: &crate::Snapshot,
+        range: std::ops::Range<usize>,
+    ) {
+        let (ui, raster, frame_row, pipeline, worker) = (
+            self.ui,
+            self.raster,
+            self.frame_row,
+            self.pipeline,
+            self.worker,
+        );
+        let (r, ends) = (&mut self.r, &mut self.ends);
+        for i in range {
+            let f = snap.frames.get(i).expect("frame in range");
+            let (Some(u), Some(rs)) = (f.ui, f.raster) else {
+                continue;
+            };
+            let (frame_start, frame_end) = (f.start.0, f.end().0);
+            if u.begin.0 >= ends[0] {
+                ends[0] = ui_slices(w, ui, r, &u);
+            }
+            if rs.start.0 >= ends[1] {
+                ends[1] = raster_slices(w, raster, r, rs.start.0, u64::from(rs.raster_us) * 1_000);
+            }
+            if frame_start >= ends[2] {
+                let dur = frame_end - frame_start;
+                let animate = Slice {
+                    start: SessionTime(frame_start),
+                    dur_ns: dur / 10,
+                    name: w.intern_name("Animate"),
+                    cat: SliceCat::Embedder,
+                };
+                w.push_slice(frame_row, 1, animate, false);
+                let parent = Slice {
+                    dur_ns: dur,
+                    name: w.intern_name("Frame"),
+                    ..animate
+                };
+                w.push_slice(frame_row, 0, parent, false);
+                ends[2] = frame_end;
+            }
+            if frame_start >= ends[3] {
+                let dur = u64::from(u.ui_us) * 1_000;
+                let child = Slice {
+                    start: SessionTime(frame_start),
+                    dur_ns: dur / 2,
+                    name: w.intern_name("PipelineProduce"),
+                    cat: SliceCat::Embedder,
+                };
+                w.push_slice(pipeline, 1, child, false);
+                let parent = Slice {
+                    dur_ns: dur,
+                    name: w.intern_name("PipelineItem"),
+                    ..child
+                };
+                w.push_slice(pipeline, 0, parent, false);
+                ends[3] = frame_start + dur;
+            }
+            if i % 50 == 49 {
+                let gc = Slice {
+                    start: SessionTime(frame_start + 1_000_000),
+                    dur_ns: 1_000_000 + r.below(2_000_000),
+                    name: w.intern_name("CollectNewGeneration"),
+                    cat: SliceCat::Gc,
+                };
+                w.push_slice(worker, 0, gc, false);
+            }
         }
-        if frame_start >= ends[2] {
-            let dur = frame_end - frame_start;
-            let animate = Slice {
-                start: SessionTime(frame_start),
-                dur_ns: dur / 10,
-                name: w.intern_name("Animate"),
-                cat: SliceCat::Embedder,
-            };
-            w.push_slice(frame_row, 1, animate, false);
-            let parent = Slice {
-                dur_ns: dur,
-                name: w.intern_name("Frame"),
-                ..animate
-            };
-            w.push_slice(frame_row, 0, parent, false);
-            ends[2] = frame_end;
+    }
+}
+
+/// Appends frames with their slices to a session [`perf`] built, a few at a time, as a live app
+/// would: what `fdt bench-ui live-perf` publishes.
+pub struct PerfFeed {
+    run: RunId,
+    hz: u32,
+    frame_rng: Rng,
+    slicer: PerfSlicer,
+    /// The seq of the next frame.
+    next: usize,
+}
+
+impl PerfFeed {
+    /// A feed continuing the frames already in `w` (published here), with its own random streams.
+    pub fn new(w: &mut SessionWriter, run: RunId, seed: u64, hz: u32) -> Self {
+        let snap = w.publish();
+        let end = snap
+            .frames
+            .len()
+            .checked_sub(1)
+            .and_then(|i| snap.frames.get(i))
+            .map_or(0, |f| f.end().0);
+        let salt = seed ^ 0x9E37_79B9_7F4A_7C15;
+        Self {
+            run,
+            hz,
+            frame_rng: Rng(salt.wrapping_mul(0xA24B_AED4_963E_E407) | 1),
+            slicer: PerfSlicer::new(w, run, salt, [end; 4]),
+            next: snap.frames.len(),
         }
-        if frame_start >= ends[3] {
-            let dur = u64::from(u.ui_us) * 1_000;
-            let child = Slice {
-                start: SessionTime(frame_start),
-                dur_ns: dur / 2,
-                name: w.intern_name("PipelineProduce"),
-                cat: SliceCat::Embedder,
-            };
-            w.push_slice(pipeline, 1, child, false);
-            let parent = Slice {
-                dur_ns: dur,
-                name: w.intern_name("PipelineItem"),
-                ..child
-            };
-            w.push_slice(pipeline, 0, parent, false);
-            ends[3] = frame_start + dur;
-        }
-        if i % 50 == 49 {
-            let gc = Slice {
-                start: SessionTime(frame_start + 1_000_000),
-                dur_ns: 1_000_000 + r.below(2_000_000),
-                name: w.intern_name("CollectNewGeneration"),
-                cat: SliceCat::Gc,
-            };
-            w.push_slice(worker, 0, gc, false);
-        }
+    }
+
+    /// Appends `n` frames (with phases) and the slices under them, and publishes.
+    pub fn append(&mut self, w: &mut SessionWriter, n: usize) -> std::sync::Arc<crate::Snapshot> {
+        let first = self.next;
+        push_frames(w, self.run, &mut self.frame_rng, first as u64, n, self.hz);
+        let snap = w.publish();
+        self.next = snap.frames.len();
+        self.slicer.slice_frames(w, &snap, first..self.next);
+        w.publish()
     }
 }
 
@@ -596,6 +678,27 @@ pub fn stress_session(seed: u64) -> std::sync::Arc<crate::Snapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_perf_feed_appends_frames_with_phases_and_slices() {
+        let (mut w, run) = writer_for_perf();
+        let mut feed = PerfFeed::new(&mut w, run, 7, 120);
+        let before = w.publish();
+        let (frames, slices) = (before.frames.len(), before.timeline.slice_count());
+        let after = feed.append(&mut w, 2);
+        assert_eq!(after.frames.len(), frames + 2);
+        let last = after.frames.get(frames + 1).unwrap();
+        assert!(last.ui.is_some() && last.raster.is_some());
+        assert_eq!(last.number, frames as u64 + 1);
+        let added = after.timeline.slice_count() - slices;
+        assert!((60..=300).contains(&added), "{added} slices for two frames");
+    }
+
+    fn writer_for_perf() -> (SessionWriter, RunId) {
+        let (mut w, run) = super::writer(3, 0, 0, 0);
+        perf(&mut w, run, 200, 3, 120);
+        (w, run)
+    }
     use crate::logs::testkit::writer;
     use crate::net::StatusClass;
 

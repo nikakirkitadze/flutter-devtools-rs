@@ -137,7 +137,6 @@ impl PerformanceView {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn chart(&self) -> &Entity<FrameChart> {
         &self.chart
     }
@@ -147,7 +146,6 @@ impl PerformanceView {
         &self.list
     }
 
-    #[cfg(test)]
     pub(crate) fn cpu(&self) -> &Entity<CpuTab> {
         &self.cpu
     }
@@ -231,7 +229,6 @@ impl PerformanceView {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn trace(&self) -> &Entity<TraceView> {
         &self.trace
     }

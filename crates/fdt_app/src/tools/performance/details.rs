@@ -222,6 +222,14 @@ fn chip(
 }
 
 impl PerformanceView {
+    /// Whether the pane shows the analysis of frame `id`: it is selected and its sentence is in
+    /// the pane (the next frame draws it).
+    pub(crate) fn details_ready(&self, id: EntryId) -> bool {
+        self.selection == Some(id)
+            && self.details.result.is_some()
+            && self.details.key.as_ref().is_some_and(|k| k.id == id)
+    }
+
     #[cfg(test)]
     pub(crate) fn details_runs(&self) -> usize {
         self.details.runs

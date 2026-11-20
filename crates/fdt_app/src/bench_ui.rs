@@ -25,12 +25,12 @@
 
 use crate::actions::show_tool;
 use crate::app::{start_fixed, start_live};
-use crate::nav::{Location, Page, Tool};
+use crate::nav::{Location, Page, Selection, TimeRange, Tool};
 use crate::perf::{Counter, N as COUNTERS, snapshot};
 use crate::shell::MainWindow;
 use fdt_capture::ConnStatus;
 use fdt_store::run::{AppInfo, Mode};
-use fdt_store::time::RunId;
+use fdt_store::time::{EntryId, RunId, SessionTime};
 use fdt_ui::assets::FdtAssets;
 use gpui_kit::profiler::{FrameEvent, FrameTimingCollector, set_trace_enabled};
 use gpui_kit::{
@@ -58,7 +58,8 @@ const LOG_QUERY: &str = "connection timeout";
 const NET_QUERY: &str = "products";
 
 pub const USAGE: &str = "usage: fdt bench-ui <scenario> [--frames N]\n\
-scenarios: logs-scroll, logs-search, net-scroll, net-filter, tool-switch, strip-drag, live-logs";
+scenarios: logs-scroll, logs-search, net-scroll, net-filter, tool-switch, strip-drag, live-logs, \
+frame-chart, frame-details, timeline-zoom, trace-zoom, flame-zoom, cpu-tree, live-perf";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scenario {
@@ -70,10 +71,24 @@ pub enum Scenario {
     StripDrag,
     /// The Logs view following a session that grows by 50 lines every 16 ms.
     LiveLogs,
+    /// Pan through all frames of the chart, then zoom its bar width in and out.
+    FrameChart,
+    /// Select the slowest frames in turn; latency runs to the drawn sentence.
+    FrameDetails,
+    /// Zoom the Timeline from the whole session to 10 ms and back, then pan.
+    TimelineZoom,
+    /// The same on the Raw trace tab.
+    TraceZoom,
+    /// The same on the CPU flame chart, scoped to 60 s.
+    FlameZoom,
+    /// Expand the top-down tree 6 levels, then scroll through it.
+    CpuTree,
+    /// The Frames tab following a session that gains 2 frames with slices per publish.
+    LivePerf,
 }
 
 impl Scenario {
-    pub const ALL: [Scenario; 7] = [
+    pub const ALL: [Scenario; 14] = [
         Scenario::LogsScroll,
         Scenario::LogsSearch,
         Scenario::NetScroll,
@@ -81,6 +96,13 @@ impl Scenario {
         Scenario::ToolSwitch,
         Scenario::StripDrag,
         Scenario::LiveLogs,
+        Scenario::FrameChart,
+        Scenario::FrameDetails,
+        Scenario::TimelineZoom,
+        Scenario::TraceZoom,
+        Scenario::FlameZoom,
+        Scenario::CpuTree,
+        Scenario::LivePerf,
     ];
 
     pub fn name(self) -> &'static str {
@@ -92,6 +114,13 @@ impl Scenario {
             Scenario::ToolSwitch => "tool-switch",
             Scenario::StripDrag => "strip-drag",
             Scenario::LiveLogs => "live-logs",
+            Scenario::FrameChart => "frame-chart",
+            Scenario::FrameDetails => "frame-details",
+            Scenario::TimelineZoom => "timeline-zoom",
+            Scenario::TraceZoom => "trace-zoom",
+            Scenario::FlameZoom => "flame-zoom",
+            Scenario::CpuTree => "cpu-tree",
+            Scenario::LivePerf => "live-perf",
         }
     }
 
@@ -103,6 +132,13 @@ impl Scenario {
     fn home(self) -> Tool {
         match self {
             Scenario::NetScroll | Scenario::NetFilter => Tool::Network,
+            Scenario::TimelineZoom => Tool::Timeline,
+            Scenario::FrameChart
+            | Scenario::FrameDetails
+            | Scenario::TraceZoom
+            | Scenario::FlameZoom
+            | Scenario::CpuTree
+            | Scenario::LivePerf => Tool::Performance,
             _ => Tool::Logs,
         }
     }
@@ -115,6 +151,13 @@ impl Scenario {
             Scenario::ToolSwitch => 40,
             Scenario::LogsSearch => LOG_QUERY.len(),
             Scenario::NetFilter => NET_QUERY.len(),
+            Scenario::FrameChart => 720,
+            Scenario::FrameDetails => 50,
+            Scenario::TimelineZoom
+            | Scenario::TraceZoom
+            | Scenario::FlameZoom
+            | Scenario::CpuTree => 300,
+            Scenario::LivePerf => 600,
         }
     }
 
@@ -122,7 +165,7 @@ impl Scenario {
     fn latency_budget_ms(self) -> Option<f64> {
         match self {
             Scenario::LogsSearch | Scenario::NetFilter => Some(16.0),
-            Scenario::ToolSwitch => Some(50.0),
+            Scenario::ToolSwitch | Scenario::FrameDetails => Some(50.0),
             _ => None,
         }
     }
@@ -385,8 +428,42 @@ pub struct Script {
     started: Option<Instant>,
     pending: Option<Pending>,
     switches: usize,
+    /// `frame-details`: the frames to select, slowest first.
+    targets: Vec<EntryId>,
+    /// The viewport span when zooming began, for the zoom-out to return to.
+    fit_span: Option<u64>,
+    zoom: ZoomPhase,
+    pans: usize,
+    /// `cpu-tree`: levels expanded so far, and the rows once expanded.
+    levels: usize,
+    tree_len: usize,
     outcome: Outcome,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ZoomPhase {
+    In,
+    Out,
+    Pan,
+}
+
+/// The zoom factor of one step.
+const ZOOM_FACTOR: f32 = 1.25;
+/// Where zooms anchor, in pixels from the plot's left edge.
+const ZOOM_X: f32 = 450.0;
+/// Pixels per pan step.
+const PAN_PX: f32 = 40.0;
+/// The span the zoom scenarios zoom in to.
+const TARGET_SPAN_NS: u64 = 10_000_000;
+/// Pan steps before the direction flips.
+const PAN_RUN: usize = 50;
+/// Levels `cpu-tree` expands, and nodes opened per level.
+const TREE_LEVELS: usize = 6;
+const TREE_FANOUT: usize = 4;
+/// Rows `cpu-tree` moves per step.
+const TREE_STRIDE: usize = 3;
+/// The range `flame-zoom` scopes the CPU profile to.
+const FLAME_RANGE_NS: u64 = 60_000_000_000;
 
 impl Script {
     /// `len` overrides the scripted length (frames, or switches for `tool-switch`); the two
@@ -407,6 +484,12 @@ impl Script {
             started: None,
             pending: None,
             switches: 0,
+            targets: Vec::new(),
+            fit_span: None,
+            zoom: ZoomPhase::In,
+            pans: 0,
+            levels: 0,
+            tree_len: 0,
             outcome: Outcome::default(),
         }
     }
@@ -443,6 +526,13 @@ impl Script {
                     Scenario::ToolSwitch => self.switch_step(shell, window, cx),
                     Scenario::StripDrag => self.drag_step(shell, window, cx),
                     Scenario::LiveLogs => self.live_step(shell, cx),
+                    Scenario::LivePerf => self.live_perf_step(shell, cx),
+                    Scenario::FrameChart => self.chart_step(shell, cx),
+                    Scenario::FrameDetails => self.details_step(shell, window, cx),
+                    Scenario::TimelineZoom | Scenario::TraceZoom | Scenario::FlameZoom => {
+                        self.zoom_step(shell, cx)
+                    }
+                    Scenario::CpuTree => self.tree_step(shell, cx),
                 }
                 self.outcome.steps += 1;
             }
@@ -453,17 +543,247 @@ impl Script {
     fn warm_up(&mut self, shell: &Entity<MainWindow>, window: &mut Window, cx: &mut App) {
         if !self.prepared {
             self.prepared = true;
-            let page = Page::Tool(self.scenario.home());
-            shell.update(cx, |s, cx| s.navigate(Location::at(page), window, cx));
+            let mut location = Location::at(Page::Tool(self.scenario.home()));
+            if self.scenario == Scenario::FlameZoom {
+                location.range = Some(TimeRange::new(SessionTime(0), SessionTime(FLAME_RANGE_NS)));
+            }
+            shell.update(cx, |s, cx| s.navigate(location, window, cx));
+            self.prepare_tab(shell, cx);
             let focus = shell.read(cx).focus_handle();
             window.focus(&focus, cx);
         }
         self.warm += 1;
-        if self.warm >= WARMUP_FRAMES && ready(shell, self.scenario.home(), cx) {
+        if self.warm >= WARMUP_FRAMES
+            && ready(shell, self.scenario.home(), cx)
+            && self.scenario_ready(shell, cx)
+        {
             self.phase = Phase::Running;
             self.started = Some(Instant::now());
             self.frame = 0;
         }
+    }
+
+    /// Opens the Performance tab the scenario works on. The CPU mode goes first: the tab only
+    /// computes once it is on screen, and then for the mode it has.
+    fn prepare_tab(&mut self, shell: &Entity<MainWindow>, cx: &mut App) {
+        use crate::tools::performance::PerfTab;
+        use crate::tools::performance::cpu_tab::CpuMode;
+        let perf = shell.read(cx).performance_view().clone();
+        let cpu = perf.read(cx).cpu().clone();
+        let (tab, mode) = match self.scenario {
+            Scenario::TraceZoom => (PerfTab::Trace, None),
+            Scenario::FlameZoom => (PerfTab::Cpu, Some(CpuMode::Flame)),
+            Scenario::CpuTree => (PerfTab::Cpu, Some(CpuMode::TopDown)),
+            _ => return,
+        };
+        if let Some(mode) = mode {
+            cpu.update(cx, |c, cx| c.set_mode(mode, cx));
+        }
+        perf.update(cx, |p, cx| p.set_tab(tab, cx));
+    }
+
+    /// Whether what the scenario works on is shown.
+    fn scenario_ready(&self, shell: &Entity<MainWindow>, cx: &App) -> bool {
+        let perf = shell.read(cx).performance_view().read(cx);
+        match self.scenario {
+            Scenario::TraceZoom => !perf.trace().read(cx).is_empty(),
+            Scenario::FlameZoom | Scenario::CpuTree => perf.cpu().read(cx).is_settled(),
+            _ => true,
+        }
+    }
+
+    fn next_frame(&mut self) {
+        self.frame += 1;
+        if self.frame >= self.len {
+            self.phase = Phase::Done;
+        }
+    }
+
+    fn live_perf_step(&mut self, shell: &Entity<MainWindow>, cx: &mut App) {
+        let perf = shell.read(cx).performance_view().read(cx);
+        self.outcome.last_position = Some(perf.chart().read(cx).len());
+        self.next_frame();
+    }
+
+    /// Pans through every frame in five sixths of the steps, then zooms the bars in and out.
+    fn chart_step(&mut self, shell: &Entity<MainWindow>, cx: &mut App) {
+        let chart = shell.read(cx).performance_view().read(cx).chart().clone();
+        let pan_steps = (self.len * 5 / 6).max(1);
+        if self.frame == 0 {
+            // The chart opens on the newest frame; start from the oldest.
+            chart.update(cx, |c, cx| c.pan_px(-1.0e9, cx));
+        }
+        if self.frame < pan_steps {
+            let (total, bar) = {
+                let c = chart.read(cx);
+                (c.len(), c.bar_px())
+            };
+            let per_step = (total / pan_steps).max(1) as f32;
+            chart.update(cx, |c, cx| c.pan_px(per_step * bar, cx));
+        } else {
+            let k = self.frame - pan_steps;
+            let half = (self.len - pan_steps) / 2;
+            let factor = if k < half { 1.15 } else { 1.0 / 1.15 };
+            chart.update(cx, |c, cx| c.zoom_about(400.0, factor, cx));
+        }
+        self.outcome.last_position = Some(chart.read(cx).first());
+        self.next_frame();
+    }
+
+    /// Selects the next of the slowest frames once the previous one's sentence was seen.
+    fn details_step(&mut self, shell: &Entity<MainWindow>, window: &mut Window, cx: &mut App) {
+        let now = Instant::now();
+        if self.targets.is_empty() {
+            let snap = shell.read(cx).session().read(cx).snapshot().clone();
+            let mut all: Vec<(u32, EntryId)> = (0..snap.frames.len())
+                .filter_map(|i| snap.frames.get(i))
+                .map(|f| (f.time_us(), f.id))
+                .collect();
+            all.sort_by_key(|a| std::cmp::Reverse(a.0));
+            self.targets = all.into_iter().take(self.len).map(|(_, id)| id).collect();
+            if self.targets.is_empty() {
+                self.fail("the session has no frames to select");
+                return;
+            }
+            self.len = self.targets.len();
+        }
+        if let Some(p) = &self.pending {
+            let id = self.targets[self.switches - 1];
+            let ready = shell.read(cx).performance_view().read(cx).details_ready(id);
+            if ready || now.saturating_duration_since(p.at) > LATENCY_CAP {
+                self.outcome.samples.push(Sample {
+                    key_at: p.at,
+                    first_seen: now,
+                    full_seen: None,
+                });
+                self.pending = None;
+            }
+        }
+        if self.pending.is_none() && self.switches < self.len {
+            let id = self.targets[self.switches];
+            let at = Instant::now();
+            let to = Location {
+                page: Page::Tool(Tool::Performance),
+                selection: Some(Selection::Frame(id)),
+                range: None,
+            };
+            shell.update(cx, |s, cx| s.navigate(to, window, cx));
+            self.pending = Some(Pending {
+                at,
+                first_base: 0,
+                first_seen: None,
+                target: None,
+            });
+            self.switches += 1;
+            self.outcome.keystrokes += 1;
+        }
+        self.frame += 1;
+        if self.switches >= self.len && self.pending.is_none() {
+            self.phase = Phase::Done;
+        }
+    }
+
+    /// The viewport span of the view the zoom scenario works on.
+    fn span(&self, shell: &Entity<MainWindow>, cx: &App) -> u64 {
+        match self.scenario {
+            Scenario::TimelineZoom => shell.read(cx).timeline_view().read(cx).viewport().span_ns,
+            Scenario::TraceZoom => {
+                let perf = shell.read(cx).performance_view().read(cx);
+                perf.trace().read(cx).viewport().span_ns
+            }
+            _ => {
+                let perf = shell.read(cx).performance_view().read(cx);
+                perf.cpu().read(cx).flame().read(cx).viewport().span_ns
+            }
+        }
+    }
+
+    /// Zooms (`factor` above 1 zooms in) or pans the view.
+    fn move_view(&self, shell: &Entity<MainWindow>, cx: &mut App, zoom: Option<f32>, pan: f32) {
+        let perf = shell.read(cx).performance_view().clone();
+        match self.scenario {
+            Scenario::TimelineZoom => {
+                shell
+                    .read(cx)
+                    .timeline_view()
+                    .clone()
+                    .update(cx, |t, cx| match zoom {
+                        Some(f) => t.zoom_about(ZOOM_X, f, cx),
+                        None => t.pan_px(pan, cx),
+                    })
+            }
+            Scenario::TraceZoom => perf
+                .read(cx)
+                .trace()
+                .clone()
+                .update(cx, |t, cx| match zoom {
+                    Some(f) => t.zoom_about(ZOOM_X, f, cx),
+                    None => t.pan_px(pan, cx),
+                }),
+            _ => perf
+                .read(cx)
+                .cpu()
+                .read(cx)
+                .flame()
+                .clone()
+                .update(cx, |t, cx| match zoom {
+                    Some(f) => t.zoom_about(ZOOM_X, f, cx),
+                    None => t.pan_px(pan, cx),
+                }),
+        }
+    }
+
+    /// In to [`TARGET_SPAN_NS`], back out to the starting span, then one deep zoom and pans.
+    fn zoom_step(&mut self, shell: &Entity<MainWindow>, cx: &mut App) {
+        let span = self.span(shell, cx);
+        let fit = *self.fit_span.get_or_insert(span);
+        if self.zoom == ZoomPhase::In && span <= TARGET_SPAN_NS {
+            self.zoom = ZoomPhase::Out;
+        }
+        if self.zoom == ZoomPhase::Out && span >= fit / 100 * 99 {
+            self.zoom = ZoomPhase::Pan;
+        }
+        match self.zoom {
+            ZoomPhase::In => self.move_view(shell, cx, Some(ZOOM_FACTOR), 0.0),
+            ZoomPhase::Out => self.move_view(shell, cx, Some(1.0 / ZOOM_FACTOR), 0.0),
+            ZoomPhase::Pan if self.pans == 0 => {
+                self.pans = 1;
+                self.move_view(shell, cx, Some(20.0), 0.0);
+            }
+            ZoomPhase::Pan => {
+                let dir = if (self.pans / PAN_RUN).is_multiple_of(2) {
+                    1.0
+                } else {
+                    -1.0
+                };
+                self.pans += 1;
+                self.move_view(shell, cx, None, dir * PAN_PX);
+            }
+        }
+        self.outcome.last_position = Some(self.span(shell, cx).min(usize::MAX as u64) as usize);
+        self.next_frame();
+    }
+
+    /// Opens one more level of the top-down tree per step, then selects rows down the list.
+    fn tree_step(&mut self, shell: &Entity<MainWindow>, cx: &mut App) {
+        let cpu = shell.read(cx).performance_view().read(cx).cpu().clone();
+        if self.levels < TREE_LEVELS {
+            self.levels += 1;
+            let depth = self.levels;
+            cpu.update(cx, |c, cx| c.expand_to_depth(depth, TREE_FANOUT, cx));
+        } else {
+            if self.tree_len == 0 {
+                self.tree_len = cpu.read(cx).tree_len(cx);
+                if self.tree_len == 0 {
+                    self.fail("the top-down tree has no rows to scroll");
+                    return;
+                }
+            }
+            let i = ((self.frame - TREE_LEVELS) * TREE_STRIDE).min(self.tree_len - 1);
+            cpu.update(cx, |c, cx| c.select_row(i, cx));
+            self.outcome.last_position = Some(i);
+        }
+        self.next_frame();
     }
 
     fn scroll_step(&mut self, shell: &Entity<MainWindow>, cx: &mut App, stride: usize) {
@@ -575,11 +895,7 @@ impl Script {
         }
         if self.pending.is_none() && self.switches < self.len {
             // The script starts on Logs, so the first switch goes to Network.
-            let target = if self.switches.is_multiple_of(2) {
-                Tool::Network
-            } else {
-                Tool::Logs
-            };
+            let target = SWITCH_CYCLE[(self.switches + 1) % SWITCH_CYCLE.len()];
             let at = Instant::now();
             // As the app's own shortcuts do: focus the shell, then dispatch, so the action
             // reaches it whatever had focus a moment ago.
@@ -653,6 +969,9 @@ impl Script {
     }
 }
 
+/// The tools `tool-switch` cycles through, starting from Logs.
+const SWITCH_CYCLE: [Tool; 4] = [Tool::Logs, Tool::Network, Tool::Performance, Tool::Timeline];
+
 /// Whether `tool`'s page is showing its rows for the current filter.
 fn ready(shell: &Entity<MainWindow>, tool: Tool, cx: &App) -> bool {
     match tool {
@@ -660,6 +979,11 @@ fn ready(shell: &Entity<MainWindow>, tool: Tool, cx: &App) -> bool {
             let net = shell.read(cx).network_view().read(cx);
             net.is_settled() && net.filtered_len() > 0
         }
+        Tool::Performance => {
+            let perf = shell.read(cx).performance_view().read(cx);
+            !perf.chart().read(cx).is_empty()
+        }
+        Tool::Timeline => shell.read(cx).timeline_view().read(cx).is_settled(),
         _ => shell.read(cx).logs_view().read(cx).is_settled(),
     }
 }
@@ -668,6 +992,8 @@ fn ready(shell: &Entity<MainWindow>, tool: Tool, cx: &App) -> bool {
 
 /// Lines added per publish by the `live-logs` feed.
 const LIVE_LINES: usize = 50;
+/// Frames added per publish by the `live-perf` feed, each with about 70 slices.
+const LIVE_FRAMES: usize = 2;
 /// Time between the feed's publishes.
 const LIVE_EVERY: Duration = Duration::from_millis(16); // token-check: allow: feed pacing
 
@@ -717,8 +1043,10 @@ impl crate::capture_host::CaptureControl for LiveFeed {
 
 /// Starts the `live-logs` feed: the stress session, then [`LIVE_LINES`] more log lines every
 /// [`LIVE_EVERY`], published from a thread that owns the writer.
-fn live_feed() -> LiveFeed {
+fn live_feed(scenario: Scenario) -> LiveFeed {
     let (mut w, run) = fdt_store::synth::stress_writer(SEED);
+    let mut perf = (scenario == Scenario::LivePerf)
+        .then(|| fdt_store::synth::PerfFeed::new(&mut w, run, SEED, 120));
     let first = w.publish();
     let mut next_ms = first.latest_time().0 / 1_000_000 + 1;
     let (status_tx, status) = tokio::sync::watch::channel(stress_status());
@@ -727,8 +1055,14 @@ fn live_feed() -> LiveFeed {
         let _keep = status_tx;
         loop {
             std::thread::sleep(LIVE_EVERY);
-            append_live_lines(&mut w, run, &mut next_ms, LIVE_LINES);
-            if snaps_tx.send(w.publish()).is_err() {
+            let snap = match perf.as_mut() {
+                Some(feed) => feed.append(&mut w, LIVE_FRAMES),
+                None => {
+                    append_live_lines(&mut w, run, &mut next_ms, LIVE_LINES);
+                    w.publish()
+                }
+            };
+            if snaps_tx.send(snap).is_err() {
                 break;
             }
         }
@@ -904,7 +1238,9 @@ fn tick(driver: Rc<RefCell<Driver>>, window: &mut Window, cx: &mut App) {
         (d.shell.clone(), d.scenario)
     };
     match scenario {
+        // These work in views that notify themselves; the shell's notify below draws the frame.
         Scenario::ToolSwitch => {}
+        _ if matches!(scenario.home(), Tool::Performance | Tool::Timeline) => {}
         _ if scenario.home() == Tool::Network => {
             cx.notify(shell.read(cx).network_view().entity_id())
         }
@@ -971,8 +1307,8 @@ enum Source {
 /// verdict. Never returns normally.
 pub fn run(scenario: Scenario, frames: Option<usize>) -> ExitCode {
     // Building the session is not timed (and not covered by the timeout).
-    let source = if scenario == Scenario::LiveLogs {
-        Source::Live(live_feed())
+    let source = if matches!(scenario, Scenario::LiveLogs | Scenario::LivePerf) {
+        Source::Live(live_feed(scenario))
     } else {
         Source::Fixed(fdt_store::synth::stress_session(SEED))
     };
@@ -1024,6 +1360,7 @@ mod tests {
     use super::*;
     use crate::session_model::SessionModel;
     use crate::test_support::{connected, open_shell_with};
+    use fdt_store::time::{SessionTime, TimeRange};
     use gpui_kit::TestAppContext;
     use gpui_kit::test::TestWindowExt as _;
 
@@ -1078,6 +1415,23 @@ mod tests {
             assert_eq!(Scenario::parse(s.name()), Some(s));
         }
         assert_eq!(Scenario::parse("nope"), None);
+        let names: Vec<_> = Scenario::ALL.iter().map(|s| s.name()).collect();
+        for want in [
+            "frame-chart",
+            "frame-details",
+            "timeline-zoom",
+            "trace-zoom",
+            "flame-zoom",
+            "cpu-tree",
+            "live-perf",
+        ] {
+            assert!(names.contains(&want), "{want} is a scenario");
+            assert!(USAGE.contains(want), "{want} is in the usage");
+        }
+        assert_eq!(Scenario::FrameDetails.latency_budget_ms(), Some(50.0));
+        assert_eq!(Scenario::ToolSwitch.latency_budget_ms(), Some(50.0));
+        assert_eq!(Scenario::TimelineZoom.home(), Tool::Timeline);
+        assert_eq!(Scenario::FlameZoom.home(), Tool::Performance);
     }
 
     fn base() -> Measured {
@@ -1257,5 +1611,141 @@ mod tests {
         assert_eq!(s.logs.len(), 100);
         assert_eq!(next, 1_100);
         assert!(s.logs.row(99).time > s.logs.row(0).time);
+    }
+
+    fn perf_snapshot() -> std::sync::Arc<fdt_store::Snapshot> {
+        let (mut w, run) = fdt_store::synth::writer(3, 100, 100, 0);
+        fdt_store::synth::perf(&mut w, run, 600, 3, 120);
+        w.set_refresh_rate(run, 120.0);
+        let span = TimeRange::new(SessionTime(0), SessionTime(5_000_000_000));
+        fdt_store::synth::cpu(&mut w, run, 3_000, 3, span);
+        w.publish()
+    }
+
+    #[gpui_kit::test]
+    fn ready_knows_performance_and_timeline(cx: &mut TestAppContext) {
+        let (shell, vcx) = open_shell_with(cx, |_| {
+            SessionModel::fixed(perf_snapshot(), connected("stress", true))
+        });
+        for tool in [Tool::Performance, Tool::Timeline] {
+            vcx.update(|window, cx| {
+                shell.update(cx, |s, cx| {
+                    s.navigate(Location::at(Page::Tool(tool)), window, cx)
+                });
+                window.render_frame(cx);
+            });
+            vcx.run_until_parked();
+            assert!(
+                vcx.update(|_, cx| ready(&shell, tool, cx)),
+                "{tool:?} is ready once its data is shown"
+            );
+        }
+        // An empty session has no frames to show, so Performance is not ready.
+        let (empty, vcx) = open_shell_with(cx, |_| {
+            SessionModel::fixed(fdt_store::synth::session(1, 0, 0, 0), connected("x", true))
+        });
+        vcx.update(|window, cx| {
+            empty.update(cx, |s, cx| {
+                s.navigate(Location::at(Page::Tool(Tool::Performance)), window, cx)
+            });
+        });
+        vcx.run_until_parked();
+        assert!(!vcx.update(|_, cx| ready(&empty, Tool::Performance, cx)));
+    }
+
+    #[gpui_kit::test]
+    fn frame_details_latency_is_measured_until_the_sentence_is_drawn(cx: &mut TestAppContext) {
+        let snapshot = fdt_store::synth::session(3, 100, 100, 3);
+        let (shell, vcx) = open_shell_with(cx, |_| {
+            SessionModel::fixed(snapshot, connected("stress", true))
+        });
+        let mut script = Script::new(Scenario::FrameDetails, Some(3));
+        let mut sentence_when_sampled = Vec::new();
+        for _ in 0..3_000 {
+            let before = script.outcome().samples.len();
+            vcx.update(|window, cx| {
+                // Whether the pane holds the selected frame's explanation as the step begins
+                // (the step then records the sample and selects the next frame).
+                let ready = {
+                    let perf = shell.read(cx).performance_view().read(cx);
+                    perf.selection().is_some_and(|id| perf.details_ready(id))
+                };
+                script.step(&shell, window, cx);
+                if script.outcome().samples.len() > before {
+                    sentence_when_sampled.push(ready);
+                }
+            });
+            vcx.run_until_parked();
+            if script.is_done() {
+                break;
+            }
+        }
+        assert!(script.is_done());
+        assert_eq!(script.outcome().error, None);
+        assert_eq!(script.outcome().keystrokes, 3, "one selection per frame");
+        assert_eq!(script.outcome().samples.len(), 3);
+        assert_eq!(sentence_when_sampled, [true, true, true]);
+        assert!(
+            script
+                .outcome()
+                .samples
+                .iter()
+                .all(|x| x.first_seen >= x.key_at)
+        );
+    }
+
+    #[gpui_kit::test]
+    fn the_view_scenarios_complete_headless(cx: &mut TestAppContext) {
+        for (scenario, len) in [
+            (Scenario::FrameChart, 60),
+            (Scenario::TimelineZoom, 200),
+            (Scenario::TraceZoom, 200),
+            (Scenario::FlameZoom, 200),
+            (Scenario::CpuTree, 60),
+            (Scenario::LivePerf, 8),
+        ] {
+            let (shell, vcx) = open_shell_with(cx, |_| {
+                SessionModel::fixed(perf_snapshot(), connected("stress", true))
+            });
+            let mut script = Script::new(scenario, Some(len));
+            for _ in 0..3_000 {
+                vcx.update(|window, cx| {
+                    window.render_frame(cx);
+                    script.step(&shell, window, cx);
+                });
+                vcx.run_until_parked();
+                if script.is_done() {
+                    break;
+                }
+            }
+            assert!(script.is_done(), "{}", scenario.name());
+            assert_eq!(script.outcome().error, None, "{}", scenario.name());
+            assert_eq!(script.outcome().steps, len, "{}", scenario.name());
+        }
+    }
+
+    #[gpui_kit::test]
+    fn tool_switch_cycles_through_the_four_tools(cx: &mut TestAppContext) {
+        let (shell, vcx) = open_shell_with(cx, |_| {
+            SessionModel::fixed(perf_snapshot(), connected("stress", true))
+        });
+        let mut script = Script::new(Scenario::ToolSwitch, Some(8));
+        let mut shown = Vec::new();
+        for _ in 0..3_000 {
+            vcx.update(|window, cx| {
+                window.render_frame(cx);
+                script.step(&shell, window, cx);
+                shown.push(shell.read(cx).current().page);
+            });
+            vcx.run_until_parked();
+            if script.is_done() {
+                break;
+            }
+        }
+        assert_eq!(script.outcome().error, None);
+        assert_eq!(script.outcome().samples.len(), 8);
+        for tool in [Tool::Network, Tool::Performance, Tool::Timeline, Tool::Logs] {
+            assert!(shown.contains(&Page::Tool(tool)), "{tool:?} was visited");
+        }
     }
 }

@@ -499,6 +499,11 @@ impl TimelineView {
         self.spans_task.is_some()
     }
 
+    /// Whether the lanes show what the data holds: no span fetch is pending.
+    pub fn is_settled(&self) -> bool {
+        !self.spans_in_flight()
+    }
+
     // Zoom and pan.
 
     /// Applies what the wheel, trackpad or pinch asked. The lanes have no vertical content, so

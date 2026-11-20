@@ -194,6 +194,15 @@ impl FrameChart {
         self.first
     }
 
+    /// How many frames the chart holds.
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
     pub fn bar_px(&self) -> f32 {
         self.bar_px
     }

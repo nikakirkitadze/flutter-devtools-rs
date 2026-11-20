@@ -1,6 +1,6 @@
 //! The Performance tool: frame timings, CPU profile, rebuilds and the raw trace.
 
-mod cpu_tab;
+pub mod cpu_tab;
 mod details;
 pub mod flame;
 pub mod frame_chart;

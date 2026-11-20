@@ -423,9 +423,12 @@ impl MainWindow {
             || matches!(session.status(), ConnStatus::Connected { .. })
     }
 
-    #[cfg(test)]
     pub(crate) fn performance_view(&self) -> &Entity<PerformanceView> {
         &self.performance
+    }
+
+    pub(crate) fn timeline_view(&self) -> &Entity<TimelineView> {
+        &self.timeline
     }
 
     pub(crate) fn network_view(&self) -> &Entity<NetworkView> {
