@@ -368,3 +368,30 @@ fn unexpected_drop_makes_no_restore_calls() {
         }
     });
 }
+
+#[test]
+fn switching_apps_restores_the_previous_app() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let (sim_a, sim_b) = (Sim::new(false), Sim::new(false));
+        let (a, b) = (sim_a.server(), sim_b.server());
+        let cfg = CaptureConfig {
+            trace_widget_builds: true,
+            ..config()
+        };
+        let cap = connected(&a, cfg, &rt).await;
+        common::wait_for(&cap, SECS5, "tracing on", tracing_on).await;
+        common::eventually(SECS5, "http on", || sim_a.http.load(Ordering::SeqCst)).await;
+        cap.connect(Target::Uri(
+            VmServiceUri::parse(b.ws_uri().as_str()).unwrap(),
+        ));
+        common::eventually(SECS5, "app B traced", || sim_b.trace.load(Ordering::SeqCst)).await;
+        assert!(!sim_a.trace.load(Ordering::SeqCst));
+        assert!(!sim_a.http.load(Ordering::SeqCst));
+        assert!(!sim_a.socket.load(Ordering::SeqCst));
+        assert_eq!(sets(&a, TRACE, false), 1);
+        for m in [TRACE, HTTP, SOCKET] {
+            assert_eq!(sets(&b, m, false), 0, "{m} was switched off in B");
+        }
+    });
+}

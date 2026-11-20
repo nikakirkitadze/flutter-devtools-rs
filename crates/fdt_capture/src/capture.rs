@@ -216,6 +216,12 @@ impl Session {
                         self.restore_profiling().await;
                         break;
                     }
+                    // A user connect leaves the current app (if live) like a disconnect does.
+                    // Automatic reconnects and retries call `begin_connect` directly.
+                    Some(SessionMsg::Command(Command::Connect(t))) => {
+                        self.restore_profiling().await;
+                        self.begin_connect(t, false);
+                    }
                     Some(SessionMsg::Command(Command::Disconnect)) => {
                         self.restore_profiling().await;
                         self.disconnect();
@@ -293,7 +299,7 @@ impl Session {
 
     fn command(&mut self, c: Command) {
         match c {
-            Command::Connect(target) => self.begin_connect(target, false),
+            Command::Connect(_) => {} // handled by the run loop, which restores first
             Command::SetBodyLimits(l) => {
                 self.cfg.body_limits = l;
                 if let Some(w) = &mut self.writer {
