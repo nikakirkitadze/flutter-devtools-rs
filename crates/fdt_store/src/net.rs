@@ -158,6 +158,9 @@ pub struct HttpRecord {
     pub response_body: BodyState,
     /// Started before capture began (its start time was clamped).
     pub before_capture: bool,
+    /// `end` was set here, when the app or the link went away, not reported by the VM. The next
+    /// update that carries a real end still counts as the request completing.
+    pub(crate) ended_locally: bool,
 }
 
 impl HttpRecord {
@@ -189,6 +192,7 @@ impl HttpRecord {
             request_body: BodyState::NotCaptured,
             response_body: BodyState::NotCaptured,
             before_capture: u.start_clamped,
+            ended_locally: false,
         }
     }
 
@@ -368,7 +372,7 @@ impl NetStore {
                 let mut new = HttpRecord::from_update(old.id, u);
                 new.request_body = old.request_body.clone();
                 new.response_body = old.response_body.clone();
-                let done = old.end.is_none() && new.end.is_some();
+                let done = (old.end.is_none() || old.ended_locally) && new.end.is_some();
                 *slot = Arc::new(new);
                 (idx, done)
             }
@@ -553,6 +557,7 @@ impl NetStore {
         let rec = Arc::make_mut(slot);
         rec.end = Some(at.max(rec.start));
         rec.error = Some(error.to_string());
+        rec.ended_locally = true;
     }
 
     pub(crate) fn set_body_state(&mut self, id: EntryId, kind: BodyKind, state: BodyState) {
@@ -782,6 +787,25 @@ mod tests {
         assert_eq!(s.net.len(), 1);
         assert_eq!(s.net.request(0).status, Some(200));
         assert_eq!(s.net.request(0).id, EntryId { run, seq: 0 });
+    }
+
+    #[test]
+    fn a_request_the_app_never_ended_counts_as_completed_when_the_vm_ends_it() {
+        let (mut w, run) = writer(4);
+        let a = w.upsert_request(http(run, "7", "http://h/a", 1));
+        assert!(!a.newly_completed);
+        // The link dropped: the request ends locally, with an error.
+        w.abort_request(a.id, SessionTime(5 * MS), "The app stopped");
+        let s = w.publish();
+        assert!(s.net.request(0).end.is_some(), "still shown as ended");
+        // After a reconnect the VM reports it, completed for real.
+        let mut u = http(run, "7", "http://h/a", 1);
+        u.status = Some(200);
+        u.end = Some(SessionTime(9 * MS));
+        let b = w.upsert_request(u.clone());
+        assert!(b.newly_completed);
+        let c = w.upsert_request(u);
+        assert!(!c.newly_completed, "only once");
     }
 
     #[test]

@@ -110,6 +110,12 @@ impl Profile {
         self.entries.lock().unwrap().push((at, entry));
     }
 
+    /// Replaces everything the profile holds with `entry`.
+    fn set(&self, entry: Value) {
+        self.entries.lock().unwrap().clear();
+        self.add(entry);
+    }
+
     fn answer(&self, since: Option<i64>) -> Value {
         let reqs: Vec<Value> = self
             .entries
@@ -368,6 +374,43 @@ fn same_vm_reconnect_continues_the_run() {
             *cap.status().borrow(),
             ConnStatus::Connected { run: RunId(1), .. }
         ));
+    });
+}
+
+#[test]
+fn a_request_that_finishes_while_disconnected_is_body_fetched_after_the_reconnect() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let app = fake(1, 100);
+        app.profile.add(json!({"id": "7", "isolateId": "isolates/1", "method": "GET",
+            "uri": "http://h:1/slow", "startTime": T + 5_000_000, "events": [],
+            "request": {"headers": {}, "contentLength": 0}}));
+        let (cap, apps) = start_discovered(&rt, cfg());
+        cap.connect(Target::Discovered(disc(&app.server)));
+        common::wait_for(&cap, Duration::from_secs(5), "a pending request", |s| {
+            s.net.len() == 1
+        })
+        .await;
+        app.server.close_abruptly();
+        wait_status(&cap, "waiting", is_waiting).await;
+        let snap = common::wait_for(&cap, Duration::from_secs(5), "the request to end", |s| {
+            s.net.request(0).end.is_some()
+        })
+        .await;
+        assert!(snap.net.request(0).error.is_some());
+        // While the link was down the app finished the request.
+        app.profile.set(done("7"));
+        apps.send(Arc::from(vec![disc(&app.server)])).unwrap();
+        wait_status(&cap, "reconnected", |s| {
+            matches!(s, ConnStatus::Connected { .. })
+        })
+        .await;
+        let snap = common::wait_for(&cap, Duration::from_secs(5), "the body", |s| {
+            matches!(s.net.request(0).response_body, BodyState::Captured(_))
+        })
+        .await;
+        assert_eq!(snap.net.len(), 1);
+        assert_eq!(app.count("ext.dart.io.getHttpProfileRequest"), 1);
     });
 }
 
