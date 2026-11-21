@@ -9,7 +9,7 @@ use crate::actions::ToggleTraceWidgetBuilds;
 use crate::nav::TimeRange;
 use crate::session_model::SessionModel;
 use crate::tools::network::model::format_duration_ns;
-use fdt_analysis::rebuilds::{WidgetCount, frame_rebuilds, range_rebuilds};
+use fdt_analysis::rebuilds::{RebuildTally, WidgetCount, frame_rebuilds, tally_rebuilds};
 use fdt_capture::ConnStatus;
 use fdt_store::Snapshot;
 use fdt_ui::theme::TokensExt as _;
@@ -41,8 +41,9 @@ const OFF_STATE: &str =
 const NONE_IN_SCOPE: &str = "No widgets rebuilt in this range.";
 const NO_MATCH: &str = "No widgets match your filter.";
 
-/// The least time between two recomputes for the same scope while snapshots keep arriving.
-const REFRESH_INTERVAL: Duration = Duration::from_millis(250); // token-check: allow: throttle, not a visual duration
+/// The least time between two recomputes for the same scope while snapshots keep arriving: the
+/// counts are a summary, and fdt shares the machine with the app it profiles.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(2); // token-check: allow: throttle, not a visual duration
 
 /// What the counts are over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,13 +82,32 @@ struct Computed {
     widgets: Arc<[WidgetCount]>,
 }
 
-/// The widgets of `scope`, busiest first. `None` when `cancel` was set.
-fn compute(snap: &Snapshot, scope: Scope, cancel: &AtomicBool) -> Option<Vec<WidgetCount>> {
-    match scope {
-        Scope::Frame(seq) => Some(frame_rebuilds(snap, seq).map_or_else(Vec::new, |f| f.widgets)),
-        Scope::Range(r) => range_rebuilds(snap, Some(r), cancel),
-        Scope::Whole => range_rebuilds(snap, None, cancel),
-    }
+/// A tally of a range or the whole session, with what it was computed for.
+struct Kept {
+    session: u64,
+    scope: Scope,
+    tally: Arc<RebuildTally>,
+}
+
+/// The widgets of `scope`, busiest first, and for a range or the whole session the tally the
+/// next snapshot can start from (`prev`, an earlier tally of the same scope and session: only
+/// the frames added since are walked). `None` when `cancel` was set.
+fn compute(
+    snap: &Snapshot,
+    scope: Scope,
+    prev: Option<&RebuildTally>,
+    cancel: &AtomicBool,
+) -> Option<(Option<RebuildTally>, Vec<WidgetCount>)> {
+    let range = match scope {
+        Scope::Frame(seq) => {
+            let widgets = frame_rebuilds(snap, seq).map_or_else(Vec::new, |f| f.widgets);
+            return Some((None, widgets));
+        }
+        Scope::Range(r) => Some(r),
+        Scope::Whole => None,
+    };
+    let (tally, widgets) = tally_rebuilds(snap, range, prev, cancel)?;
+    Some((Some(tally), widgets))
 }
 
 /// Indices into `all` of the widgets whose name contains `needle` (lower case, may be empty).
@@ -172,6 +192,8 @@ pub struct RebuildsTab {
     selection: Option<usize>,
     active: bool,
     result: Option<Arc<Computed>>,
+    /// The latest range or whole-session tally, which the next recompute of that scope extends.
+    kept: Option<Kept>,
     started: Option<Key>,
     last_start: Option<Instant>,
     trailing: Option<Task<()>>,
@@ -223,6 +245,7 @@ impl RebuildsTab {
             selection: None,
             active: false,
             result: None,
+            kept: None,
             started: None,
             last_start: None,
             trailing: None,
@@ -368,15 +391,29 @@ impl RebuildsTab {
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = cancel.clone();
         let snap = self.session.read(cx).snapshot().clone();
+        let prev = self
+            .kept
+            .as_ref()
+            .filter(|k| k.session == key.session && k.scope == key.scope)
+            .map(|k| k.tally.clone());
         self.job = Some(cx.spawn(async move |this, cx| {
             let out = cx
-                .background_spawn(async move { compute(&snap, key.scope, &cancel) })
+                .background_spawn(
+                    async move { compute(&snap, key.scope, prev.as_deref(), &cancel) },
+                )
                 .await;
             this.update(cx, |this, cx| {
                 // A newer job replaced this one.
                 if this.started == Some(key)
-                    && let Some(widgets) = out
+                    && let Some((tally, widgets)) = out
                 {
+                    if let Some(tally) = tally {
+                        this.kept = Some(Kept {
+                            session: key.session,
+                            scope: key.scope,
+                            tally: Arc::new(tally),
+                        });
+                    }
                     this.result = Some(Arc::new(Computed {
                         widgets: widgets.into(),
                     }));
@@ -806,6 +843,67 @@ mod tests {
         );
     }
 
+    /// Reviewer B's lazy-list frame: BUILD with 2 widgets, then LAYOUT running 3 child BUILDs
+    /// of 3 widgets each. The frames table, the details pane and the Rebuilds tab agree on 11.
+    #[gpui_kit::test]
+    fn builds_inside_layout_count_the_same_everywhere(cx: &mut TestAppContext) {
+        let snap = snapshot(|w, run| {
+            w.push_frame(frame_at(run, 1, 10, 30, 1));
+            let begin = 10 * MS;
+            w.set_frame_ui(
+                run,
+                1,
+                UiPhases {
+                    begin: SessionTime(begin),
+                    ui_us: 24_000,
+                    build_us: 3000,
+                    layout_us: 18_000,
+                    paint_us: 1000,
+                    composite_us: 500,
+                    finalize_us: 500,
+                    widgets_built: Some(11),
+                },
+            );
+            let ui = w.timeline_track(run, TrackKind::Thread, 1, "io.flutter.ui");
+            w.set_track_order(ui, 0);
+            let mut put = |depth: u16, name: &str, at_us: u64, dur_us: u64| {
+                let s = Slice {
+                    start: SessionTime(begin + at_us * 1000),
+                    dur_ns: dur_us * 1000,
+                    name: w.intern_name(name),
+                    cat: SliceCat::Dart,
+                };
+                assert!(w.push_slice(ui, depth, s, depth > 2), "{name} stored");
+            };
+            put(0, "VsyncProcessCallback", 0, 24_000);
+            put(1, "Animator::BeginFrame", 0, 24_000);
+            put(2, "BUILD", 0, 3000);
+            put(3, "CartBadge", 0, 2000);
+            put(4, "Text", 0, 1000);
+            put(2, "LAYOUT (root)", 3000, 18_000);
+            for k in 0..3u64 {
+                let at = 3100 + k * 5000;
+                put(3, "BUILD", at, 4800);
+                put(4, "ProductTile", at, 4700);
+                put(5, "Card", at, 4600);
+                put(6, "Text", at, 100);
+            }
+        });
+        let id = snap.frames.get(0).unwrap().id;
+        let explained = fdt_analysis::explain::explain(&snap, 0);
+        let (shell, tab, cx) = open_tab(cx, snap);
+        go(&shell, Some(Selection::Frame(id)), None, cx);
+        let builds: u32 = cells(&tab, cx)
+            .iter()
+            .map(|r| r[1].parse::<u32>().unwrap())
+            .sum();
+        let list = shell.read_with(cx, |s, cx| s.performance_view().read(cx).list().clone());
+        let table = list.read_with(cx, |l, cx| l.cell_text(0, 7, cx));
+        assert_eq!(table, "11");
+        assert_eq!(explained.rebuilds.map(|r| r.total), Some(11));
+        assert_eq!(builds, 11);
+    }
+
     fn exists_in(cx: &mut VisualTestContext, id: &'static str) -> bool {
         crate::test_support::exists(cx, id)
     }
@@ -919,6 +1017,86 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(tab.read_with(cx, |t, _| t.runs()), 1);
         assert!(exists_in(cx, "rebuilds-empty"));
+    }
+
+    /// A connected, tracing app streaming frames into a shown or hidden Rebuilds tab.
+    fn streaming(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<crate::shell::MainWindow>,
+        Entity<RebuildsTab>,
+        &mut VisualTestContext,
+        crate::test_support::FakeHandle,
+        SessionWriter,
+        RunId,
+    ) {
+        let (shell, cx, fake) = open_shell_fake(cx);
+        fake.status.send(connected("demo", true)).unwrap();
+        let (mut w, run) = writer();
+        w.set_tracing(run, true);
+        cart_frame(&mut w, run, 1, 10, 4);
+        fake.snaps.send(w.publish()).unwrap();
+        cx.dispatch_action(ShowPerformance);
+        shell.update(cx, |s, cx| {
+            s.performance_view()
+                .update(cx, |v, cx| v.set_tab(PerfTab::Rebuilds, cx))
+        });
+        cx.run_until_parked();
+        let tab = shell.read_with(cx, |s, cx| s.performance_view().read(cx).rebuilds().clone());
+        (shell, tab, cx, fake, w, run)
+    }
+
+    #[gpui_kit::test]
+    fn the_hidden_tab_does_no_work(cx: &mut TestAppContext) {
+        let (shell, tab, cx, fake, mut w, run) = streaming(cx);
+        assert_eq!(tab.read_with(cx, |t, _| t.runs()), 1);
+        shell.update(cx, |s, cx| {
+            s.performance_view()
+                .update(cx, |v, cx| v.set_tab(PerfTab::Frames, cx))
+        });
+        for n in 2..8u64 {
+            cart_frame(&mut w, run, n, n * 100, 4);
+            fake.snaps.send(w.publish()).unwrap();
+            cx.executor().advance_clock(Duration::from_secs(3));
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            tab.read_with(cx, |t, _| t.runs()),
+            1,
+            "nothing while hidden"
+        );
+        // Shown again, it catches up in one run.
+        shell.update(cx, |s, cx| {
+            s.performance_view()
+                .update(cx, |v, cx| v.set_tab(PerfTab::Rebuilds, cx))
+        });
+        cx.run_until_parked();
+        assert_eq!(tab.read_with(cx, |t, _| t.runs()), 2);
+        let tile = names(&tab, cx).into_iter().find(|r| r.0 == "ProductTile");
+        assert_eq!(tile.map(|r| r.1).as_deref(), Some("28"));
+    }
+
+    #[gpui_kit::test]
+    fn streaming_recomputes_at_most_every_two_seconds(cx: &mut TestAppContext) {
+        let (_shell, tab, cx, fake, mut w, run) = streaming(cx);
+        cx.executor().advance_clock(Duration::from_secs(3));
+        cx.run_until_parked();
+        let runs0 = tab.read_with(cx, |t, _| t.runs());
+        // Ten publishes over 1.5 s: the first starts a run at once, the rest wait.
+        for n in 2..12u64 {
+            cart_frame(&mut w, run, n, n * 100, 4);
+            fake.snaps.send(w.publish()).unwrap();
+            cx.run_until_parked();
+            cx.executor().advance_clock(Duration::from_millis(150));
+            cx.run_until_parked();
+        }
+        assert_eq!(tab.read_with(cx, |t, _| t.runs()), runs0 + 1);
+        // One trailing run, two seconds after the last start, with every frame in it.
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        assert_eq!(tab.read_with(cx, |t, _| t.runs()), runs0 + 2);
+        let tile = names(&tab, cx).into_iter().find(|r| r.0 == "ProductTile");
+        assert_eq!(tile.map(|r| r.1).as_deref(), Some("44"));
     }
 
     #[gpui_kit::test]

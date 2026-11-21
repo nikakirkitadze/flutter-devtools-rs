@@ -221,6 +221,8 @@ pub(crate) struct FrameStore {
     budgets: HashMap<RunId, u32>,
     pending: HashMap<(RunId, u64), (Option<UiPhases>, Option<RasterPhase>)>,
     pending_order: VecDeque<(RunId, u64)>,
+    /// Bumped whenever phases land on a stored frame.
+    phases_version: u64,
 }
 
 impl FrameStore {
@@ -235,6 +237,7 @@ impl FrameStore {
             budgets: HashMap::new(),
             pending: HashMap::new(),
             pending_order: VecDeque::new(),
+            phases_version: 0,
         }
     }
 
@@ -314,13 +317,17 @@ impl FrameStore {
     }
 
     pub(crate) fn set_ui(&mut self, run: RunId, n: u64, ui: UiPhases) {
-        if !self.update(run, n, |r| r.ui = Some(ui)) {
+        if self.update(run, n, |r| r.ui = Some(ui)) {
+            self.phases_version += 1;
+        } else {
             self.park(run, n, |p| p.0 = Some(ui));
         }
     }
 
     pub(crate) fn set_raster(&mut self, run: RunId, n: u64, ra: RasterPhase) {
-        if !self.update(run, n, |r| r.raster = Some(ra)) {
+        if self.update(run, n, |r| r.raster = Some(ra)) {
+            self.phases_version += 1;
+        } else {
             self.park(run, n, |p| p.1 = Some(ra));
         }
     }
@@ -343,6 +350,7 @@ impl FrameStore {
             frames: self.frames.snapshot(),
             lod: self.lod.snapshot(),
             slow: self.slow.snapshot(),
+            phases_version: self.phases_version,
         }
     }
 }
@@ -352,9 +360,17 @@ pub struct FramesSnapshot {
     frames: ChunkedSnapshot<FrameRecord>,
     lod: LodSnapshot,
     slow: ChunkedSnapshot<u32>,
+    phases_version: u64,
 }
 
 impl FramesSnapshot {
+    /// Changes whenever UI or raster phases land on a frame already stored (they arrive with a
+    /// later timeline poll than the frame itself), so a view keyed on the frame count alone can
+    /// tell its rows' phases changed.
+    pub fn phases_version(&self) -> u64 {
+        self.phases_version
+    }
+
     pub fn len(&self) -> usize {
         self.frames.len()
     }
@@ -509,6 +525,39 @@ mod tests {
     }
 
     #[test]
+    fn late_phases_bump_the_phases_version() {
+        let mut s = FrameStore::new(64);
+        let run = RunId(1);
+        let ui = UiPhases {
+            begin: SessionTime(0),
+            ui_us: 1,
+            build_us: 1,
+            layout_us: 0,
+            paint_us: 0,
+            composite_us: 0,
+            finalize_us: 0,
+            widgets_built: None,
+        };
+        // Parked phases change no stored frame.
+        s.set_ui(run, 1, ui);
+        assert_eq!(s.snapshot().phases_version(), 0);
+        s.push(input(run, 1, 10, 5));
+        let v = s.snapshot().phases_version();
+        s.set_ui(run, 1, ui);
+        let v2 = s.snapshot().phases_version();
+        assert!(v2 > v);
+        s.set_raster(
+            run,
+            1,
+            RasterPhase {
+                start: SessionTime(0),
+                raster_us: 2,
+            },
+        );
+        assert!(s.snapshot().phases_version() > v2);
+    }
+
+    #[test]
     fn a_frame_lands_in_one_bucket_per_level() {
         let mut s = LodSeries::new();
         let t = SessionTime(5 * SPAN + 123);
@@ -649,6 +698,7 @@ mod tests {
             frames: ChunkedSnapshot::default(),
             lod: lod.snapshot(),
             slow: ChunkedSnapshot::default(),
+            phases_version: 0,
         };
         assert!(
             frames.lod().level(0).unwrap().len() <= 8,

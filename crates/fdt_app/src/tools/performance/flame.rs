@@ -29,6 +29,11 @@ use std::sync::Arc;
 
 /// The most spans one flame chart holds. More are left out, and the page says so.
 pub const MAX_SPANS: usize = 100_000;
+/// With no range set, the flame chart shows the session's last 10 seconds: the whole session
+/// would be cut at `MAX_SPANS` and show only its start.
+pub const RECENT_NS: u64 = 10_000_000_000;
+/// What the chart says while it shows only the last [`RECENT_NS`].
+pub const RECENT_NOTE: &str = "Showing the last 10 seconds. Select a range to see another part.";
 /// How much one press of the zoom keys changes the scale.
 const KEY_ZOOM: f32 = 1.5; // token-check: allow: zoom step, not a visual size
 /// The chart's size before it has been drawn once.
@@ -45,6 +50,26 @@ pub enum Hue {
     /// Dart code of the SDK, Flutter and packages.
     Dart,
     Native,
+}
+
+/// The fill of a box of hue `h`.
+pub fn flame_fill(t: &fdt_ui::tokens::Palette, h: Hue) -> fdt_ui::tokens::Color {
+    match h {
+        Hue::User => t.accent,
+        Hue::Dart => t.text_muted,
+        Hue::Native => t.text_faint,
+    }
+}
+
+/// The colour of a function's name on a box of hue `h`: `bg` or `text`, whichever reads better
+/// on the fill (as in the Raw trace).
+pub fn flame_label_colour(t: &fdt_ui::tokens::Palette, h: Hue) -> fdt_ui::tokens::Color {
+    let fill = flame_fill(t, h);
+    if t.bg.contrast(fill) >= t.text.contrast(fill) {
+        t.bg
+    } else {
+        t.text
+    }
 }
 
 /// The hue of function `id`.
@@ -67,6 +92,8 @@ pub struct FlameData {
     pub hues: Vec<Hue>,
     /// Spans were left out at `MAX_SPANS`.
     pub truncated: bool,
+    /// No range was set and the session is longer than [`RECENT_NS`]: only its end is shown.
+    pub recent: bool,
     /// The time the chart fits to, in nanoseconds.
     pub bounds: (u64, u64),
     pub period_us: u32,
@@ -96,6 +123,7 @@ impl FlameData {
             by_depth,
             hues,
             truncated,
+            recent: false,
             bounds,
             period_us,
         }
@@ -422,8 +450,7 @@ impl Render for FlameChart {
         let (data, snap) = (self.data.clone(), self.snap.clone());
         let (viewport, selected, first_row) = (self.viewport, self.selected, self.row_offset);
         let size_cell = self.size.clone();
-        let (accent, muted, faint, ink, border) =
-            (t.accent, t.text_muted, t.text_faint, t.bg, t.text);
+        let border = t.text;
         let surface = canvas(
             move |bounds: Bounds<Pixels>, window, cx| {
                 let now = (f32::from(bounds.size.width), f32::from(bounds.size.height));
@@ -442,11 +469,7 @@ impl Render for FlameChart {
                     |f: FunctionId| data.hues.get(f.0 as usize).copied().unwrap_or(Hue::Native);
                 let (boxes, labels) =
                     flame_layout(&data.spans, &hue, viewport, width, rows, first_row);
-                let colour = |h: Hue| match h {
-                    Hue::User => accent,
-                    Hue::Dart => muted,
-                    Hue::Native => faint,
-                };
+                let colour = |h: Hue| flame_fill(&t, h);
                 let mut quads: Vec<Quad> = boxes
                     .iter()
                     .map(|b| Quad {
@@ -488,7 +511,7 @@ impl Render for FlameChart {
                                 oy + px(l.y) + (layout::FLAME_ROW - line) / 2.0,
                             ),
                             max_width: px(l.w),
-                            color: Hsla::from(ink),
+                            color: Hsla::from(flame_label_colour(&t, hue(s.function))),
                         })
                     })
                     .collect();
@@ -725,5 +748,17 @@ mod tests {
             assert_eq!(c.row_offset, 0);
             assert!(c.viewport().start_ns > before.start_ns, "later time shows");
         });
+    }
+    #[test]
+    fn flame_label_colours_meet_contrast() {
+        for (name, p) in [
+            ("dark", &fdt_ui::tokens::DARK),
+            ("light", &fdt_ui::tokens::LIGHT),
+        ] {
+            for h in [Hue::User, Hue::Dart, Hue::Native] {
+                let c = flame_label_colour(p, h).contrast(flame_fill(p, h));
+                assert!(c >= 4.5, "{name} {h:?}: {c:.2}");
+            }
+        }
     }
 }

@@ -59,29 +59,152 @@ pub(super) fn pane_build(
     view.render_details(cx)
 }
 
-/// Everything `render_details` reads, so an unrelated notification of the page does not rebuild
-/// the pane. The result is compared by identity: a new analysis is a new `Arc`.
+/// Everything `render_details` reads, so neither an unrelated notification of the page nor a
+/// new snapshot rebuilds the pane: it draws from the snapshot its analysis was made from. The
+/// result is compared by identity: an analysis that shows something new is a new `Arc`.
 pub(super) fn pane_key(view: &PerformanceView, cx: &gpui_kit::App) -> String {
     let session = view.session.read(cx);
     let connected = matches!(session.status(), ConnStatus::Connected { .. });
+    let snap = session.snapshot();
     let result = view
         .details
         .result
         .as_ref()
         .map(|r| Arc::as_ptr(r) as usize);
+    let cpu = view
+        .selection
+        .and_then(|id| snap.frames.get(id.seq as usize))
+        .map(|f| (snap.cpu.status(f.run).clone(), snap.cpu.coverage_end(f.run)));
     format!(
         "{:?}",
         (
-            session.snapshot().session,
-            session.snapshot().generation,
+            snap.session,
             cx.appearance(),
             connected,
             view.selection,
             result,
+            cpu,
             view.details.skeleton,
         )
     )
 }
+
+/// One row of the Related section: what it opens and its text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RelatedRow {
+    id: EntryId,
+    text: String,
+}
+
+/// One analysis of the selected frame, as the pane shows it: the explanation, the snapshot it
+/// was made from (the pane draws from it, not from the latest one), and the Related rows' text
+/// (requests change in place, so their text is part of what the pane shows).
+pub(super) struct Analysed {
+    explanation: Explanation,
+    snap: Arc<Snapshot>,
+    requests: Vec<RelatedRow>,
+    logs: Vec<RelatedRow>,
+    /// The frame's run traces widget builds.
+    tracing: bool,
+    /// The store stopped keeping raw widget builds after its cap.
+    capped: bool,
+}
+
+impl Analysed {
+    fn new(snap: Arc<Snapshot>, seq: usize) -> Analysed {
+        let explanation = explain(&snap, seq);
+        let (requests, logs) = related_rows(&explanation, &snap, seq);
+        let tracing = snap
+            .frames
+            .get(seq)
+            .and_then(|f| snap.run(f.run))
+            .is_some_and(|r| r.tracing);
+        let capped = snap.timeline.drops().build_cap > 0;
+        Analysed {
+            explanation,
+            snap,
+            requests,
+            logs,
+            tracing,
+            capped,
+        }
+    }
+
+    /// Whether the pane would show the same thing for both.
+    fn shows_the_same(&self, other: &Analysed) -> bool {
+        self.explanation == other.explanation
+            && self.requests == other.requests
+            && self.logs == other.logs
+            && self.tracing == other.tracing
+            && self.capped == other.capped
+    }
+}
+
+/// The Related rows of frame `seq`: the requests and log lines nearest its start, in time order.
+fn related_rows(
+    e: &Explanation,
+    snap: &Snapshot,
+    seq: usize,
+) -> (Vec<RelatedRow>, Vec<RelatedRow>) {
+    let start = snap.frames.get(seq).map_or(0, |f| f.start.0);
+    let nearest = |mut v: Vec<(u64, u32)>| -> Vec<u32> {
+        v.sort_by_key(|&(t, seq)| (t.abs_diff(start), seq));
+        v.truncate(RELATED_SHOWN);
+        v.sort_by_key(|&(t, seq)| (t, seq));
+        v.into_iter().map(|(_, s)| s).collect()
+    };
+    let requests = nearest(
+        e.related
+            .requests
+            .iter()
+            .filter_map(|&s| Some((snap.net.get(s as usize)?.start.0, s)))
+            .collect(),
+    )
+    .into_iter()
+    .filter_map(|seq| {
+        let r = snap.net.get(seq as usize)?;
+        let duration = r.duration_ns().map_or(DASH.to_string(), format_duration_ns);
+        Some(RelatedRow {
+            id: r.id,
+            text: format!(
+                "{} {}{SEP}{}{SEP}{}",
+                r.method,
+                r.path,
+                status_text(r),
+                duration
+            ),
+        })
+    })
+    .collect();
+    let logs = nearest(
+        e.related
+            .logs
+            .iter()
+            .filter_map(|&s| Some((snap.logs.get_row(s as usize)?.time.0, s)))
+            .collect(),
+    )
+    .into_iter()
+    .filter_map(|seq| {
+        let r = snap.logs.get_row(seq as usize)?;
+        let line = elide(r.text.lines().next().unwrap_or(""));
+        Some(RelatedRow {
+            id: r.id,
+            text: format!(
+                "{}{SEP}{}{SEP}{}",
+                format_time(r.time),
+                r.level.label(),
+                line
+            ),
+        })
+    })
+    .collect();
+    (requests, logs)
+}
+
+/// What "Most rebuilt widgets" says when the frame has no traced rebuilds.
+const REBUILDS_HINT: &str = "Turn on Trace widget builds to see which widgets rebuilt.";
+/// Ruling R19: tracing is on and none of the app's widgets rebuilt.
+pub const NONE_REBUILT: &str = "None of your app's widgets rebuilt in this frame.";
 
 const MAX_NAME_CHARS: usize = 80;
 const TOP: usize = 10;
@@ -160,7 +283,7 @@ pub(super) struct DetailsState {
     last_start: Option<Instant>,
     /// A rerun waiting out `REFRESH_INTERVAL`.
     trailing: Option<Task<()>>,
-    result: Option<Arc<Explanation>>,
+    result: Option<Arc<Analysed>>,
     /// Set once the analysis has taken longer than `LOADING_DELAY`.
     skeleton: bool,
     /// How many times the analysis was started.
@@ -367,13 +490,22 @@ impl PerformanceView {
         self.details.started = Some(key.clone());
         let seq = frame.id.seq as usize;
         self.details.job = Some(cx.spawn(async move |this, cx| {
-            let explanation = cx
-                .background_spawn(async move { explain(&snap, seq) })
+            let analysed = cx
+                .background_spawn(async move { Analysed::new(snap, seq) })
                 .await;
             this.update(cx, |this, cx| {
                 // A newer analysis (another frame, or the same one later) replaced this one.
                 if this.details.started.as_ref() == Some(&key) {
-                    this.details.result = Some(Arc::new(explanation));
+                    // The same frame showing the same thing keeps its result, so the pane is not
+                    // built again.
+                    let same = this
+                        .details
+                        .result
+                        .as_ref()
+                        .is_some_and(|old| old.shows_the_same(&analysed));
+                    if !same {
+                        this.details.result = Some(Arc::new(analysed));
+                    }
                     this.details.skeleton = false;
                     this.details.timer = None;
                     cx.notify();
@@ -448,7 +580,12 @@ impl PerformanceView {
     fn render_details(&mut self, cx: &mut Context<Self>) -> AnyElement {
         crate::perf::bump(crate::perf::Counter::DetailsPane, 1);
         let t = *cx.tokens();
-        let snap = self.session.read(cx).snapshot().clone();
+        // The snapshot the analysis was made from, so that every row agrees with the sentence.
+        let result = self.details.result.clone();
+        let snap = result.as_ref().map_or_else(
+            || self.session.read(cx).snapshot().clone(),
+            |r| r.snap.clone(),
+        );
         let connected = matches!(self.session.read(cx).status(), ConnStatus::Connected { .. });
         let frame = self
             .selection
@@ -510,8 +647,8 @@ impl PerformanceView {
             .gap(space::S12)
             .px(space::S12)
             .pb(space::S12);
-        let content: Vec<AnyElement> = match self.details.result.clone() {
-            Some(e) => self.render_sections(&e, &snap, connected, cx),
+        let content: Vec<AnyElement> = match result {
+            Some(a) => self.render_sections(&a, connected, cx),
             None => self
                 .details
                 .skeleton
@@ -538,12 +675,12 @@ impl PerformanceView {
 
     fn render_sections(
         &mut self,
-        e: &Explanation,
-        snap: &Snapshot,
+        a: &Analysed,
         connected: bool,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let t = *cx.tokens();
+        let (e, snap) = (&a.explanation, &*a.snap);
         vec![
             self.breakdown_section(e, &t).into_any_element(),
             div()
@@ -554,11 +691,11 @@ impl PerformanceView {
                 .font_weight(font::MEDIUM)
                 .child(e.sentence.clone())
                 .into_any_element(),
-            self.rebuilds_section(e, &t, connected, cx)
+            self.rebuilds_section(e, &t, connected, (a.tracing, a.capped), cx)
                 .into_any_element(),
             self.functions_section(e, snap, &t, connected, cx)
                 .into_any_element(),
-            self.related_section(e, snap, &t, cx).into_any_element(),
+            self.related_section(a, &t, cx).into_any_element(),
         ]
     }
 
@@ -657,11 +794,14 @@ impl PerformanceView {
             }))
     }
 
+    /// `(tracing, capped)`: the frame's run traces widget builds, and the store stopped keeping
+    /// raw builds after its cap.
     fn rebuilds_section(
         &mut self,
         e: &Explanation,
         t: &Palette,
         connected: bool,
+        (tracing, capped): (bool, bool),
         cx: &mut Context<Self>,
     ) -> Div {
         let section = div().flex().flex_col().gap(space::S4).child(heading(
@@ -670,12 +810,17 @@ impl PerformanceView {
             "Most rebuilt widgets",
         ));
         let Some(rebuilds) = &e.rebuilds else {
+            // Tracing is on: there is nothing to turn on (ruling R19).
+            if tracing {
+                let text = if capped {
+                    super::rebuilds_tab::CAP_NOTE
+                } else {
+                    NONE_REBUILT
+                };
+                return section.child(note(t, "details-rebuilds-note", text));
+            }
             return section
-                .child(note(
-                    t,
-                    "details-rebuilds-note",
-                    "Turn on Trace widget builds to see which widgets rebuilt.",
-                ))
+                .child(note(t, "details-rebuilds-note", REBUILDS_HINT))
                 .children(connected.then(|| {
                     div().flex().child(
                         button(t, "details-trace-builds", "Trace widget builds").on_click(
@@ -838,13 +983,8 @@ impl PerformanceView {
             }))
     }
 
-    fn related_section(
-        &mut self,
-        e: &Explanation,
-        snap: &Snapshot,
-        t: &Palette,
-        cx: &mut Context<Self>,
-    ) -> Div {
+    fn related_section(&mut self, a: &Analysed, t: &Palette, cx: &mut Context<Self>) -> Div {
+        let (e, snap) = (&a.explanation, &*a.snap);
         let mut section = div().flex().flex_col().gap(space::S4).child(heading(
             t,
             "details-section-related",
@@ -856,51 +996,20 @@ impl PerformanceView {
             .and_then(|id| snap.frames.get(id.seq as usize))
             .filter(|f| Some(f.id) == self.selection)
             .cloned();
-        let start = frame.as_ref().map_or(0, |f| f.start.0);
-        // The nearest the frame start, in time order (the list is already in time order).
-        let nearest = |mut v: Vec<(u64, u32)>| -> Vec<u32> {
-            v.sort_by_key(|&(t, seq)| (t.abs_diff(start), seq));
-            v.truncate(RELATED_SHOWN);
-            v.sort_by_key(|&(t, seq)| (t, seq));
-            v.into_iter().map(|(_, s)| s).collect()
-        };
-        let requests = nearest(
-            e.related
-                .requests
-                .iter()
-                .filter_map(|&s| Some((snap.net.get(s as usize)?.start.0, s)))
-                .collect(),
-        );
-        let logs = nearest(
-            e.related
-                .logs
-                .iter()
-                .filter_map(|&s| Some((snap.logs.get_row(s as usize)?.time.0, s)))
-                .collect(),
-        );
         let window = frame
             .as_ref()
             .map(|f| fdt_analysis::correlate::frame_window(f, snap.frame_budget_us(f.run)));
-        for (i, &seq) in requests.iter().enumerate() {
-            let Some(r) = snap.net.get(seq as usize) else {
-                continue;
-            };
+        let requests = &a.requests;
+        let logs = &a.logs;
+        for (i, row) in requests.iter().enumerate() {
             any = true;
-            let id = r.id;
-            let duration = r.duration_ns().map_or(DASH.to_string(), format_duration_ns);
-            let text = format!(
-                "{} {}{SEP}{}{SEP}{}",
-                r.method,
-                r.path,
-                status_text(r),
-                duration
-            );
+            let id = row.id;
             section = section.child(
-                related_row(*t, format!("details-request-{i}"), text).on_click(cx.listener(
-                    move |this, _, _, cx| {
+                related_row(*t, format!("details-request-{i}"), row.text.clone()).on_click(
+                    cx.listener(move |this, _, _, cx| {
                         this.open_related(Tool::Network, Selection::Request(id), cx)
-                    },
-                )),
+                    }),
+                ),
             );
         }
         if e.related.requests_total > requests.len() {
@@ -913,24 +1022,16 @@ impl PerformanceView {
                 cx,
             ));
         }
-        for (i, &seq) in logs.iter().enumerate() {
-            let Some(r) = snap.logs.get_row(seq as usize) else {
-                continue;
-            };
+        for (i, row) in logs.iter().enumerate() {
             any = true;
-            let id = r.id;
-            let line = elide(r.text.lines().next().unwrap_or(""));
-            let text = format!(
-                "{}{SEP}{}{SEP}{}",
-                format_time(r.time),
-                r.level.label(),
-                line
+            let id = row.id;
+            section = section.child(
+                related_row(*t, format!("details-log-{i}"), row.text.clone()).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        this.open_related(Tool::Logs, Selection::Log(id), cx)
+                    }),
+                ),
             );
-            section = section.child(related_row(*t, format!("details-log-{i}"), text).on_click(
-                cx.listener(move |this, _, _, cx| {
-                    this.open_related(Tool::Logs, Selection::Log(id), cx)
-                }),
-            ));
         }
         if e.related.logs_total > logs.len() {
             any = true;
@@ -1284,6 +1385,99 @@ mod tests {
         );
         click(cx, "details-trace-builds");
         assert_eq!(fake.commands(), vec!["trace_builds true".to_string()]);
+        let sentence = label(cx, "details-sentence").unwrap();
+        assert!(sentence.ends_with("Turn on Trace widget builds to see which widgets rebuilt."));
+    }
+
+    /// Ruling R19: with tracing on, a frame with no traced rebuilds says so, with no button to
+    /// turn tracing on.
+    #[gpui_kit::test]
+    fn tracing_on_without_rebuilds_says_none_rebuilt(cx: &mut TestAppContext) {
+        let (shell, cx, fake) = open_shell_fake(cx);
+        let (mut w, run) = writer();
+        phased_frame(&mut w, run, 0, 100, 2);
+        w.set_tracing(run, true);
+        fake.snaps.send(w.publish()).unwrap();
+        fake.status.send(connected("demo", true)).unwrap();
+        cx.run_until_parked();
+        cx.dispatch_action(ShowPerformance);
+        select(&shell, cx, 0);
+        assert_eq!(
+            label(cx, "details-rebuilds-note").as_deref(),
+            Some("None of your app's widgets rebuilt in this frame.")
+        );
+        assert!(!exists(cx, "details-trace-builds"));
+        let sentence = label(cx, "details-sentence").unwrap();
+        assert!(
+            !sentence.contains("Turn on Trace widget builds"),
+            "{sentence}"
+        );
+    }
+
+    /// After the build cap there is no build detail to show: the cap note says why.
+    #[gpui_kit::test]
+    fn tracing_on_after_the_cap_shows_the_cap_note(cx: &mut TestAppContext) {
+        let (shell, cx, fake) = open_shell_fake(cx);
+        let (mut w, run) = writer();
+        phased_frame(&mut w, run, 0, 100, 2);
+        w.set_tracing(run, true);
+        let ui = w.timeline_track(run, TrackKind::Thread, 1, "io.flutter.ui");
+        let name = w.intern_name("Spam");
+        for i in 0..=fdt_store::timeline::RAW_BUILD_CAP {
+            let s = Slice {
+                start: SessionTime(1_000 * MS + i * 2),
+                dur_ns: 1,
+                name,
+                cat: SliceCat::Dart,
+            };
+            w.push_slice(ui, 3, s, true);
+        }
+        let snap = w.publish();
+        assert!(snap.timeline.drops().build_cap > 0);
+        fake.snaps.send(snap).unwrap();
+        fake.status.send(connected("demo", true)).unwrap();
+        cx.run_until_parked();
+        cx.dispatch_action(ShowPerformance);
+        select(&shell, cx, 0);
+        assert_eq!(
+            label(cx, "details-rebuilds-note").as_deref(),
+            Some(super::super::rebuilds_tab::CAP_NOTE)
+        );
+        assert!(!exists(cx, "details-trace-builds"));
+    }
+
+    /// Snapshots that change nothing the pane shows do not rebuild it, even once the throttled
+    /// analysis has run again.
+    #[gpui_kit::test]
+    fn unrelated_publishes_do_not_rebuild_the_pane(cx: &mut TestAppContext) {
+        use crate::perf::Counter::DetailsPane;
+        let (shell, cx, fake) = open_shell_fake(cx);
+        let (mut w, run) = writer();
+        phased_frame(&mut w, run, 0, 1_000, 2);
+        fake.snaps.send(w.publish()).unwrap();
+        fake.status.send(connected("demo", true)).unwrap();
+        cx.run_until_parked();
+        cx.dispatch_action(ShowPerformance);
+        select(&shell, cx, 0);
+        cx.executor().advance_clock(REFRESH_INTERVAL * 4);
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(exists(cx, "details-sentence"));
+        let runs0 = shell.read_with(cx, |s, cx| s.performance_view().read(cx).details_runs());
+        // Ten log lines far from the frame, one snapshot each.
+        let rebuilt = renders_in(cx, |cx| {
+            for i in 0..10u64 {
+                w.push_log(log_at(run, 50_000 + i, LogLevel::Info));
+                fake.snaps.send(w.publish()).unwrap();
+                cx.run_until_parked();
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+            }
+            cx.executor().advance_clock(REFRESH_INTERVAL * 2);
+            cx.run_until_parked();
+        });
+        let runs = shell.read_with(cx, |s, cx| s.performance_view().read(cx).details_runs());
+        assert!(runs > runs0, "the analysis still reran behind the throttle");
+        assert_eq!(rebuilt[DetailsPane as usize], 0, "{rebuilt:?}");
     }
 
     #[gpui_kit::test]

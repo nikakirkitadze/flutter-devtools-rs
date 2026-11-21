@@ -300,6 +300,8 @@ pub enum ListEvent {
 struct Key {
     session: u64,
     frames: usize,
+    /// Phases arrive after their frame; a new version refreshes the rows' cells.
+    phases: u64,
     version: u64,
     /// What every run's frame budget is, so a refresh-rate change (which re-judges earlier
     /// frames) forces a full run.
@@ -439,6 +441,7 @@ impl FramesList {
         Key {
             session: snap.session,
             frames: snap.frames.len(),
+            phases: snap.frames.phases_version(),
             version: self.version,
             budgets: budget_stamp(snap),
         }
@@ -1107,6 +1110,50 @@ mod tests {
             "sorted rows use the hash index"
         );
         assert!(list.read_with(cx, |l, cx| l.shares_rows_with_table(cx)));
+    }
+
+    /// A frame's timeline phases arrive with a later poll than its `Flutter.Frame`, and no frame
+    /// may follow (the app went idle): the row still shows them.
+    #[gpui_kit::test]
+    fn late_phases_refresh_the_table(cx: &mut TestAppContext) {
+        use crate::tools::performance::fixtures::push_frames;
+        let (mut w, run) = crate::test_support::writer();
+        push_frames(&mut w, run, 0, 40);
+        let (shell, cx, fake) = crate::test_support::open_shell_fake(cx);
+        fake.snaps.send(w.publish()).unwrap();
+        fake.status
+            .send(crate::test_support::connected("demo", true))
+            .unwrap();
+        cx.run_until_parked();
+        cx.dispatch_action(ShowPerformance);
+        cx.run_until_parked();
+        let list = shell.read_with(cx, |s, cx| s.performance_view().read(cx).list().clone());
+        let last = 39usize;
+        let cells = |list: &gpui_kit::Entity<FramesList>, cx: &mut VisualTestContext| {
+            list.read_with(cx, |l, cx| {
+                (l.cell_text(last, 5, cx), l.cell_text(last, 7, cx))
+            })
+        };
+        assert_eq!(cells(&list, cx), (DASH.to_string(), DASH.to_string()));
+        w.set_frame_ui(
+            run,
+            39,
+            fdt_store::frames::UiPhases {
+                begin: SessionTime((100 + 39 * 20) * 1_000_000),
+                ui_us: 8_000,
+                build_us: 5_000,
+                layout_us: 1_500,
+                paint_us: 1_000,
+                composite_us: 300,
+                finalize_us: 200,
+                widgets_built: Some(321),
+            },
+        );
+        fake.snaps.send(w.publish()).unwrap();
+        cx.run_until_parked();
+        let (layout, widgets) = cells(&list, cx);
+        assert_ne!(layout, DASH);
+        assert_eq!(widgets, "321");
     }
 
     #[gpui_kit::test]

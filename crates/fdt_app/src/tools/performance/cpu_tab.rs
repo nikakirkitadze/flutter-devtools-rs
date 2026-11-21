@@ -8,7 +8,7 @@
 //! with that node's children. The open nodes are kept by id, so they stay open through every
 //! recompute.
 
-use super::flame::{FlameChart, FlameData, FlameEvent, MAX_SPANS};
+use super::flame::{FlameChart, FlameData, FlameEvent, MAX_SPANS, RECENT_NOTE, RECENT_NS};
 use crate::nav::TimeRange;
 use crate::session_model::SessionModel;
 use crate::tools::network::model::format_duration_ns;
@@ -189,7 +189,19 @@ fn compute(snap: &Arc<Snapshot>, key: &Key, cancel: &AtomicBool) -> Option<Compu
             })
         }
         CpuMode::Flame => {
-            let data = match key.range.or_else(|| sample_span(snap)) {
+            // No range: the last 10 seconds of samples, not the session's first part.
+            let (window, recent) = match key.range {
+                Some(r) => (Some(r), false),
+                None => match sample_span(snap) {
+                    None => (None, false),
+                    Some(all) => {
+                        let start = all.start.0.max(all.end.0.saturating_sub(RECENT_NS));
+                        let w = TimeRange::new(fdt_store::time::SessionTime(start), all.end);
+                        (Some(w), start > all.start.0)
+                    }
+                },
+            };
+            let data = match window {
                 None => FlameData::default(),
                 Some(r) => {
                     let (spans, truncated) = flame_spans(snap, r, MAX_SPANS);
@@ -197,7 +209,9 @@ fn compute(snap: &Arc<Snapshot>, key: &Key, cancel: &AtomicBool) -> Option<Compu
                         Some(_) => (r.start.0, r.end.0),
                         None => (r.start.0, r.end.0 + u64::from(period) * 1_000),
                     };
-                    FlameData::new(snap, spans, truncated, bounds, period)
+                    let mut data = FlameData::new(snap, spans, truncated, bounds, period);
+                    data.recent = recent;
+                    data
                 }
             };
             Body::Flame(Arc::new(data))
@@ -1107,6 +1121,7 @@ impl CpuTab {
         let t = *cx.tokens();
         let footer = self.selected_span.and_then(|s| self.span_text(s));
         let truncated = self.flame_data.as_ref().is_some_and(|d| d.truncated);
+        let recent = self.flame_data.as_ref().is_some_and(|d| d.recent);
         let mut col = div().flex_1().min_h_0().flex().flex_col().child(
             div().flex_1().min_h_0().w_full().child(
                 self.flame
@@ -1114,6 +1129,20 @@ impl CpuTab {
                     .cached(StyleRefinement::default().size_full()),
             ),
         );
+        if recent {
+            col = col.child(
+                div()
+                    .id("cpu-flame-recent")
+                    .test_support()
+                    .aria_label(RECENT_NOTE)
+                    .flex_none()
+                    .px(space::S16)
+                    .py(space::S4)
+                    .text_size(font::LABEL)
+                    .text_color(Hsla::from(t.text_muted))
+                    .child(RECENT_NOTE),
+            );
+        }
         if truncated {
             let text = "Too many calls to draw. Showing the first part; select a shorter range to see the rest.";
             col = col.child(
@@ -1628,6 +1657,56 @@ mod tests {
         cx.dispatch_action(crate::actions::ZoomToFit);
         cx.run_until_parked();
         assert_eq!(flame.read_with(cx, |f, _| f.viewport()), fit);
+    }
+
+    /// One sample a millisecond for `secs` seconds, in `main`.
+    fn long_snapshot(secs: u64) -> Arc<Snapshot> {
+        snapshot(|w, run| {
+            w.push_frame(frame_at(run, 0, 1, 8, 1));
+            let a = w.intern_function("main", Some("file:///app/lib/main.dart"));
+            let b = w.intern_function("work", Some("file:///app/lib/main.dart"));
+            let ab = w.intern_stack(&[a, b]);
+            let samples = (0..secs * 1000)
+                .map(|i| CpuSample {
+                    time: SessionTime((i + 1) * MS),
+                    leaf: ab,
+                })
+                .collect();
+            w.push_cpu_samples(run, samples);
+        })
+    }
+
+    fn flame_bounds(tab: &Entity<CpuTab>, cx: &mut VisualTestContext) -> (u64, u64) {
+        tab.read_with(cx, |t, _| t.flame_data.as_ref().map(|d| d.bounds))
+            .expect("flame data")
+    }
+
+    /// With no range, the flame chart shows the last 10 seconds (the whole session would be cut
+    /// at the span cap and show only its start); with a range, the range.
+    #[gpui_kit::test]
+    fn the_flame_chart_shows_the_last_ten_seconds_without_a_range(cx: &mut TestAppContext) {
+        let (_shell, tab, cx) = open(cx, long_snapshot(60));
+        set_mode(&tab, cx, CpuMode::Flame);
+        let last = 60_000 * MS;
+        let (start, end) = flame_bounds(&tab, cx);
+        assert_eq!(start, last - 10_000 * MS);
+        assert!(end >= last, "{end}");
+        let note = cx.update(|window, cx| {
+            window.render_frame(cx);
+            window
+                .try_find("cpu-flame-recent")
+                .and_then(|e| e.label().map(str::to_string))
+        });
+        assert_eq!(
+            note.as_deref(),
+            Some("Showing the last 10 seconds. Select a range to see another part.")
+        );
+        let r = TimeRange::new(SessionTime(5_000 * MS), SessionTime(7_000 * MS));
+        tab.update(cx, |t, cx| t.set_range(Some(r), cx));
+        cx.run_until_parked();
+        frame(cx);
+        assert_eq!(flame_bounds(&tab, cx), (r.start.0, r.end.0));
+        assert!(!crate::test_support::exists(cx, "cpu-flame-recent"));
     }
 
     #[gpui_kit::test]

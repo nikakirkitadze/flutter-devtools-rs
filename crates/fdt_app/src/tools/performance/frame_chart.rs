@@ -464,6 +464,11 @@ impl FrameChart {
     }
 }
 
+/// The colour of the budget label: information, so never the faint ink.
+pub fn budget_label_colour(t: &fdt_ui::tokens::Palette) -> fdt_ui::tokens::Color {
+    t.text_muted
+}
+
 /// The budget as the chart labels it: `16.7 ms budget`.
 pub fn budget_label(budget_us: u32) -> String {
     format!("{:.1} ms budget", budget_us as f64 / 1000.0)
@@ -483,6 +488,7 @@ impl Render for FrameChart {
         let budget = snap.latest_budget_us();
         let colors = (t.success, t.warning, t.danger);
         let (accent, text, faint) = (t.accent, t.text, t.text_faint);
+        let label_ink = budget_label_colour(&t);
         let prepaint_width = width_cell.clone();
         let surface = canvas(
             move |bounds: Bounds<Pixels>, window, cx| {
@@ -575,7 +581,7 @@ impl Render for FrameChart {
                         text: budget_label(budget).into(),
                         origin: point(ox + space::S8, line_y - label_h),
                         max_width: w - space::S16,
-                        color: Hsla::from(faint),
+                        color: Hsla::from(label_ink),
                     }],
                 );
                 window.set_cursor_style(CursorStyle::PointingHand, &hitbox);
@@ -749,6 +755,19 @@ mod tests {
         assert_eq!(column.w, 1.0);
         for b in &bars {
             assert!(b.x >= 0.0 && b.x < 50.0);
+        }
+    }
+
+    #[test]
+    fn budget_label_meets_contrast() {
+        for (name, p) in [
+            ("dark", &fdt_ui::tokens::DARK),
+            ("light", &fdt_ui::tokens::LIGHT),
+        ] {
+            for (what, bg) in [("bg", p.bg), ("surface", p.surface)] {
+                let c = budget_label_colour(p).contrast(bg);
+                assert!(c >= 4.5, "{name} on {what}: {c:.2}");
+            }
         }
     }
 
