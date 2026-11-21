@@ -181,9 +181,9 @@ Taken on R1 (Apple M3 Max, 120 Hz) on the M3 branch (`3d0e8a7`), whose Logs, Net
 
 This confirms open decision 1 (6.3 and 7.1 ms; M2's last numbers were 6.5 and 6.9). `strip-drag` rose from 3.4 ms (Task 21b) to 4.3 ms; the strip changed in M3.
 
-**Idle memory and CPU of the connected window, app idle on the home screen, 30 s warm-up, 30 one-second samples.** Measured with the screen locked, so the window drew no frames, which makes this a lower bound for a drawing window (the capture host now installs from a timer, so the window did connect): RSS 156.4 to 157.0 MB (budget 150 MB, **missed** by about 7 MB), CPU 0.0 to 0.5 %, mean 0.11 % (budget 1 %, met). The window alone was 101 MB unconnected; the M2 build measured on the same machine gave 70.8 MB, and `attach_hold` (the capture alone) about 52 to 61 MB, against the 3.2 MB recorded above for M2's capture. See M3 open decision 3.
+**Idle memory and CPU of the connected window, app idle on the home screen, 30 s warm-up, 30 one-second samples.** Measured with the screen locked, so the window drew no frames, which makes this a lower bound for a drawing window (the capture host now installs from a timer, so the window did connect): RSS 152.7 to 153.3 MiB, that is 156,352 to 156,992 KiB from `ps` (budget 150 MB, **missed** in either unit: 160.8 decimal MB at most), CPU 0.0 to 0.5 %, mean 0.11 % (budget 1 %, met for a window that was not drawing). The window alone was 98.9 MiB (101,232 KiB) unconnected; the M2 build measured on the same machine gave 69.1 MiB (70,784 KiB), and `attach_hold` (the capture alone) about 50 to 60 MiB, against the 3.2 MB (3,216 KiB) recorded above for M2's capture. The MB figures elsewhere in this record divide KiB by 1,000. See M3 open decision 3.
 
-**Still not measured:** the UI part of attach to data on screen, the first CI run, and Windows and Linux. Profile-mode attach was not repeated 3 times (the screen locked): `attach_ms` was 126 ms in one profile run, against 5 ms in the Task 22 run recorded above.
+**Still not measured:** the UI part of attach to data on screen, the first CI run, and Windows and Linux. Profile-mode attach was not repeated 3 times (the screen locked): `attach_ms` was 126 ms in one profile run, against 5 ms in the profile-mode Task 22 run recorded above (one run each; the debug runs in the table are not comparable).
 
 ## Carry into M3
 

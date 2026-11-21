@@ -1,8 +1,8 @@
 # M3 verification results and review checklist
 
-Branch `m3-performance`, built from the commit that precedes this record (`3d0e8a7`, plus the `cpu_poll` default change described under "CPU polling" and the `p99` column added to `frame_build_sampler`). R1: Apple M3 Max, macOS, 14 cores, 120 Hz display, release build. Run on the night of 21 November 2026 (00:59 to 01:55 local).
+Branch `m3-performance`, built from the commit that precedes this record (`3d0e8a7`, plus the `cpu_poll` default change described under "CPU polling" and the `p99` column added to `frame_build_sampler`). R1: Apple M3 Max, macOS, 14 cores, 120 Hz display, release build. Run on the night of 21 November 2026 (00:59 to 01:55 local). Corrected after its review the same day: the miss count, the load during the second overhead run, which statements are hypotheses, the memory units and the attach comparison. Nothing was re-measured; the fix round added two unit tests.
 
-Legend: met, missed, not measured (and why).
+Legend: met, missed, not resolvable (the method cannot see the budget's margin), not measured (and why).
 
 ## Summary and status
 
@@ -10,10 +10,11 @@ M3 is built: frame ingest with phases, timeline ingest with level-of-detail lane
 
 What this verification found:
 
-- **Met:** every release budget test (26 tests, strict); frame p99 and no-frame-over-16.7 ms for all pan and zoom scenarios; the overhead on the profiled app (no increase detectable on `/jank`, +0.2 % to 0 %); idle CPU (max 0.5 %); the Timeline ingest rate (3.41 M events/s against 1 M); the CPU tree (1.4 ms against 100 ms).
-- **Missed, with the dominant cost:** draw p99 on six scenarios (below; the two from M2 are unchanged, `frame-details` and `trace-zoom` are new misses); the Logs search keystroke latency in milliseconds (19.6 against 16, still inside 2 frames); idle memory of the connected window, 157 MB against 150 MB (measured with a window that was not presenting frames).
-- **Changed in code:** the default `cpu_poll` is now 15 s (ruling R6, below), because a CPU-sample fetch can cost the app one 80 to 110 ms frame and one of two overhead runs crossed the 20 µs median line.
-- **Not measured, because the Mac's screen locked partway through** (`CGSSessionScreenIsLocked = 1` at some point between 01:30 and 01:33, checked again at 01:35, 01:42, 01:45, 01:54 and 01:55; the display had gone to sleep, and `jank_lab` stopped drawing, so no frames reached it or `fdt`): the 15 s re-measurement of the CPU poll, the 600-frame CPU-poll run (one of four rounds got its bare half before the lock), the widget-build tracing overhead, the quiet-machine re-run of the draw misses, and three of the five attach-to-data runs, along with the in-window part of attach to data (only `attach_ms` was taken, once). Nothing is estimated; see "Not measured".
+- **Met:** every release budget test (26 tests, strict); frame p99 and no-frame-over-16.7 ms for all pan and zoom scenarios; the overhead on the profiled app on `/jank` (no increase detectable: +0.22 % and -0.01 % in two runs); idle CPU (max 0.5 %, from a window that was not drawing); the Timeline ingest rate (3.41 M events/s against 1 M); the CPU tree (1.4 ms against 100 ms).
+- **Not resolvable:** the overhead on `/rebuilds`, whose build is about 1 ms and varies by 10 % between rounds, so 2 % cannot be seen on this machine.
+- **Missed, with the dominant cost:** draw p99 on five scenarios, by the median of three runs: `logs-search` and `tool-switch` (M2's open decision 1, unchanged), `strip-drag` (3.4 ms in M2), and the new `frame-details` and `trace-zoom` (`net-filter` missed in one run of three and is met on the median); the Logs search keystroke latency in milliseconds (19.6 against 16, still inside 2 frames); idle memory of the connected window, 153.3 MiB (160.8 MB) against 150 MB, a miss in either unit (measured with a window that was not presenting frames).
+- **Changed in code:** the default `cpu_poll` is now 15 s (ruling R6, below), as a precaution. One of two overhead runs crossed the 20 µs median line, and that run had an 80 to 110 ms frame in every connected sample. That a CPU-sample fetch causes that frame is a hypothesis: the other run had such a frame in 1 of 6 samples, and no run logged fetch times. The re-measure at 15 s is pending.
+- **Not measured, because the Mac's screen locked partway through** (`CGSSessionScreenIsLocked = 1` at some point between 01:30 and 01:33, checked again at 01:35, 01:42, 01:45, 01:54 and 01:55; the display had gone to sleep, and `jank_lab` stopped drawing, so no frames reached it or `fdt`): the 15 s re-measurement of the CPU poll, the 600-frame CPU-poll run (one of four rounds got its bare half before the lock), the widget-build tracing overhead, the quiet-machine re-run of the draw misses, and the five attach-to-data runs, along with the in-window part of attach to data (only `attach_ms` was taken, once). Nothing is estimated; see "Not measured".
 
 ## Automated checks (all green)
 
@@ -57,7 +58,7 @@ Medians over the 3 runs of draw p99 (budget 4 ms), interval p99 (budget 8.833 ms
 | logs-search | **6.33** (6.63, 6.33, 6.08) | 8.56 | first result 19.6 (16; 2 frames, budget 2), full result 42.4 ms, 5 frames (budget 100 ms, 12 frames) | 0/3 | **missed** (draw and ms latency) |
 | net-scroll | 3.29 (3.35, 3.21, 3.30) | 8.41 | | 3/3 | met |
 | net-filter | 3.40 (4.21, 3.40, 3.40) | 8.47 | 11.8 (16) | 2/3 | met on the median; run 1 missed on draw (4.21) |
-| tool-switch | **7.08** (13.30, 7.08, 6.63) | **11.51** (33.4, 8.39, 11.51) | 16.8 (50) | 0/3 | **missed** (draw; interval p99 in 2 of 3 runs) |
+| tool-switch | **7.08** (13.30, 7.08, 6.63) | **11.51** (33.4, 8.39, 11.51) | 16.8 (50) | 0/3 | **missed** (draw; interval p99 in 2 of 3 runs: run 1 ran at about 30 Hz throughout, run 3 had one slow interval) |
 | strip-drag | **4.28** (error, 4.17, 4.38) | 8.66 | | 0/3 | **missed**; run 1 errored with "the drag did not select a time range on the strip" |
 | live-logs (new, Task 1) | 2.78 (2.62, 2.92, 2.78) | 8.44 | | 3/3 | met |
 | frame-chart | 3.05 (3.01, 3.05, 3.12) | 8.65 | | 3/3 | met |
@@ -70,11 +71,11 @@ Medians over the 3 runs of draw p99 (budget 4 ms), interval p99 (budget 8.833 ms
 
 Notes:
 
-- The pan and zoom budget (frame p99 <= 8.3 ms, no frame over 16.7 ms) holds for every scroll and zoom scenario: interval p99 8.4 to 8.7 ms against the 8.833 ms line, and the largest single interval was 16.6 ms (net-scroll run 1) and 33.4 ms in the first `tool-switch` run (a switch, not a pan).
+- The pan and zoom budget (frame p99 <= 8.3 ms, no frame over 16.7 ms) holds for every scroll and zoom scenario: interval p99 8.4 to 8.7 ms against the 8.833 ms line, and the largest single interval in those scenarios was 16.6 ms (net-scroll run 1). `tool-switch` is not a pan or zoom scenario; its first run is described below.
 - **The latency scenarios have 18 to 90 samples**, so their "p99" is close to the maximum. Treat them as indicative.
 - **`logs-search`:** the draw p99 is M2's open decision 1, unchanged at about 6.3 ms (M2: 6.5). The full-result latency is met (5 frames against 12). The first-result latency in milliseconds is 19.6 ms against 16, but 2 frames against a budget of 2 (R17: keystroke latency is judged in frames), so the report fails only on the ms line. M2's record called this met (first results within 2 frames); the ms line is stricter than what M2 reported.
-- **`tool-switch`** now includes Performance and Timeline in the switch list. Draw p99 7.1 ms is the same figure M2 recorded (6.9) and the same cause (full-page text reshaping); the extra interval-p99 misses in 2 of 3 runs are one slow frame in a short scenario (41 frames).
-- **`frame-details`** was 4.68 ms median at the end of Task 24b on a machine with load 10 to 15 (5.37 before R10). On this run it is 4.51 ms median (5.23, 4.31, 4.51), at load 9 to 11, a little better but still over. Dominant cost, from `task-24b-report.md` section 4: the frame where the pane's full draw (about 1.5 ms after R10, text shaping of the Related rows) coincides with the frames table's scrollbar-animation re-render (about 1.8 ms); prepaint (layout plus shaping) is the bulk (p99 2.9 ms). **The "quietest run" re-measure was not possible:** by the time the machine's load had fallen to 2 to 5 (01:07 onward) every `bench-ui` batch had finished, and when I wanted to repeat the misses at that load the screen was locked (see "Summary"). So this is an open decision (number 2 below), not an accepted pass.
+- **`tool-switch`** now includes Performance and Timeline in the switch list. Draw p99 7.1 ms is the same figure M2 recorded (6.9) and the same cause (full-page text reshaping). The interval-p99 misses in 2 of 3 runs have different shapes. Run 1 ran at about 30 Hz throughout: interval p50 33.3 ms and p99 33.4 ms, so every frame took about four refresh periods, and its draw p99 (13.3 ms) and latency p99 (46.7 ms) are also far from runs 2 and 3 (cause not investigated). Run 3 had one slow interval (11.5 ms) in a short scenario (41 frames; its p95 is 8.36 ms).
+- **`frame-details`** was 4.68 ms median at the end of Task 24b on a machine with load 10 to 15 (5.37 before R10). On this run it is 4.51 ms median (5.23, 4.31, 4.51), at load 9 to 11, a little better but still over. Dominant cost, as Task 24b measured it: the frame where the pane's full draw (about 1.5 ms after R10, text shaping of the Related rows) coincides with the frames table's scrollbar-animation re-render (about 1.8 ms); prepaint (layout plus shaping) is the bulk (p99 2.9 ms). **The "quietest run" re-measure was not possible:** by the time the machine's load had fallen to 2 to 5 (01:07 onward) every `bench-ui` batch had finished, and when I wanted to repeat the misses at that load the screen was locked (see "Summary"). So this is an open decision (number 2 below), not an accepted pass.
 - **`trace-zoom`** is a new miss, not seen by earlier tasks: 3.39, 4.30, 4.33. By 0.3 ms; the same load caveat applies.
 - **`strip-drag`:** run 1's error is intermittent and is a harness result, not a draw time. Cause not investigated. Runs 2 and 3 are 4.17 and 4.38 ms against 4 (M2 recorded 3.4 ms after Task 21b), so the strip's draw time is also up since M2; the strip changed in M3 (refresh-rate budget line, phase-aware bars).
 
@@ -82,20 +83,21 @@ Notes:
 
 Setup: `jank_lab` built in profile mode (`flutter run -d macos --profile`, `JANK_LAB_FLOAT=1`), driven to `/jank` and `/rebuilds` with `ext.jank_lab.run` (`goto_jank`, `goto_rebuilds`). `frame_build_sampler` (a second VM client on the `Extension` stream only) collects 150 `Flutter.Frame` build times per sample. "conn" is the real `fdt --connect <vm uri>` window, default settings (tracing off, `cpu_poll` 5 s at the time of this run), connected for 10 s before sampling; "bare" is the sampler alone. Six interleaved rounds (bare first on odd rounds, conn first on even rounds), the window started and killed each round. Raw: appendix C.
 
-Run 2 (the recorded run; a second `jank_lab` instance; load 5.3 falling to 2):
+Run 2 (the recorded run; a second `jank_lab` instance; 1-minute load 11.3 falling to 5.5 during the `/jank` rounds, and 3.8 falling to 2.0 during the `/rebuilds` rounds):
 
 | Page | bare median of medians (us) | conn median of medians (us) | bare / conn median p90 (us) | paired median ratio conn / bare | Verdict |
 |---|---|---|---|---|---|
 | `/jank` (24 ms build) | 24,060 | 24,072 | 24,104 / 24,112 | **0.9999** (rounds 0.9954 to 1.0010) | met (no increase detectable) |
-| `/rebuilds` (about 1 ms build) | 974 | 886 | 1,735 / 1,450 | 0.9415 (rounds 0.88 to 1.09) | met, but see the note |
+| `/rebuilds` (about 1 ms build) | 974 | 886 | 1,735 / 1,450 | 0.9415 (rounds 0.88 to 1.09) | **not resolvable at 2 % on this machine** (see the note) |
 
-Run 1 (`/jank` only, a first `jank_lab` instance, load 2.8 to 3.2): bare 24,083, conn 24,140, paired median ratio **1.0022** (+0.22 %; median delta +52 us), and each connected round had one build of 79 to 112 ms (appendix C, first run). That run is why the CPU-poll default changed (below). Both runs are well under 2 %.
+Run 1 (`/jank` only, a first `jank_lab` instance, load 2.8 to 3.2): bare 24,083, conn 24,140, paired median ratio **1.0022** (+0.22 %; median delta +52 us), and each connected round had one build of 79 to 112 ms (appendix C, first run). That run is why the CPU-poll default changed (below). On `/jank`, both runs are well under 2 %.
 
 Notes:
 
-- The `/jank` build is long and steady (p90 within 0.4 % of the median), so the 2 % budget is resolved there to a few tenths of a percent. On `/rebuilds` the build is about 1 ms and varies by 10 % between rounds, so 2 % (20 us) cannot be resolved; the connected samples were faster (ratio 0.94), which is noise, or the Mac running faster with more going on. This says only that no increase was seen.
-- The single long frame in connected rounds is a CPU-sample fetch: it appeared in 6 of 6 connected rounds in run 1 (79 to 112 ms; the sampler window of 150 frames spans about 3.8 s, so one 5 s poll lands in most of them) and 1 of 6 in run 2 (94 ms). In bare rounds the maximum was 25 to 27 ms. It does not move the median or p90 but is one visibly dropped frame every poll.
-- Two overhead runs in the same configuration disagreeing (median +52 us, then -2 us) shows the noise floor of this method; the fetch cost may also depend on how long the app has been running (the second instance had been up about 2 minutes).
+- The `/jank` build is long and steady (p90 within 0.4 % of the median), so the 2 % budget is resolved there to a few tenths of a percent. On `/rebuilds` the build is about 1 ms and varies by 10 % between rounds, so 2 % (20 us) cannot be resolved; the connected samples were faster (ratio 0.94), which is noise, or the Mac running faster with more going on. This says only that no increase was seen, so the verdict is "not resolvable", not "met".
+- **The single long frame in connected rounds may come from a CPU-sample fetch; that is a hypothesis, not a finding.** It appeared in 6 of 6 connected rounds in run 1 (79 to 112 ms) and in 1 of 6 in run 2 (94 ms), with the same 5 s poll and the same procedure. A 150-frame sample spans about 3.8 s, so if every 5 s fetch cost such a frame, most samples in both runs would show one; run 2 does not. No run logged when fetches happened, so no long frame is tied to a poll, and no other cause was looked for. In bare rounds the maximum was 24.1 to 27.4 ms. The long frame does not move the median or p90; if it is a fetch, it is one visibly dropped frame every poll.
+- Two overhead runs in the same configuration disagreeing (median +52 us, then -2 us) shows the noise floor of this method; the long frames, whatever causes them, may also depend on how long the app has been running (the second instance had been up about 2 minutes).
+- **Two run-2 samples took far longer than the others:** `/jank` connected round 6 took 35.6 s for its 150 frames and `/rebuilds` bare round 3 took 65.4 s, against 2.3 to 4.7 s for every other sample (and 8.4 s for run 1's first bare sample). Their frame numbers are consecutive (5614 to 5763 and 9028 to 9177), so the app drew no frames for about 32 s and 63 s inside those samples; the sampler did not miss frames. Their build times are in line with the other rounds. The cause was not investigated (possibly the not-drawing behaviour described under call 14). Both samples are kept in the medians.
 - Widget-build tracing on (R12, `profileUserWidgetBuilds`, "about +29 %"): **not measured here.** The +29 % is from the planning spike (Q5.3), measured on a different screen. The measurement was planned for after the CPU-poll runs and the screen locked first. The figure must be labelled "from the spike, not re-measured in M3 verification".
 
 ### CPU polling (ruling R6, Task 10 Step 3)
@@ -108,29 +110,31 @@ Rule: measure the `/jank` build median and p99 with `cpu_poll` at 5 s against no
 | Run 2, 6 x 150 frames | -2 us | -3 us | 94 ms in 1 round |
 | Planned 600-frame run, 4 rounds | not completed: round 1's bare half only (median 24,527 us, p99 26,199 us, max 36,981 us, 600 frames in 16.2 s); the screen locked before its connected half | | |
 
-Run 1 crosses the median line, so the default is now **15 s** (`crates/fdt_capture/src/config.rs`). Run 2 and the planned run do not contradict it enough to keep 5 s (run 2 had a single hitch, and nothing in it shows polls are free). **The re-measurement at 15 s was not possible** (screen locked), so it is open: decision 4, and the "Pending verification" list. At 15 s the hitch comes at most every 15 s while frames are drawn; the VM keeps about 40 s of samples, so nothing is lost. The cost is that the CPU samples for a slow frame arrive up to 15 s late (the Frame details pane already shows its "Pending" state and "Fetch now").
+Run 1 crosses the median line, so under R6's rule the default is now **15 s** (`crates/fdt_capture/src/config.rs`, pinned by a unit test). This is a precaution: run 2 crossed neither line, and that the long frames come from fetches is a hypothesis (see the notes above). **The re-measurement at 15 s was not possible** (screen locked), so it is open: decision 4, and the "Pending verification" list. If the hypothesis holds, a hitch comes at most every 15 s while frames are drawn. The VM keeps about 40 s of samples, so nothing is lost; the cost is that the CPU samples for a slow frame arrive up to 15 s late (the Frame details pane already shows its "Pending" state and "Fetch now").
 
 ### Idle memory and CPU, and attach (Step 4)
 
-**Real window, connected, app idle on the home screen: measured, but with the screen locked** (`CGSSessionScreenIsLocked = 1`), so the window was not presenting frames. `fdt --connect <vm uri>` (the capture host installs from a timer since Task 1, so it connects without frames; the 56 MB difference from the unconnected window below says it did), 30 s warm-up, 30 one-second `ps -o rss=,%cpu=` samples. `uptime` before 1:40, load 5.62 4.65 5.40. Raw: appendix E.
+**Real window, connected, app idle on the home screen: measured, but with the screen locked** (`CGSSessionScreenIsLocked = 1`), so the window was not presenting frames. `fdt --connect <vm uri>` (the capture host installs from a timer since Task 1, so it connects without frames; the 54 MiB difference from the unconnected window below says it did), 30 s warm-up, 30 one-second `ps -o rss=,%cpu=` samples. `uptime` before 1:40, load 5.62 4.65 5.40. Raw: appendix E.
+
+Units: `ps` reports RSS in KiB (1,024 bytes), and the figures here are KiB / 1,024 = MiB, with decimal MB where the budget is compared. The spec writes the budget as "150 MB" without saying which; the miss holds under either reading. (The first version of this record divided KiB by 1,000, as M2's record did.)
 
 | Measure | Budget | Measured | Verdict |
 |---|---|---|---|
-| Idle RSS, connected | <= 150 MB | 156.4 to 157.0 MB (156,352 to 156,992 KB), flat across the 30 samples | **missed** by about 7 MB (4.6 %), with a window that drew no frames; a window that draws can only add to it |
-| Idle CPU, connected | <= 1 % | 0.0 to 0.5 %, mean 0.11 % | met (a locked window draws nothing, so a drawn idle window may cost more; GPUI redraws only on change) |
+| Idle RSS, connected | <= 150 MB | 152.7 to 153.3 MiB (156,352 to 156,992 KiB; 160.1 to 160.8 MB), flat across the 30 samples | **missed**, by 3.3 MiB (2.2 %) if the budget is 150 MiB, or by 10.8 MB (7.2 %) if it is 150 decimal MB; with a window that drew no frames, and a window that draws can only add to it |
+| Idle CPU, connected | <= 1 % | 0.0 to 0.5 %, mean 0.11 % | met for a window that was not drawing (a locked window draws nothing, so a drawn idle window may cost more; GPUI redraws only on change) |
 
-Where the 157 MB comes from (same night, same machine, release builds, 15 s settle):
+Where the 153 MiB comes from (same night, same machine, release builds, 15 s settle):
 
 | Process | RSS |
 |---|---|
-| `fdt` at M2 (`aff8ccf`), window only, not connected | 70.8 MB |
-| `fdt` at M3, window only, not connected | 101.0 MB (+30 MB since M2) |
-| `attach_hold` (the capture without a window), connected to the idle app | 51.7 MB at 1 s, 60.4 MB at 6 s |
-| `fdt` at M3, connected | 157 MB |
+| `fdt` at M2 (`aff8ccf`), window only, not connected | 69.1 MiB (70,784 KiB) |
+| `fdt` at M3, window only, not connected | 98.9 MiB (101,232 KiB; 98.7 MiB on a second run), +29.7 MiB since M2 |
+| `attach_hold` (the capture without a window), connected to the idle app | 50.5 MiB at 1 s, 59.0 MiB at 6 s, 59.5 to 60.2 MiB over the next 20 s |
+| `fdt` at M3, connected | 152.7 to 153.3 MiB |
 
-M2's record said 54 to 56 MB for an unconnected window; the M2 build run here gave 70.8 MB (the machine and the window size differ), so +30 MB is the comparable growth. Two parts to explain, **neither investigated**: the window alone grew by about 30 MB (M3 views, fonts or caches created at startup), and the capture, which had been measured at 3.2 MB in M2, now holds about 52 to 60 MB with nothing captured (5 logs, 0 frames). Candidates are the Perfetto and timeline decode buffers, the rayon and tokio pools, and the store's pre-sized chunks. This is open decision 3.
+M2's record said 54 to 56 MB for an unconnected window (54,336 to 56,288 KiB, which is 53.1 to 55.0 MiB); the M2 build run here gave 69.1 MiB (the machine and the window size differ), so about +30 MiB is the comparable growth. Two parts to explain, **neither investigated**: the window alone grew by about 30 MiB (M3 views, fonts or caches created at startup), and the capture, which M2's record gave as 3.2 MB (3,216 KiB, 3.1 MiB), now holds about 50 to 60 MiB with nothing captured (5 logs, 0 frames). Candidates are the Perfetto and timeline decode buffers, the rayon and tokio pools, and the store's pre-sized chunks. This is open decision 3.
 
-**Attach to first live data, 5 runs: not measured.** `attach_ms` was 126 ms in the one run I could take (the live test against the idle app, screen locked), against 10 to 11 ms in M2, so the connect sequence is about 115 ms longer in M3 (the M3 connect sequence also reads the refresh rate and the timeline flags; not broken down); the live test fails at its next step (`goto_logs`, which needs a drawing app), so `attach_to_data_ms` was not reached. The budget is <= 1 s to first live data; 126 ms leaves a wide margin even before the first log. **Status: `attach_ms` measured once, `attach_to_data_ms` not measured, the five runs not taken.**
+**Attach to first live data, 5 runs: not measured.** `attach_ms` was 126 ms in the one run I could take (the live test against the idle profile-mode app, screen locked). M2 recorded 5 ms in its one profile-mode run (Task 22) and 10 to 11 ms in its three debug-mode runs, so profile to profile it is 5 ms against 126 ms, one run each. The M3 connect sequence also reads the refresh rate and the timeline flags, which may account for the difference; that is untested and not broken down. The live test fails at its next step (`goto_logs`, which needs a drawing app), so `attach_to_data_ms` was not reached. The budget is <= 1 s to first live data; 126 ms leaves a wide margin even before the first log. **Status: `attach_ms` measured once, `attach_to_data_ms` not measured, the five runs not taken.**
 
 ## Not measured
 
@@ -154,7 +158,7 @@ These are the plan's 14 calls, with what the verification can say about each.
 3. **fdt leaves the app's timeline streams alone, adding `Dart` and `Embedder` if missing.** Kept.
 4. **A slow frame is `max(build, raster)` over the budget, janky beyond twice the budget.** Kept; the strip's colouring changed from M2 as planned. The budget comes from the display (8.333 ms here).
 5. **Replayed and duplicate frames are dropped.** Kept; pinned by the replay tests.
-6. **CPU samples are fetched every 5 s while the app draws.** **Changed to 15 s** by the measurement above. The brief of Task 10 required this check; it moved here by ruling R6.
+6. **CPU samples are fetched every 5 s while the app draws.** **Changed to 15 s** as a precaution after the measurement above: one of two runs crossed R6's median line; the re-measure at 15 s is pending. The brief of Task 10 required this check; it moved here by ruling R6.
 7. **Raw widget-build slices are capped at 8,000,000.** Kept; the Rebuilds tab says when older detail was dropped.
 8. **Async slices are grouped by name into packed rows.** Kept.
 9. **The Raw trace tab is in M3.** Kept; `trace-zoom` is the one that now misses the draw budget by 0.3 ms.
@@ -171,7 +175,7 @@ These are the plan's 14 calls, with what the verification can say about each.
 - R3: the strip's `MIN_DRAG_PX` is shared rather than duplicated.
 - R4: "Fetch now" shows only while connected; otherwise the copy says the samples were not fetched before the app disconnected.
 - R5: the `live-logs` bench-ui numbers moved to this task (Task 1's run was environmental): measured above, 2.78 ms draw p99, 3 of 3 passes.
-- R6: the CPU-poll cost measurement moved to this task: done above; default now 15 s.
+- R6: the CPU-poll cost measurement moved to this task: measured above at 5 s, where one of two runs crossed the median line; default now 15 s, its re-measure pending.
 - R7: connecting to another target while connected is a user disconnect from the first app, so profiling is restored.
 - R8: the flame chart scrolls vertically when its deepest visible stack exceeds the rows; PanY pans time only when everything fits.
 - R9: Task 24b was added for the frame-details draw time; it did not reach 4 ms (open decision 2).
@@ -185,9 +189,9 @@ These are the plan's 14 calls, with what the verification can say about each.
 Numbers 1 to 7 are carried from M2's record, with the numbering made consecutive; 8 onward are new in M3.
 
 1. **Draw p99 for Logs search and tool switch is 6.3 and 7.1 ms against 4 ms** (M2: 6.5 and 6.9). Cost: reshaping a full page of text per frame. Meeting it needs visible changes (fewer text runs per row, no ligatures). Decide: change the design, or accept about 8 ms for these two interactions.
-2. **Draw p99 for the M3 pages: `frame-details` 4.5, `trace-zoom` 4.3, `strip-drag` 4.3 against 4 ms** (and `net-filter` once at 4.2). `frame-details`: from `task-24b-report.md`, the pane draw (text shaping of Related rows, about 1.5 ms) lands on the table's scrollbar-animation re-render (about 1.8 ms). Options listed there and not applied: a visible scrollbar mode for the frames table, applying the pane result one frame later (+8 ms latency), or virtualising Related below the fold. The quiet-machine re-run could not be taken (see above); re-run first (`./target/release/fdt bench-ui frame-details`, three times).
-3. **Idle memory of the connected window is about 157 MB against 150 MB**, measured with a window that was not drawing. The window alone grew from 70.8 to 101 MB since M2 and the capture alone is about 52 to 60 MB with nothing captured (M2: 3.2 MB). Decide whether to find and trim the growth (the likely places are listed above) or to move the budget; repeat the measurement with a drawing window first.
-4. **The CPU-poll default and its hitch.** One CPU-sample fetch costs the app one frame of 80 to 110 ms, every poll, while frames are drawn. The default is now 15 s; the re-measurement is pending. Decide whether that is acceptable for a tool that must add under 2 %, or whether the fetch should be made on demand (when a slow frame is opened) with a longer interval in the background. The VM keeps only about 40 s of samples.
+2. **Draw p99 for the M3 pages: `frame-details` 4.5, `trace-zoom` 4.3, `strip-drag` 4.3 against 4 ms** (and `net-filter` once at 4.2). `frame-details`: as Task 24b measured it, the pane draw (text shaping of Related rows, about 1.5 ms) lands on the table's scrollbar-animation re-render (about 1.8 ms). Options Task 24b listed and did not apply: a visible scrollbar mode for the frames table, applying the pane result one frame later (+8 ms latency), or virtualising Related below the fold. The quiet-machine re-run could not be taken (see above); re-run first (`./target/release/fdt bench-ui frame-details`, three times).
+3. **Idle memory of the connected window is 153.3 MiB (160.8 MB) against 150 MB**, a miss in either unit, measured with a window that was not drawing. The window alone grew from 69.1 to 98.9 MiB since M2 and the capture alone is about 50 to 60 MiB with nothing captured (M2: 3.1 MiB). Decide whether to find and trim the growth (the likely places are listed above) or to move the budget; repeat the measurement with a drawing window first.
+4. **The CPU-poll default and a possible hitch.** In one of two overhead runs every connected sample had one 80 to 110 ms frame. The hypothesis is that each CPU-sample fetch causes it, but the other run had such a frame in 1 of 6 samples and nothing tied the frames to a fetch. The default is now 15 s as a precaution; the re-measurement is pending, and it should record when each fetch is sent so long frames can be matched to fetches. If the hypothesis holds, decide whether that is acceptable for a tool that must add under 2 %, or whether the fetch should be made on demand (when a slow frame is opened) with a longer interval in the background. The VM keeps only about 40 s of samples.
 5. **The first CI run.** No GitHub remote yet; `ci.yml` (including the live `jank_lab` job and the release budget step) has never run.
 6. **Recent URLs keep the VM token in `settings.json`** (M2 decision 3). Store it, or store only host and port and ask again.
 7. **Bodies of unknown length are auto-fetched with a 10 s bound** (M2 decision 4), **new session (⌘N) discards the stored session with no confirmation and fires inside inputs** (M2 decision 7), **`fdt --connect` skips recent URLs** (M2 decision 6), and **Windows and Linux paths are read from source only** (M2 decision 5). All unchanged. M2 decision 8 (a live-publishing bench) is closed: `live-logs` and `live-perf` exist and pass.
@@ -217,9 +221,9 @@ Save screenshots next to this file as `m3-<os>-<theme>-<view>.png`.
 All on an awake, unlocked R1, with `uptime` before each batch:
 
 - **bench-ui, the misses again:** `cargo build --release -p fdt_app` then, three times each, `./target/release/fdt bench-ui <logs-search|tool-switch|strip-drag|frame-details|trace-zoom|net-filter>`.
-- **CPU poll at 15 s:** start a profile `jank_lab` (`JANK_LAB_FLOAT=1 flutter run -d macos --profile`), go to `/jank` (`ext.jank_lab.run` with `goto_jank`), and run 4 interleaved rounds of `frame_build_sampler --uri <ws uri> --frames 600` with and without `fdt --connect <ws uri>` (now 15 s). Pass: median delta <= 20 us, p99 delta <= 1 ms, no build over 40 ms in connected rounds.
+- **CPU poll at 15 s:** start a profile `jank_lab` (`JANK_LAB_FLOAT=1 flutter run -d macos --profile`), go to `/jank` (`ext.jank_lab.run` with `goto_jank`), and run 4 interleaved rounds of `frame_build_sampler --uri <ws uri> --frames 600` with and without `fdt --connect <ws uri>` (now 15 s). Pass: median delta <= 20 us, p99 delta <= 1 ms, no build over 40 ms in connected rounds. Record when each CPU fetch is sent (the capture does not log successful fetches today), so that a long frame can be matched to a fetch or ruled out as one.
 - **Tracing overhead, labelled:** the same on `/rebuilds`, with and without the "Trace widget builds" switch on in the connected window.
-- **Idle memory and CPU of the connected window while drawing:** `fdt --connect`, home screen, 30 s warm-up, then 30 samples of `ps -o rss=,%cpu= -p <pid>` one second apart. Budgets: RSS <= 150 MB, CPU <= 1 %.
+- **Idle memory and CPU of the connected window while drawing:** `fdt --connect`, home screen, 30 s warm-up, then 30 samples of `ps -o rss=,%cpu= -p <pid>` one second apart (`ps` reports KiB; divide by 1,024 for MiB). Budgets: RSS <= 150 MB, CPU <= 1 %.
 - **Attach to first live data, 5 runs:** `scripts/jank-lab-it.sh profile` five times (it prints `attach_ms`, `attach_to_data_ms`, `first_log_ms`).
 - **The first CI run** on macOS, Windows and Linux.
 - **Windows and Linux** code paths and slice names.
@@ -463,7 +467,7 @@ conn only 0 of 600 frames arrived
 
 ### E. Idle memory and CPU (Step 4)
 
-Connected `fdt`, locked screen. First line is `uptime`, then samples as `rss_kb cpu%`, one per second after a 30 s warm-up, then `uptime`.
+Connected `fdt`, locked screen. First line is `uptime`, then samples as `rss_kb cpu%` (`ps` RSS, in KiB), one per second after a 30 s warm-up, then `uptime`.
 
 ```
  1:40  up 5 days,  9:57, 9 users, load averages: 5.62 4.65 5.40
@@ -501,6 +505,6 @@ fdt pid 893; warm-up 30 s; samples (rss_kb cpu%)
  1:41  up 5 days,  9:58, 9 users, load averages: 3.35 4.16 5.16
 ```
 
-Decomposition runs (single samples, same night): M2 `fdt` (aff8ccf) unconnected `70784 0.0`, M3 `fdt` unconnected `101232 0.0` (101024 on a second run), `attach_hold` connected: 51,696 KB at 1 s rising to 51,936 at 5 s and 60,432 at 6 s; 60,896 to 61,600 KB over the following 20 s with CPU 0.0 to 0.1 %. The M2 `fdt --connect` run at 70,720 KB cannot have been connected (the capture host installs from a frame there, and the screen was locked); only its unconnected number is used.
+Decomposition runs (single samples, same night): M2 `fdt` (aff8ccf) unconnected `70784 0.0` (KiB), M3 `fdt` unconnected `101232 0.0` (101024 on a second run), `attach_hold` connected: 51,696 KiB at 1 s rising to 51,936 at 5 s and 60,432 at 6 s; 60,896 to 61,600 KiB over the following 20 s with CPU 0.0 to 0.1 %. The M2 `fdt --connect` run at 70,720 KiB cannot have been connected (the capture host installs from a frame there, and the screen was locked); only its unconnected number is used.
 
 Attach: `FDT_JANK_LAB=1 cargo test --release -p fdt_capture --test jank_lab_live -- --ignored --nocapture` against the idle profile app: `attach_ms=126 debug=false`, then `panicked at crates/fdt_capture/tests/jank_lab_live.rs:74:17` (the `goto_logs` action never saw its screen mount).

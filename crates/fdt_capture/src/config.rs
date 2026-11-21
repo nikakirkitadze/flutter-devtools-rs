@@ -11,9 +11,12 @@ pub struct CaptureConfig {
     pub timeline_poll: Duration,
     /// One `getVMTimeline` call gives up after this long.
     pub timeline_call_timeout: Duration,
-    /// How often CPU samples are fetched while frames are being drawn. 15 s, not 5 s: each fetch
-    /// can cost the app one frame of 80 to 110 ms (M3 verification, `docs/milestones/m3-review.md`),
-    /// and the VM keeps about 40 s of samples, so 15 s still leaves a margin.
+    /// How often CPU samples are fetched while frames are being drawn. 15 s, not 5 s, as a
+    /// precaution: in one of two M3 overhead runs at 5 s, the median build time rose by 52 µs
+    /// (over ruling R6's 20 µs line) and every connected sample had one 80 to 110 ms frame; the
+    /// other run had such a frame in 1 of 6 samples and no rise. Nothing tied those frames to a
+    /// fetch, so a cost per fetch is a hypothesis until the 15 s re-measure listed in
+    /// `docs/milestones/m3-review.md`. The VM keeps about 40 s of samples, so 15 s leaves a margin.
     pub cpu_poll: Duration,
     /// One `getPerfettoCpuSamples` call gives up after this long.
     pub cpu_call_timeout: Duration,
