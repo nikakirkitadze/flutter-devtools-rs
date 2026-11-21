@@ -179,6 +179,8 @@ impl Pipeline {
         let gap = match (window, self.fed) {
             (Some((origin, _)), Fed::Polled(next)) => origin != next,
             (Some(_), Fed::Streamed) => true,
+            // The events between the last poll and the stream were never fetched.
+            (None, Fed::Polled(_)) => true,
             _ => false,
         };
         if self.conn != Some(sink.conn) || gap {
@@ -199,7 +201,24 @@ impl Pipeline {
         let batch = to_batch(sink, out);
         (!batch.is_empty()).then_some(batch)
     }
+
+    /// Forgets what is open. Switching tracing moves the timeline between polling and the
+    /// stream, and the events in between are never fetched: a slice open at the switch would
+    /// never close, and every later slice below it would count as a widget build.
+    fn reset(&mut self) {
+        self.asm.reset();
+        self.fed = Fed::Nothing;
+    }
 }
+
+/// The most one `getVMTimeline` window spans. After a stall (a slow call, a busy app) the poller
+/// catches up in consecutive windows of this size, in the same tick, so that no single reply
+/// holds a whole ring of events.
+pub(crate) const MAX_POLL_EXTENT_US: i64 = 2_000_000;
+
+/// How far back one tick catches up at most. The VM keeps far less than this, and a start that
+/// was never read (a failed clock read gives 0) would otherwise take hours of windows.
+const MAX_CATCH_UP_US: i64 = 60_000_000;
 
 pub(crate) struct PerfConfig {
     pub(crate) poll: Duration,
@@ -592,23 +611,29 @@ async fn run(
                 if now < next {
                     continue;
                 }
-                let chunk = match svc.get_vm_timeline(next, now - next, cfg.call_timeout).await {
-                    Ok(c) => c,
-                    Err(RpcError::Closed) => return,
-                    // The window stays: the next tick asks for it again, and more.
-                    Err(e) => {
-                        log::warn!("getVMTimeline failed; retrying the same window: {e}");
-                        continue;
+                // Beyond what the VM could still hold: start later (a gap, so the assembler
+                // starts over).
+                next = next.max(now - MAX_CATCH_UP_US);
+                while next <= now {
+                    let extent = (now - next).min(MAX_POLL_EXTENT_US);
+                    let chunk = match svc.get_vm_timeline(next, extent, cfg.call_timeout).await {
+                        Ok(c) => c,
+                        Err(RpcError::Closed) => return,
+                        // The window stays: the next tick asks for it again, and more.
+                        Err(e) => {
+                            log::warn!("getVMTimeline failed; retrying the same window: {e}");
+                            break;
+                        }
+                    };
+                    if chunk.skipped > 0 {
+                        log::debug!("skipped {} unreadable timeline events", chunk.skipped);
                     }
-                };
-                if chunk.skipped > 0 {
-                    log::debug!("skipped {} unreadable timeline events", chunk.skipped);
-                }
-                let sink = shared.get();
-                let window = (next, now + 1);
-                next = now + 1;
-                if let Some(b) = pipe.feed(&sink, chunk.events, Some(window)) {
-                    sink.send(Ingest::Timeline(b));
+                    let sink = shared.get();
+                    let window = (next, next + extent + 1);
+                    next = window.1;
+                    if let Some(b) = pipe.feed(&sink, chunk.events, Some(window)) {
+                        sink.send(Ingest::Timeline(b));
+                    }
                 }
             }
             _ = cpu_tick.tick(), if !cs.off => {
@@ -630,6 +655,7 @@ async fn run(
                     let Some(actual) = apply_tracing(&svc, &cfg, &cpu, on, &mut stream_mode, &mut next).await else {
                         return;
                     };
+                    pipe.reset();
                     // The app refused: the wish is not the state, and the next request must
                     // reach it again.
                     if on && !actual {
@@ -642,9 +668,13 @@ async fn run(
                     if cpu.wanted.load(Ordering::Relaxed)
                         && *cpu.main.lock().unwrap() == isolate
                     {
+                        let streamed = stream_mode;
                         let Some(actual) = apply_tracing(&svc, &cfg, &cpu, true, &mut stream_mode, &mut next).await else {
                             return;
                         };
+                        if stream_mode != streamed {
+                            pipe.reset();
+                        }
                         shared.get().send(Ingest::Tracing(shared.get().run, actual));
                     }
                 }

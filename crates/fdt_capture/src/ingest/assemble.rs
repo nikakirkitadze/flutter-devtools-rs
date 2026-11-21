@@ -377,7 +377,14 @@ impl Assembler {
             phase: [0; 5],
             name: ev.name,
         };
-        close(stack, open, depth, ev.ts_us + dur, ev.tid, out);
+        close(
+            stack,
+            open,
+            depth,
+            ev.ts_us.saturating_add(dur),
+            ev.tid,
+            out,
+        );
     }
 
     fn async_begin(&mut self, ev: TraceEvent) {
@@ -479,7 +486,7 @@ fn close(
     tid: i64,
     out: &mut AssembledBatch,
 ) {
-    let dur = (end - open.start).max(0);
+    let dur = end.saturating_sub(open.start).max(0);
     stack.has_slice = true;
     let widget = open.under_build;
     if widget {
@@ -489,7 +496,7 @@ fn close(
         && parent.role == Role::BeginFrame
         && let Some(p) = phase_of(&open.name)
     {
-        parent.phase[p] += dur as u64;
+        parent.phase[p] = parent.phase[p].saturating_add(dur as u64);
     }
     match (open.role, open.frame) {
         (Role::BeginFrame, Some(n)) => {
@@ -591,6 +598,18 @@ mod tests {
         );
         assert_eq!(out.slices[0].track, (TrackKind::Thread, 5));
         assert_eq!(a.stats(), AssemblerStats::default());
+    }
+
+    /// Hostile timestamps: an `X` whose `ts + dur` overflows, and a span from `i64::MIN` to
+    /// `i64::MAX`. Debug builds panicked; durations saturate instead.
+    #[test]
+    fn hostile_timestamps_do_not_overflow() {
+        let mut x = ev(Phase::Complete, "x", 5, i64::MAX - 10);
+        x.dur_us = Some(100);
+        let (out, _) = run(vec![x]);
+        assert_eq!(names(&out), vec![("x", 0, i64::MAX - 10, 10)]);
+        let (out, _) = run(vec![b("a", 5, i64::MIN), e("a", 5, i64::MAX)]);
+        assert_eq!(names(&out), vec![("a", 0, i64::MIN, i64::MAX)]);
     }
 
     #[test]
@@ -1018,7 +1037,8 @@ mod tests {
         let mut dec = vec![];
         for _ in 0..5 {
             let t0 = std::time::Instant::now();
-            let (events, _) = decode_trace_events(&json);
+            // The decoder `get_vm_timeline` ships.
+            let (events, _) = fdt_vm::timeline::decode_timeline_reply(&json).unwrap();
             let t1 = std::time::Instant::now();
             let mut a = Assembler::new();
             let mut out = AssembledBatch::default();

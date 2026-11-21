@@ -134,8 +134,13 @@ impl Lane {
             }
             for idx in lo..=hi {
                 let cell_idx = idx as u32;
-                let cell_end = (idx + 1).checked_shl(sh).unwrap_or(u64::MAX);
-                let cover = end.min(cell_end) - s.start.0.max(idx << sh).min(end);
+                // `checked_shl` only checks the shift amount, not the bits shifted out.
+                let width = 1u64 << sh;
+                let cell_end = (idx + 1).saturating_mul(width);
+                let cell_start = idx.saturating_mul(width);
+                let cover = end
+                    .min(cell_end)
+                    .saturating_sub(s.start.0.max(cell_start).min(end));
                 let last = level.len().checked_sub(1);
                 match last.and_then(|i| level.get_mut(i)) {
                     Some(c) if c.idx == cell_idx => {
@@ -684,6 +689,19 @@ mod tests {
                 .all(|l| l.len() as u64 <= MAX_CELLS_PER_SLICE)
         );
         assert_eq!(lane.len(), 1);
+    }
+
+    /// Hostile timestamps near the end of time: no overflow (debug builds panicked).
+    #[test]
+    fn a_slice_near_the_end_of_time_does_not_overflow() {
+        let mut w = SessionWriter::new(0);
+        let run = begin(&mut w);
+        let t = w.timeline_track(run, TrackKind::Thread, 1, "t");
+        let n = w.intern_name("n");
+        assert!(w.push_slice(t, 0, sl(u64::MAX - 1_000, 500, n), false));
+        assert!(w.push_slice(t, 0, sl(u64::MAX - 400, u64::MAX, n), false));
+        let snap = w.publish();
+        assert_eq!(snap.timeline.lanes(t)[0].len(), 2);
     }
 
     #[test]

@@ -192,6 +192,25 @@ pub fn decode_trace_events(json: &str) -> (Vec<TraceEvent>, u32) {
     }
 }
 
+/// Decodes a `getVMTimeline` reply: the decoder the capture's poller ships. Well-formed replies
+/// take the typed pass (no `Value` tree, so a large window costs no more than its events); any
+/// surprise falls back to the lenient `Value` path. A reply without `traceEvents` holds no
+/// events. `None` when the text is not a JSON object at all, so the caller can keep the window.
+pub fn decode_timeline_reply(json: &str) -> Option<(Vec<TraceEvent>, u32)> {
+    if json.trim_start().starts_with('{')
+        && let Some(r) = fast::decode(json)
+    {
+        return Some(r);
+    }
+    #[derive(Deserialize)]
+    struct Reply {
+        #[serde(rename = "traceEvents", default)]
+        trace_events: Vec<Value>,
+    }
+    let r: Reply = serde_json::from_str(json).ok()?;
+    Some(decode_trace_values(&r.trace_events))
+}
+
 /// The typed decoder behind [`decode_trace_events`]. It returns `None` on any surprise.
 mod fast {
     use std::borrow::Cow;
@@ -413,27 +432,52 @@ mod fast {
         })
     }
 
+    /// An array of events, converted one at a time as it is read: only the decoded events are
+    /// ever held, never the whole reply as raw records.
+    struct Events {
+        events: Vec<TraceEvent>,
+        skipped: u32,
+    }
+
+    impl<'de> Deserialize<'de> for Events {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V;
+            impl<'de> Visitor<'de> for V {
+                type Value = Events;
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str("an array of trace events")
+                }
+                fn visit_seq<S: SeqAccess<'de>>(self, mut s: S) -> Result<Events, S::Error> {
+                    let mut out = Events {
+                        events: Vec::new(),
+                        skipped: 0,
+                    };
+                    while let Some(r) = s.next_element::<Raw<'de>>()? {
+                        match convert(r) {
+                            Some(e) => out.events.push(e),
+                            None => out.skipped += 1,
+                        }
+                    }
+                    Ok(out)
+                }
+            }
+            d.deserialize_seq(V)
+        }
+    }
+
     #[derive(Deserialize)]
-    struct Reply<'a> {
-        #[serde(borrow, rename = "traceEvents")]
-        trace_events: Vec<Raw<'a>>,
+    struct Reply {
+        #[serde(rename = "traceEvents")]
+        trace_events: Events,
     }
 
     pub(super) fn decode(json: &str) -> Option<(Vec<TraceEvent>, u32)> {
-        let raws: Vec<Raw> = match json.trim_start().as_bytes().first()? {
+        let e = match json.trim_start().as_bytes().first()? {
             b'{' => serde_json::from_str::<Reply>(json).ok()?.trace_events,
-            b'[' => serde_json::from_str(json).ok()?,
+            b'[' => serde_json::from_str::<Events>(json).ok()?,
             _ => return None,
         };
-        let mut skipped = 0;
-        let mut events = Vec::with_capacity(raws.len());
-        for r in raws {
-            match convert(r) {
-                Some(e) => events.push(e),
-                None => skipped += 1,
-            }
-        }
-        Some((events, skipped))
+        Some((e.events, e.skipped))
     }
 }
 
@@ -479,14 +523,8 @@ impl VmService {
             )
             .await?;
         tokio::task::spawn_blocking(move || {
-            #[derive(Deserialize)]
-            struct Reply {
-                #[serde(rename = "traceEvents", default)]
-                trace_events: Vec<Value>,
-            }
-            let r: Reply = serde_json::from_str(raw.get())
-                .map_err(|e| RpcError::Decode(format!("getVMTimeline: {e}")))?;
-            let (events, skipped) = decode_trace_values(&r.trace_events);
+            let (events, skipped) = decode_timeline_reply(raw.get())
+                .ok_or_else(|| RpcError::Decode("getVMTimeline: unreadable reply".into()))?;
             Ok(TimelineChunk { events, skipped })
         })
         .await
@@ -719,6 +757,43 @@ mod tests {
         let ev =
             decode_notification(&note(json!({"kind":"TimelineEvents","timestamp":1}))).unwrap();
         assert!(matches!(ev, StreamEvent::Other { .. }));
+    }
+
+    #[test]
+    fn the_shipped_reply_decoder_agrees_with_the_value_path() {
+        // What `get_vm_timeline` decoded before it shipped the typed pass.
+        fn value_path(json: &str) -> Option<(Vec<TraceEvent>, u32)> {
+            #[derive(Deserialize)]
+            struct Reply {
+                #[serde(rename = "traceEvents", default)]
+                trace_events: Vec<Value>,
+            }
+            let r: Reply = serde_json::from_str(json).ok()?;
+            Some(decode_trace_values(&r.trace_events))
+        }
+        let docs = [
+            r#"{"type":"Timeline","traceEvents":[{"ph":"B","ts":1,"name":"a","cat":"Dart","pid":2,"tid":3,"args":{"frame_number":"7"}},
+                {"ph":"E","ts":2.9,"tid":3,"id":"1fdb"},{"ph":"M","name":"thread_name","pid":1,"tid":4,"args":{"name":"io.x (4)"}},
+                {"ph":"B"},{"ts":1}],"timeOriginMicros":0,"timeExtentMicros":5}"#,
+            r#"{"type":"Timeline","traceEvents":[{"ph":"B","ts":1}, 7, {"ph":"E","ts":2}]}"#,
+            r#"{"type":"Timeline","traceEvents":[]}"#,
+            r#"{"type":"Timeline"}"#,
+            r#"{"type":"Timeline","traceEvents":5}"#,
+        ];
+        for d in docs {
+            assert_eq!(decode_timeline_reply(d), value_path(d), "{d}");
+        }
+        // Well-formed replies never build a `Value` tree.
+        assert!(fast::decode(docs[0]).is_some());
+        assert_eq!(
+            decode_timeline_reply(docs[1]).map(|r| (r.0.len(), r.1)),
+            Some((2, 1))
+        );
+        assert_eq!(decode_timeline_reply(docs[3]), Some((vec![], 0)));
+        // Text that is not a reply is not "no events": the poller keeps the window.
+        assert_eq!(decode_timeline_reply("not json"), None);
+        assert_eq!(decode_timeline_reply(r#"{"traceEvents":[{"ph":"B""#), None);
+        assert_eq!(decode_timeline_reply(""), None);
     }
 
     #[test]

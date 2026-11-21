@@ -19,6 +19,7 @@ const STEP: i64 = 10_000;
 /// Event times in the tests sit this far after the connect, so that they are after the session's
 /// origin whatever the real time spent connecting.
 const LATER: i64 = 3_000_000;
+const TRACE: &str = "ext.flutter.profileUserWidgetBuilds";
 
 fn config() -> CaptureConfig {
     CaptureConfig {
@@ -63,6 +64,12 @@ impl Sim {
     }
 
     fn server(self: &Arc<Sim>) -> ScriptedServer {
+        self.server_with(&[])
+    }
+
+    /// A server whose main isolate lists `extensions`. The widget-build tracing switch answers
+    /// with the state it was set to.
+    fn server_with(self: &Arc<Sim>, extensions: &'static [&'static str]) -> ScriptedServer {
         let sim = self.clone();
         ScriptedServer::start(move |m, p| {
             let iso = p["isolateId"].as_str().unwrap_or("isolates/1");
@@ -72,8 +79,10 @@ impl Sim {
                     "isolates": [{"id": "isolates/1", "name": "main", "isSystemIsolate": false}]}),
                 ),
                 "getIsolate" => Ok(json!({"type": "Isolate", "id": iso, "name": "main",
-                    "extensionRPCs": [], "rootLib": {"uri": "package:demo/main.dart"}})),
-                "streamListen" => Ok(json!({"type": "Success"})),
+                    "extensionRPCs": extensions, "rootLib": {"uri": "package:demo/main.dart"}})),
+                "streamListen" | "streamCancel" => Ok(json!({"type": "Success"})),
+                TRACE => Ok(json!({"type": "_extensionType", "method": TRACE,
+                    "enabled": if p["enabled"] == "true" { "true" } else { "false" }})),
                 "getVMTimelineMicros" => Ok(json!({"type": "Timestamp",
                     "timestamp": sim.micros.fetch_add(STEP, Ordering::SeqCst)})),
                 "getVMTimelineFlags" => Ok(json!({"type": "TimelineFlags",
@@ -210,6 +219,33 @@ fn refresh_rate_lands_in_the_run() {
     });
 }
 
+/// "New session" on a live connection keeps the run's facts: the refresh rate (so the frame
+/// budget) and the actual tracing state.
+#[test]
+fn new_session_keeps_the_refresh_budget() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let server = Sim::new().server_with(&[TRACE]);
+        let cap = start(&server, config(), &rt);
+        common::settle(&cap, Duration::from_millis(100), Duration::from_secs(5)).await;
+        cap.set_trace_widget_builds(true);
+        let first = common::wait_for(&cap, Duration::from_secs(5), "tracing on", |s| {
+            s.runs.last().is_some_and(|r| r.tracing)
+        })
+        .await;
+        assert_eq!(first.latest_budget_us(), 8_333);
+        cap.new_session();
+        let snap = common::wait_for(&cap, Duration::from_secs(5), "a new session", |s| {
+            s.session != first.session && !s.runs.is_empty()
+        })
+        .await;
+        assert_eq!(snap.runs[0].refresh_hz, Some(120.0));
+        assert_eq!(snap.latest_budget_us(), 8_333);
+        assert!(snap.runs[0].tracing);
+        drop(cap);
+    });
+}
+
 #[test]
 fn poll_windows_are_contiguous() {
     let rt = CaptureRuntime::new().unwrap();
@@ -237,6 +273,157 @@ fn poll_windows_are_contiguous() {
         for w in polls.windows(2) {
             assert_eq!(w[1].0, w[0].0 + w[0].1 + 1, "{polls:?}");
         }
+        drop(cap);
+    });
+}
+
+/// The windows of every `getVMTimeline` call so far: `(origin, extent)`.
+fn windows(server: &ScriptedServer) -> Vec<(i64, i64)> {
+    server
+        .received()
+        .into_iter()
+        .filter(|(m, _)| m == "getVMTimeline")
+        .map(|(_, p)| {
+            (
+                p["timeOriginMicros"].as_i64().unwrap(),
+                p["timeExtentMicros"].as_i64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// After a stall the poller catches up in windows of at most 2 s, one after another in the same
+/// tick, so that no single reply can hold a whole ring of events.
+#[test]
+fn long_gaps_are_polled_in_windows_of_two_seconds() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let sim = Sim::new();
+        let server = sim.server();
+        let cap = start(&server, config(), &rt);
+        common::settle(&cap, Duration::from_millis(100), Duration::from_secs(5)).await;
+        common::eventually(Duration::from_secs(5), "a first poll", || {
+            !windows(&server).is_empty()
+        })
+        .await;
+        // The clock jumps 5 s: the poll fell behind.
+        sim.micros.fetch_add(5_000_000, Ordering::SeqCst);
+        common::eventually(Duration::from_secs(5), "the catch-up", || {
+            let w = windows(&server);
+            w.last().is_some_and(|l| l.0 + l.1 > BASE + 5_000_000)
+        })
+        .await;
+        drop(cap);
+        let polls = windows(&server);
+        for w in polls.windows(2) {
+            assert_eq!(w[1].0, w[0].0 + w[0].1 + 1, "contiguous: {polls:?}");
+        }
+        assert!(polls.iter().all(|w| w.1 <= 2_000_000), "{polls:?}");
+        let full = polls.iter().filter(|w| w.1 == 2_000_000).count();
+        assert!(full >= 2, "the 5 s gap is split: {polls:?}");
+        // The split windows follow each other with no clock read between them: one tick.
+        let calls: Vec<String> = server.received().into_iter().map(|(m, _)| m).collect();
+        let first_full = polls.iter().position(|w| w.1 == 2_000_000).unwrap();
+        let at = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| *m == "getVMTimeline")
+            .map(|(i, _)| i)
+            .nth(first_full)
+            .unwrap();
+        assert_eq!(
+            &calls[at..at + 3],
+            ["getVMTimeline", "getVMTimeline", "getVMTimeline"],
+            "{calls:?}"
+        );
+    });
+}
+
+/// Turning tracing on while a frame is in progress at the last poll: the begins of that frame
+/// never see their ends (the events between the last poll and the stream are never fetched).
+/// They must not make every later UI-thread slice count as a widget build.
+#[test]
+fn toggling_tracing_mid_frame_does_not_count_later_slices_as_builds() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let sim = Sim::new();
+        let t = BASE + LATER;
+        // The last poll before the switch ends inside frame 1's BUILD.
+        sim.push(vec![
+            ev("B", "VsyncProcessCallback", 259, t),
+            framed("B", "Animator::BeginFrame", 259, t + 1, 1),
+            ev("B", "BUILD", 259, t + 2),
+        ]);
+        let server = sim.server_with(&[TRACE]);
+        let cap = start(&server, config(), &rt);
+        common::settle(&cap, Duration::from_millis(200), Duration::from_secs(5)).await;
+        common::eventually(Duration::from_secs(5), "the poll was served", || {
+            sim.polls.lock().unwrap().is_empty()
+        })
+        .await;
+        cap.set_trace_widget_builds(true);
+        common::eventually(Duration::from_secs(5), "streamListen Timeline", || {
+            server
+                .received()
+                .iter()
+                .any(|(m, p)| m == "streamListen" && p["streamId"] == "Timeline")
+        })
+        .await;
+        common::wait_for(&cap, Duration::from_secs(5), "tracing on", |s| {
+            s.runs.last().is_some_and(|r| r.tracing)
+        })
+        .await;
+        // Frame 2 on the stream: a whole frame with no widget builds at all.
+        let u = t + 100_000;
+        let block = vec![
+            ev("B", "VsyncProcessCallback", 259, u),
+            framed("B", "Animator::BeginFrame", 259, u + 1, 2),
+            ev("B", "BUILD", 259, u + 2),
+            ev("E", "BUILD", 259, u + 40),
+            ev("B", "LAYOUT (root)", 259, u + 41),
+            ev("E", "LAYOUT (root)", 259, u + 50),
+            ev("B", "PAINT (root)", 259, u + 51),
+            ev("E", "PAINT (root)", 259, u + 60),
+            framed("E", "Animator::BeginFrame", 259, u + 61, 2),
+            ev("E", "VsyncProcessCallback", 259, u + 62),
+        ];
+        server.notify(
+            "streamNotify",
+            json!({"streamId": "Timeline", "event": {"type": "Event",
+                "kind": "TimelineEvents", "timelineEvents": block}}),
+        );
+        server.notify("streamNotify", frame_event(2, u + 1, 60));
+        let snap = common::wait_for(&cap, Duration::from_secs(5), "frame 2 with phases", |s| {
+            (0..s.frames.len()).any(|i| {
+                s.frames
+                    .get(i)
+                    .is_some_and(|f| f.number == 2 && f.ui.is_some())
+            })
+        })
+        .await;
+        let f = (0..snap.frames.len())
+            .filter_map(|i| snap.frames.get(i))
+            .find(|f| f.number == 2)
+            .unwrap();
+        let ui = f.ui.unwrap();
+        assert!(
+            matches!(ui.widgets_built, None | Some(0)),
+            "no widget was built in frame 2: {:?}",
+            ui.widgets_built
+        );
+        // Frame 2's slices sit at the top of the UI track, not below frame 1's stale opens.
+        let track = snap
+            .timeline
+            .tracks()
+            .iter()
+            .find(|t| t.order == 0)
+            .unwrap()
+            .id;
+        let lanes = snap.timeline.lanes(track);
+        let top: Vec<&str> = (0..lanes[0].len())
+            .map(|i| snap.timeline.name(lanes[0].get(i).name))
+            .collect();
+        assert_eq!(top, ["VsyncProcessCallback"]);
         drop(cap);
     });
 }

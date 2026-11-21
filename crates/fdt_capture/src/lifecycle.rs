@@ -23,6 +23,8 @@ pub(crate) struct VmIdent {
     pid: Option<u32>,
     start_time: Option<i64>,
     clock: RunClock,
+    /// The display's refresh rate, read once per connection; a new session's run keeps it.
+    refresh_hz: Option<f32>,
 }
 
 /// Retrying the same URL after the app stopped.
@@ -394,6 +396,8 @@ impl Session {
                 && v.pid == app.pid
                 && v.start_time == vm_start_time
         });
+        // A reopened run keeps the rate it had when this connect could not read one.
+        let refresh_hz = refresh_hz.or(same.as_ref().and_then(|v| v.refresh_hz));
         let (id, clock, app) = match same {
             // The same VM again: the app never stopped, only the connection did.
             Some(v) => {
@@ -427,6 +431,7 @@ impl Session {
             pid: app.pid,
             start_time: vm_start_time,
             clock,
+            refresh_hz,
         });
         self.life.waiting_for = None;
         self.life.retry = None;
@@ -476,6 +481,11 @@ impl Session {
                 shared.get().connect_timeline_us,
                 tx,
             ));
+            // The connection's facts carry over: the frame budget and the actual tracing.
+            let refresh_hz = old_vm.as_ref().and_then(|v| v.refresh_hz);
+            if let Some(hz) = refresh_hz {
+                w.set_refresh_rate(id, hz);
+            }
             w.set_tracing(id, self.tracing_actual);
             self.current_run = Some(id);
             self.life.last_vm = Some(VmIdent {
@@ -483,6 +493,7 @@ impl Session {
                 pid: app.pid,
                 start_time: old_vm.and_then(|v| v.start_time),
                 clock,
+                refresh_hz,
             });
             self.status.send_replace(ConnStatus::Connected {
                 run: id,

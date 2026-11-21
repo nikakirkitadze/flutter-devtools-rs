@@ -1,7 +1,7 @@
 //! A way in for the `ingest` benchmark and the budget test, which cannot see crate-private items.
 //! Not part of the public API.
 
-use fdt_vm::timeline::decode_trace_events;
+use fdt_vm::timeline::decode_timeline_reply;
 
 use crate::ingest::assemble::{AssembledBatch, Assembler};
 
@@ -295,9 +295,10 @@ pub fn synthetic_timeline_json(frames: usize) -> String {
     s
 }
 
-/// Decodes the JSON and assembles it in one feed. Returns the slice count.
+/// Decodes the JSON with the poller's decoder and assembles it in one feed. Returns the slice
+/// count.
 pub fn decode_and_assemble(json: &str) -> usize {
-    let (events, _) = decode_trace_events(json);
+    let (events, _) = decode_timeline_reply(json).unwrap_or_default();
     let mut a = Assembler::new();
     let mut out = AssembledBatch::default();
     a.feed(events, &mut out);
