@@ -242,6 +242,8 @@ fn new_session_keeps_the_refresh_budget() {
         assert_eq!(snap.runs[0].refresh_hz, Some(120.0));
         assert_eq!(snap.latest_budget_us(), 8_333);
         assert!(snap.runs[0].tracing);
+        // Carried over: on from the new run's start, so its first frames count as traced.
+        assert!(snap.runs[0].tracing_at(snap.runs[0].started));
         drop(cap);
     });
 }

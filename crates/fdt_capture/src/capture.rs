@@ -406,7 +406,9 @@ impl Session {
             Ingest::NetRestoreReady(n) => self.net_restore = Some(n),
             Ingest::Tracing(run, on) => {
                 self.tracing_actual = on;
-                w.set_tracing(run, on);
+                // Frames from before this moment were recorded with the old state.
+                let at = crate::lifecycle::session_time(w);
+                w.set_tracing(run, on, at);
             }
             Ingest::HttpPoll {
                 isolate,

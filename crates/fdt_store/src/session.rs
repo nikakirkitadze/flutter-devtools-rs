@@ -134,6 +134,7 @@ impl SessionWriter {
             clock,
             refresh_hz: None,
             tracing: false,
+            tracing_periods: Vec::new(),
         });
         self.touch(at);
         id
@@ -178,12 +179,21 @@ impl SessionWriter {
         }
     }
 
-    /// Records whether widget-build tracing is on in the run's app.
-    pub fn set_tracing(&mut self, run: RunId, on: bool) {
+    /// Records whether widget-build tracing is on in the run's app, and that it turned on or off
+    /// `at` (see [`RunInfo::tracing_at`]). Times never go back: a stamp before the last one is
+    /// taken as the last one.
+    pub fn set_tracing(&mut self, run: RunId, on: bool, at: SessionTime) {
         if let Some(r) = self.runs.iter_mut().find(|r| r.id == run)
             && r.tracing != on
         {
             r.tracing = on;
+            let last = r.tracing_periods.last().map(|&(on, off)| off.unwrap_or(on));
+            let at = last.map_or(at, |last| at.max(last));
+            if on {
+                r.tracing_periods.push((at, None));
+            } else if let Some(p) = r.tracing_periods.last_mut() {
+                p.1 = Some(at);
+            }
             self.dirty = true;
         }
     }
@@ -443,10 +453,33 @@ mod tests {
         let r = w.start_run(app(), clock(), SessionTime(10));
         w.publish();
         assert!(!w.publish().run(r).unwrap().tracing);
-        w.set_tracing(r, false);
+        w.set_tracing(r, false, SessionTime(20));
         assert!(!w.is_dirty());
-        w.set_tracing(r, true);
+        w.set_tracing(r, true, SessionTime(30));
         assert!(w.publish().run(r).unwrap().tracing);
+    }
+
+    /// Tracing is judged at a time: on from when it turned on, off from when it turned off.
+    #[test]
+    fn tracing_at_follows_on_off_and_on_again() {
+        let mut w = SessionWriter::new(0);
+        let r = w.start_run(app(), clock(), SessionTime(10));
+        w.set_tracing(r, true, SessionTime(100));
+        w.set_tracing(r, true, SessionTime(150));
+        w.set_tracing(r, false, SessionTime(200));
+        w.set_tracing(r, false, SessionTime(250));
+        w.set_tracing(r, true, SessionTime(300));
+        let s = w.publish();
+        let run = s.run(r).unwrap();
+        assert!(run.tracing);
+        let at = |t: u64| run.tracing_at(SessionTime(t));
+        assert!(!at(10) && !at(99), "before it turned on");
+        assert!(
+            at(100) && at(150) && at(199),
+            "on (a repeated on changes nothing)"
+        );
+        assert!(!at(200) && !at(250) && !at(299), "off");
+        assert!(at(300) && at(u64::MAX), "on again, still on");
     }
 
     #[test]

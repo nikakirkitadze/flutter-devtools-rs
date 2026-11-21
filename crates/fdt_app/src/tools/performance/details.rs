@@ -10,7 +10,7 @@ use crate::nav::{Location, Page, Selection, Tool};
 use crate::tools::network::model::{format_duration_ns, format_time, status_text};
 use crate::tools::{OpenLocation, ReplaceLocation};
 use fdt_analysis::breakdown::Phase;
-use fdt_analysis::explain::{CpuState, Explanation, explain};
+use fdt_analysis::explain::{BuildTracing, CpuState, Explanation, build_tracing, explain};
 use fdt_analysis::user_code::is_user_library;
 use fdt_capture::ConnStatus;
 use fdt_store::Snapshot;
@@ -104,8 +104,8 @@ pub(super) struct Analysed {
     snap: Arc<Snapshot>,
     requests: Vec<RelatedRow>,
     logs: Vec<RelatedRow>,
-    /// The frame's run traces widget builds.
-    tracing: bool,
+    /// Whether the frame's widget builds were traced, judged at its start.
+    tracing: BuildTracing,
     /// The store stopped keeping raw widget builds after its cap.
     capped: bool,
 }
@@ -117,8 +117,7 @@ impl Analysed {
         let tracing = snap
             .frames
             .get(seq)
-            .and_then(|f| snap.run(f.run))
-            .is_some_and(|r| r.tracing);
+            .map_or(BuildTracing::Off, |f| build_tracing(&snap, f));
         let capped = snap.timeline.drops().build_cap > 0;
         Analysed {
             explanation,
@@ -681,7 +680,7 @@ impl PerformanceView {
     ) -> Vec<AnyElement> {
         let t = *cx.tokens();
         let (e, snap) = (&a.explanation, &*a.snap);
-        vec![
+        let mut out = vec![
             self.breakdown_section(e, &t).into_any_element(),
             div()
                 .id("details-sentence")
@@ -691,12 +690,17 @@ impl PerformanceView {
                 .font_weight(font::MEDIUM)
                 .child(e.sentence.clone())
                 .into_any_element(),
+        ];
+        out.extend(
             self.rebuilds_section(e, &t, connected, (a.tracing, a.capped), cx)
-                .into_any_element(),
+                .map(IntoElement::into_any_element),
+        );
+        out.push(
             self.functions_section(e, snap, &t, connected, cx)
                 .into_any_element(),
-            self.related_section(a, &t, cx).into_any_element(),
-        ]
+        );
+        out.push(self.related_section(a, &t, cx).into_any_element());
+        out
     }
 
     fn breakdown_section(&self, e: &Explanation, t: &Palette) -> Div {
@@ -794,44 +798,51 @@ impl PerformanceView {
             }))
     }
 
-    /// `(tracing, capped)`: the frame's run traces widget builds, and the store stopped keeping
-    /// raw builds after its cap.
+    /// `(tracing, capped)`: whether the frame's widget builds were traced, and the store stopped
+    /// keeping raw builds after its cap. None when there is nothing to say: the frame is from
+    /// before tracing turned on, and it is on now.
     fn rebuilds_section(
         &mut self,
         e: &Explanation,
         t: &Palette,
         connected: bool,
-        (tracing, capped): (bool, bool),
+        (tracing, capped): (BuildTracing, bool),
         cx: &mut Context<Self>,
-    ) -> Div {
+    ) -> Option<Div> {
         let section = div().flex().flex_col().gap(space::S4).child(heading(
             t,
             "details-section-rebuilds",
             "Most rebuilt widgets",
         ));
         let Some(rebuilds) = &e.rebuilds else {
-            // Tracing is on: there is nothing to turn on (ruling R19).
-            if tracing {
-                let text = if capped {
-                    super::rebuilds_tab::CAP_NOTE
-                } else {
-                    NONE_REBUILT
-                };
-                return section.child(note(t, "details-rebuilds-note", text));
+            match tracing {
+                // Traced: there is nothing to turn on (ruling R19).
+                BuildTracing::Traced => {
+                    let text = if capped {
+                        super::rebuilds_tab::CAP_NOTE
+                    } else {
+                        NONE_REBUILT
+                    };
+                    return Some(section.child(note(t, "details-rebuilds-note", text)));
+                }
+                BuildTracing::OnAfter => return None,
+                BuildTracing::Off => {}
             }
-            return section
-                .child(note(t, "details-rebuilds-note", REBUILDS_HINT))
-                .children(connected.then(|| {
-                    div().flex().child(
-                        button(t, "details-trace-builds", "Trace widget builds").on_click(
-                            cx.listener(|this, _, _, cx| {
-                                if let Some(c) = this.session.read(cx).control() {
-                                    c.set_trace_widget_builds(true);
-                                }
-                            }),
-                        ),
-                    )
-                }));
+            return Some(
+                section
+                    .child(note(t, "details-rebuilds-note", REBUILDS_HINT))
+                    .children(connected.then(|| {
+                        div().flex().child(
+                            button(t, "details-trace-builds", "Trace widget builds").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    if let Some(c) = this.session.read(cx).control() {
+                                        c.set_trace_widget_builds(true);
+                                    }
+                                }),
+                            ),
+                        )
+                    })),
+            );
         };
         let mut section = section;
         for (i, w) in rebuilds.widgets.iter().take(TOP).enumerate() {
@@ -875,7 +886,7 @@ impl PerformanceView {
                     ),
             );
         }
-        section
+        Some(section)
     }
 
     fn functions_section(
@@ -1389,14 +1400,26 @@ mod tests {
         assert!(sentence.ends_with("Turn on Trace widget builds to see which widgets rebuilt."));
     }
 
-    /// Ruling R19: with tracing on, a frame with no traced rebuilds says so, with no button to
-    /// turn tracing on.
+    /// Publishes `w` and lets the pane's throttled analysis run again.
+    fn republish(
+        w: &mut SessionWriter,
+        fake: &crate::test_support::FakeHandle,
+        cx: &mut VisualTestContext,
+    ) {
+        fake.snaps.send(w.publish()).unwrap();
+        cx.run_until_parked();
+        cx.executor().advance_clock(REFRESH_INTERVAL * 4);
+        cx.run_until_parked();
+    }
+
+    /// Tracing is judged at the frame's start. A frame recorded before tracing turned on was
+    /// never traced: it is not called unrebuilt, and while tracing is on there is nothing to turn
+    /// on for it; once tracing is off again, it offers to turn it on.
     #[gpui_kit::test]
-    fn tracing_on_without_rebuilds_says_none_rebuilt(cx: &mut TestAppContext) {
+    fn frame_before_tracing_on_is_not_called_unrebuilt(cx: &mut TestAppContext) {
         let (shell, cx, fake) = open_shell_fake(cx);
         let (mut w, run) = writer();
         phased_frame(&mut w, run, 0, 100, 2);
-        w.set_tracing(run, true);
         fake.snaps.send(w.publish()).unwrap();
         fake.status.send(connected("demo", true)).unwrap();
         cx.run_until_parked();
@@ -1404,14 +1427,64 @@ mod tests {
         select(&shell, cx, 0);
         assert_eq!(
             label(cx, "details-rebuilds-note").as_deref(),
-            Some("None of your app's widgets rebuilt in this frame.")
+            Some(REBUILDS_HINT)
         );
+        click(cx, "details-trace-builds");
+        // The app confirms tracing after the frame.
+        w.set_tracing(run, true, SessionTime(500 * MS));
+        republish(&mut w, &fake, cx);
+        assert_ne!(
+            label(cx, "details-rebuilds-note").as_deref(),
+            Some(NONE_REBUILT)
+        );
+        assert_eq!(label(cx, "details-rebuilds-note"), None);
         assert!(!exists(cx, "details-trace-builds"));
         let sentence = label(cx, "details-sentence").unwrap();
         assert!(
             !sentence.contains("Turn on Trace widget builds"),
             "{sentence}"
         );
+        // Tracing off again: the frame still was not traced.
+        w.set_tracing(run, false, SessionTime(900 * MS));
+        republish(&mut w, &fake, cx);
+        assert_eq!(
+            label(cx, "details-rebuilds-note").as_deref(),
+            Some(REBUILDS_HINT)
+        );
+        assert!(exists(cx, "details-trace-builds"));
+        let sentence = label(cx, "details-sentence").unwrap();
+        assert!(sentence.ends_with(REBUILDS_HINT), "{sentence}");
+    }
+
+    /// Ruling R19, per frame: a frame recorded while tracing was on, with no traced rebuilds,
+    /// says so with no button to turn tracing on, also after tracing is turned off.
+    #[gpui_kit::test]
+    fn frame_after_tracing_on_with_no_builds_says_so(cx: &mut TestAppContext) {
+        let (shell, cx, fake) = open_shell_fake(cx);
+        let (mut w, run) = writer();
+        w.set_tracing(run, true, SessionTime(50 * MS));
+        phased_frame(&mut w, run, 0, 100, 2);
+        fake.snaps.send(w.publish()).unwrap();
+        fake.status.send(connected("demo", true)).unwrap();
+        cx.run_until_parked();
+        cx.dispatch_action(ShowPerformance);
+        select(&shell, cx, 0);
+        let says_so = |cx: &mut VisualTestContext| {
+            assert_eq!(
+                label(cx, "details-rebuilds-note").as_deref(),
+                Some(NONE_REBUILT)
+            );
+            assert!(!exists(cx, "details-trace-builds"));
+            let sentence = label(cx, "details-sentence").unwrap();
+            assert!(
+                !sentence.contains("Turn on Trace widget builds"),
+                "{sentence}"
+            );
+        };
+        says_so(cx);
+        w.set_tracing(run, false, SessionTime(500 * MS));
+        republish(&mut w, &fake, cx);
+        says_so(cx);
     }
 
     /// After the build cap there is no build detail to show: the cap note says why.
@@ -1420,7 +1493,7 @@ mod tests {
         let (shell, cx, fake) = open_shell_fake(cx);
         let (mut w, run) = writer();
         phased_frame(&mut w, run, 0, 100, 2);
-        w.set_tracing(run, true);
+        w.set_tracing(run, true, SessionTime(0));
         let ui = w.timeline_track(run, TrackKind::Thread, 1, "io.flutter.ui");
         let name = w.intern_name("Spam");
         for i in 0..=fdt_store::timeline::RAW_BUILD_CAP {

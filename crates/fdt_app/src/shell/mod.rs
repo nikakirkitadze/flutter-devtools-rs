@@ -1819,7 +1819,7 @@ mod tests {
         );
         // Once the latest run reports it, that state is flipped.
         let (mut w, run) = crate::test_support::writer();
-        w.set_tracing(run, true);
+        w.set_tracing(run, true, SessionTime(0));
         fake.snaps.send(w.publish()).unwrap();
         cx.run_until_parked();
         cx.dispatch_action(ToggleTraceWidgetBuilds);
@@ -1827,7 +1827,7 @@ mod tests {
             fake.commands().last().map(String::as_str),
             Some("trace_builds false")
         );
-        w.set_tracing(run, false);
+        w.set_tracing(run, false, SessionTime(0));
         fake.snaps.send(w.publish()).unwrap();
         cx.run_until_parked();
         cx.dispatch_action(ToggleTraceWidgetBuilds);

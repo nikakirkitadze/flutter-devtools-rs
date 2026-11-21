@@ -771,7 +771,7 @@ mod tests {
         // The click is a request: the switch moves only when the run reports tracing.
         assert!(!tab.read_with(cx, |t, cx| t.tracing_on(cx)));
         let (mut w, run) = writer();
-        w.set_tracing(run, true);
+        w.set_tracing(run, true, SessionTime(0));
         fake.snaps.send(w.publish()).unwrap();
         cx.run_until_parked();
         assert!(tab.read_with(cx, |t, cx| t.tracing_on(cx)));
@@ -780,7 +780,7 @@ mod tests {
             fake.commands().last().map(String::as_str),
             Some("trace_builds false")
         );
-        w.set_tracing(run, false);
+        w.set_tracing(run, false, SessionTime(0));
         fake.snaps.send(w.publish()).unwrap();
         cx.run_until_parked();
         assert!(!tab.read_with(cx, |t, cx| t.tracing_on(cx)));
@@ -1003,7 +1003,7 @@ mod tests {
         let (shell, cx, fake) = open_shell_fake(cx);
         fake.status.send(connected("demo", true)).unwrap();
         let (mut w, run) = writer();
-        w.set_tracing(run, true);
+        w.set_tracing(run, true, SessionTime(0));
         fake.snaps.send(w.publish()).unwrap();
         cx.dispatch_action(ShowPerformance);
         cx.run_until_parked();
@@ -1033,7 +1033,7 @@ mod tests {
         let (shell, cx, fake) = open_shell_fake(cx);
         fake.status.send(connected("demo", true)).unwrap();
         let (mut w, run) = writer();
-        w.set_tracing(run, true);
+        w.set_tracing(run, true, SessionTime(0));
         cart_frame(&mut w, run, 1, 10, 4);
         fake.snaps.send(w.publish()).unwrap();
         cx.dispatch_action(ShowPerformance);

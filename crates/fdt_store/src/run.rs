@@ -32,4 +32,17 @@ pub struct RunInfo {
     pub refresh_hz: Option<f32>,
     /// Widget-build tracing is on in the app (the run's actual state, not the wish).
     pub tracing: bool,
+    /// When tracing was on, oldest first: from the first time until the second, which is `None`
+    /// while it is still on. Each time is when the app confirmed the change.
+    pub tracing_periods: Vec<(SessionTime, Option<SessionTime>)>,
+}
+
+impl RunInfo {
+    /// Whether widget-build tracing was on at `t`. A frame is judged by its own start, not by
+    /// whether tracing is on now.
+    pub fn tracing_at(&self, t: SessionTime) -> bool {
+        self.tracing_periods
+            .iter()
+            .any(|&(on, off)| on <= t && off.is_none_or(|off| t < off))
+    }
 }

@@ -424,7 +424,7 @@ impl Session {
             w.set_refresh_rate(id, hz);
         }
         // This connection has not switched anything yet.
-        w.set_tracing(id, false);
+        w.set_tracing(id, false, session_time(w));
         self.tracing_actual = false;
         self.life.last_vm = Some(VmIdent {
             run: id,
@@ -471,7 +471,8 @@ impl Session {
                 origin_host_us: w.origin_host_us(),
                 ..shared.get().clock
             };
-            let id = w.start_run(app.clone(), clock, session_time(&w));
+            let started = session_time(&w);
+            let id = w.start_run(app.clone(), clock, started);
             // Everything the old session's work still sends is stale from here on.
             self.conn_gen += 1;
             shared.set(Sink::new(
@@ -486,7 +487,7 @@ impl Session {
             if let Some(hz) = refresh_hz {
                 w.set_refresh_rate(id, hz);
             }
-            w.set_tracing(id, self.tracing_actual);
+            w.set_tracing(id, self.tracing_actual, started);
             self.current_run = Some(id);
             self.life.last_vm = Some(VmIdent {
                 run: id,

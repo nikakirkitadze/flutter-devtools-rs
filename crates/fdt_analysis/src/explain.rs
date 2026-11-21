@@ -318,6 +318,28 @@ fn cpu_state(snap: &Snapshot, frame: &FrameRecord, window: TimeRange) -> CpuStat
     }
 }
 
+/// What can be said about a frame's widget builds when none were traced (ruling R19). Tracing is
+/// judged at the frame's start, not by whether it is on now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuildTracing {
+    /// Tracing was on when the frame started: no traced rebuild means none of the app's widgets
+    /// rebuilt.
+    Traced,
+    /// The frame is from before tracing turned on, and it is on now: nothing is known about the
+    /// frame's rebuilds, and there is nothing to turn on.
+    OnAfter,
+    /// Tracing is off: turning it on traces the frames that follow.
+    Off,
+}
+
+pub fn build_tracing(snap: &Snapshot, frame: &FrameRecord) -> BuildTracing {
+    match snap.run(frame.run) {
+        Some(r) if r.tracing_at(frame.start) => BuildTracing::Traced,
+        Some(r) if r.tracing => BuildTracing::OnAfter,
+        _ => BuildTracing::Off,
+    }
+}
+
 fn functions(snap: &Snapshot, window: TimeRange) -> Vec<FunctionCost> {
     let mut all = busiest(&snap.cpu, Some(window), usize::MAX);
     // Stable: user code first, each group keeps the busiest-first order.
@@ -513,8 +535,9 @@ fn pick(
         format_ms(u64::from(phase_us(bd, over))),
         times_budget(phase_us(bd, over), budget)
     );
-    // With tracing on there is nothing to turn on: no rebuild was traced in this frame.
-    if over == Phase::Build && !snap.run(frame.run).is_some_and(|r| r.tracing) {
+    // Only while tracing is off: a frame traced with no rebuilds rebuilt none of the app's
+    // widgets, and with tracing on now there is nothing to turn on.
+    if over == Phase::Build && build_tracing(snap, frame) == BuildTracing::Off {
         s.push_str(" Turn on Trace widget builds to see which widgets rebuilt.");
     }
     (s, Cause::Phase(over))
@@ -1187,10 +1210,32 @@ mod tests {
     #[test]
     fn rule_8_hint_only_while_tracing_is_off() {
         let (mut w, run) = writer();
-        w.set_tracing(run, true);
+        w.set_tracing(run, true, SessionTime(0));
         put_frame(&mut w, run, 1, ([20_000, 500, 500, 500, 500], 22_000), 3000);
         let e = explain_of(&mut w, 0);
         assert_eq!(e.sentence, "Build took 20 ms, 1.2× the budget.");
+    }
+
+    /// Rule 8 judges tracing at the frame's start. A frame from before tracing turned on gets no
+    /// hint while tracing is on (there is nothing to turn on) and gets it once tracing is off; a
+    /// frame recorded while tracing was on gets none, also after tracing is off.
+    #[test]
+    fn rule_8_judges_tracing_at_the_frame() {
+        const PLAIN: &str = "Build took 20 ms, 1.2× the budget.";
+        let hinted = format!("{PLAIN} Turn on Trace widget builds to see which widgets rebuilt.");
+        let build = ([20_000, 500, 500, 500, 500], 22_000);
+        // The frame starts at 1 s.
+        let (mut w, run) = writer();
+        put_frame(&mut w, run, 1, build, 3000);
+        w.set_tracing(run, true, SessionTime(1_500 * MS));
+        assert_eq!(explain_of(&mut w, 0).sentence, PLAIN);
+        w.set_tracing(run, false, SessionTime(1_800 * MS));
+        assert_eq!(explain_of(&mut w, 0).sentence, hinted);
+        let (mut w, run) = writer();
+        w.set_tracing(run, true, SessionTime(500 * MS));
+        put_frame(&mut w, run, 1, build, 3000);
+        w.set_tracing(run, false, SessionTime(1_800 * MS));
+        assert_eq!(explain_of(&mut w, 0).sentence, PLAIN);
     }
 
     #[test]
