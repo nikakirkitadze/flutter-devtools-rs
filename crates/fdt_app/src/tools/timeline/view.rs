@@ -46,9 +46,6 @@ pub const EMPTY_CONNECTED_TEXT: &str =
     "Nothing recorded yet. Timeline lanes fill in as your app runs.";
 /// How much one press of the zoom keys changes the scale.
 const KEY_ZOOM: f32 = 1.5; // token-check: allow: zoom step, not a visual size
-/// How long a click on a lane waits before it opens what is under it, so that a double-click
-/// (which clears the range) does not navigate first. The macOS default double-click time.
-const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(500); // token-check: allow: double-click time, not a visual duration
 /// The page size before it has been drawn once.
 const FIRST_WIDTH_PX: f32 = 900.0; // token-check: allow: stand-in until the first paint
 const FIRST_HEIGHT_PX: f32 = 400.0; // token-check: allow: stand-in until the first paint
@@ -271,8 +268,6 @@ pub struct TimelineView {
     spans_for: Option<SpansKey>,
     spans_jobs: usize,
     spans_task: Option<Task<()>>,
-    /// A lane click waiting out the double-click time.
-    pending_click: Option<Task<()>>,
     click_task: Option<Task<()>>,
     focus: FocusHandle,
     /// The page was just opened: the lanes take the focus when they are next drawn.
@@ -313,7 +308,6 @@ impl TimelineView {
             spans_for: None,
             spans_jobs: 0,
             spans_task: None,
-            pending_click: None,
             click_task: None,
             focus: cx.focus_handle(),
             focus_pending: false,
@@ -448,7 +442,6 @@ impl TimelineView {
             self.spans_for = None;
             self.spans_task = None;
             self.click_task = None;
-            self.pending_click = None;
         }
         self.snap = snap;
         self.refresh_visible();
@@ -682,9 +675,9 @@ impl TimelineView {
         if x < f32::from(layout::LANE_LABEL_WIDTH) {
             return;
         }
-        if click_count >= 2 {
-            // The first click of a double-click opens nothing.
-            self.pending_click = None;
+        // A double-click on the ruler clears the range. On a lane it is two clicks: the first
+        // has already opened what is under it.
+        if click_count >= 2 && y < f32::from(layout::RULER_HEIGHT) {
             self.drag = None;
             self.open_timeline(None, cx);
             return;
@@ -752,22 +745,11 @@ impl TimelineView {
         cx.notify();
         let label_w = f32::from(layout::LANE_LABEL_WIDTH);
         if (x - d.start_x).abs() < MIN_DRAG_PX {
-            // A click: on a lane it opens what is under it, unless it turns out to be the first
-            // of a double-click; on the ruler it does nothing.
+            // A click: on a lane it opens what is under it at once; on the ruler it does nothing.
             if let Some((kind, ly)) = self.lane_at(d.start_y) {
                 let lx = d.start_x - label_w;
                 if let Some(hit) = self.lane_hit(kind, lx, ly, cx) {
-                    let session = self.snap.session;
-                    self.pending_click = Some(cx.spawn(async move |this, cx| {
-                        cx.background_executor().timer(DOUBLE_CLICK).await;
-                        this.update(cx, |this, cx| {
-                            this.pending_click = None;
-                            if this.snap.session == session {
-                                this.activate(hit, cx);
-                            }
-                        })
-                        .ok();
-                    }));
+                    self.activate(hit, cx);
                 }
             }
             return;
@@ -1254,42 +1236,29 @@ mod tests {
         TimeRange::new(SessionTime(0), SessionTime(4_000 * MS))
     }
 
-    /// A single click, and the double-click time after it.
     fn click(v: &Entity<TimelineView>, cx: &mut VisualTestContext, x: f32, y: f32) {
         v.update(cx, |v, cx| {
             v.press(x, y, 1, cx);
             v.released(x, cx);
         });
         cx.run_until_parked();
-        cx.executor().advance_clock(DOUBLE_CLICK);
-        cx.run_until_parked();
     }
 
-    /// A double-click on a lane clears the range, as on the ruler; the first click of it does not
-    /// open what is under the pointer.
+    /// A double-click on the ruler clears the range (ruling R22); its first click sets nothing.
     #[gpui_kit::test]
-    fn a_double_click_on_a_lane_clears_the_range(cx: &mut gpui_kit::TestAppContext) {
-        let snap = demo();
-        let (v, cx, _h) = open(cx, snap.clone());
-        let range = range_0_to_4s();
-        v.update(cx, |v, cx| v.set_location(Some(range), cx));
+    fn double_click_on_the_ruler_clears_the_range(cx: &mut gpui_kit::TestAppContext) {
+        let (v, cx, _h) = open(cx, demo());
+        v.update(cx, |v, cx| v.set_location(Some(range_0_to_4s()), cx));
         cx.run_until_parked();
         cx.update(|window, cx| window.render_frame(cx));
         let (events, _sub) = log(cx, &v);
-        let (x, y, _) = point_of(&v, cx, LaneKind::Frames, |h| *h == LaneHit::Frame(5));
+        let (x, y) = (label_w() + 120.0, ruler_h() / 2.0);
         v.update(cx, |v, cx| {
             v.press(x, y, 1, cx);
             v.released(x, cx);
-        });
-        cx.run_until_parked();
-        v.update(cx, |v, cx| {
             v.press(x, y, 2, cx);
             v.released(x, cx);
         });
-        cx.run_until_parked();
-        cx.executor()
-            .advance_clock(std::time::Duration::from_secs(1));
-        cx.run_until_parked();
         assert_eq!(
             events.borrow().as_slice(),
             [Location {
@@ -1298,13 +1267,37 @@ mod tests {
                 range: None,
             }]
         );
-        // A single click still opens the frame, once the double-click time has passed.
-        click(&v, cx, x, y);
-        let id = snap.frames.get(5).unwrap().id;
-        assert_eq!(
-            events.borrow().last().map(|l| l.selection),
-            Some(Some(Selection::Frame(id)))
-        );
+    }
+
+    /// A click on a lane opens what is under it at once, with no wait for a second click
+    /// (ruling R22); a double-click on a lane is two clicks, and does not clear the range.
+    #[gpui_kit::test]
+    fn lane_click_opens_its_target_immediately(cx: &mut gpui_kit::TestAppContext) {
+        let snap = demo();
+        let (v, cx, _h) = open(cx, snap.clone());
+        let range = range_0_to_4s();
+        v.update(cx, |v, cx| v.set_location(Some(range), cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+        let (events, _sub) = log(cx, &v);
+        let (x, y, _) = point_of(&v, cx, LaneKind::Frames, |h| *h == LaneHit::Frame(5));
+        let opened = Location {
+            page: Page::Tool(Tool::Performance),
+            selection: Some(Selection::Frame(snap.frames.get(5).unwrap().id)),
+            range: Some(range),
+        };
+        // No clock advance and no parking: the location is emitted on mouse-up.
+        v.update(cx, |v, cx| {
+            v.press(x, y, 1, cx);
+            v.released(x, cx);
+        });
+        assert_eq!(*events.borrow(), vec![opened.clone()]);
+        // The second press of a double-click on a lane is another click.
+        v.update(cx, |v, cx| {
+            v.press(x, y, 2, cx);
+            v.released(x, cx);
+        });
+        assert_eq!(*events.borrow(), vec![opened.clone(), opened]);
     }
 
     #[gpui_kit::test]

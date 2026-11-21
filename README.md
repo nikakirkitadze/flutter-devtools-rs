@@ -41,7 +41,8 @@ cargo run -p fdt_app
   "Trace widget builds" in profile mode); and the raw timeline trace.
 - **Timeline**: one zoomable page with frames, requests, logs, route changes, GC and janky-frame
   findings on the same time axis. Click anything to jump to the same moment in the other tools.
-  The UI and raster threads themselves are on the Performance tool's Raw trace tab.
+  Drag across the page to set the time range; double-click its ruler to clear it. The UI and
+  raster threads themselves are on the Performance tool's Raw trace tab.
 
 ## Test app
 

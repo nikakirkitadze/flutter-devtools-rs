@@ -4,6 +4,8 @@ Branch `m3-performance`, built from the commit that precedes this record (`3d0e8
 
 **Final fix wave (after the whole-branch review, 21 November 2026).** The three-reviewer whole-branch review found no critical issue; its important findings were fixed in one wave (commits after `b132b3a`). Where a fix changes a figure in this record, the figure is updated and marked "(final fix wave)"; a figure the wave could change but did not re-measure is marked "pending re-measure". The rest of this record is the Task 26 verification as it was. After the wave: `cargo test --workspace` 902 passed, 0 failed, 12 ignored; `FDT_BUDGETS=strict cargo test --workspace --release -- budget` 28 passed (the two new ones are a contrast test and a capture test whose names contain "budget"); the live `jank_lab` test passed on the second of two profile runs (the first judged 0 frames with tracing on: no janky frame with phases arrived in its window).
 
+**Timeline clicks (ruling R22, after the wave's re-review).** A click on a Timeline lane opens its target at once, on mouse-up. A double-click clears the range only on the Timeline's ruler and on the session strip, as the plan and spec say; on a lane it is two clicks. (The wave had delayed every lane click by 500 ms so that a double-click on a lane could clear the range instead.)
+
 Legend: met, missed, not resolvable (the method cannot see the budget's margin), not measured (and why).
 
 ## Summary and status
