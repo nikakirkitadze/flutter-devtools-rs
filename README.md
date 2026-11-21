@@ -39,8 +39,9 @@ cargo run -p fdt_app
 - **Performance**: frames with their build, raster and GC phases and a one-sentence reason for each
   slow frame; the CPU profile (bottom-up, top-down, flame chart); widget rebuild counts (turn on
   "Trace widget builds" in profile mode); and the raw timeline trace.
-- **Timeline**: one zoomable page with the frames, the UI and raster threads, GC, logs and requests
-  on the same time axis. Click anything to jump to the same moment in the other tools.
+- **Timeline**: one zoomable page with frames, requests, logs, route changes, GC and janky-frame
+  findings on the same time axis. Click anything to jump to the same moment in the other tools.
+  The UI and raster threads themselves are on the Performance tool's Raw trace tab.
 
 ## Test app
 
