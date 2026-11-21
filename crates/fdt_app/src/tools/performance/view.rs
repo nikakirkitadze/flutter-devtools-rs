@@ -93,6 +93,8 @@ pub struct PerformanceView {
     /// The page or a tab was just shown: the next render gives the tab's canvas the focus, so
     /// its keys work without a click.
     focus_pending: bool,
+    /// The tab changed: the next render takes the focus back to the page first.
+    tab_changed: bool,
     _observe: Subscription,
     _subs: Vec<Subscription>,
 }
@@ -143,6 +145,7 @@ impl PerformanceView {
             following: true,
             page_active: false,
             focus_pending: false,
+            tab_changed: false,
             _observe: observe,
             _subs: subs,
         }
@@ -274,6 +277,7 @@ impl PerformanceView {
     pub fn set_tab(&mut self, tab: PerfTab, cx: &mut Context<Self>) {
         if self.tab != tab {
             self.tab = tab;
+            self.tab_changed = true;
             self.focus_pending = self.page_active;
             self.refresh_active(cx);
             cx.notify();
@@ -614,6 +618,11 @@ impl PerformanceView {
 impl Render for PerformanceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::perf::bump(crate::perf::Counter::PerformanceView, 1);
+        // The page takes the focus before the new tab does: the old tab's canvas, if it had it,
+        // is no longer drawn, and keys sent to it would reach none of the shell's handlers.
+        if std::mem::take(&mut self.tab_changed) {
+            window.focus(&self.focus, cx);
+        }
         if self.focus_pending && self.page_active && self.focus_canvas(window, cx) {
             self.focus_pending = false;
         }

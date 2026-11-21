@@ -109,6 +109,8 @@ pub struct MainWindow {
     was_connected: bool,
     /// The session the window last saw, to notice when a new one replaces it.
     session_id: u64,
+    /// The page changed: the next render takes the focus back to the shell first.
+    page_changed: bool,
     _appearance: gpui_kit::Subscription,
     _session_subs: Vec<gpui_kit::Subscription>,
 }
@@ -242,6 +244,7 @@ impl MainWindow {
             _host_failed_wait: host_failed_wait,
             was_connected,
             session_id,
+            page_changed: false,
             _appearance: appearance,
             _session_subs: {
                 let mut subs = vec![observed, connected, selected, net_selected];
@@ -604,6 +607,7 @@ impl MainWindow {
         let before = self.current().page;
         if self.history.navigate(to) {
             self.sync_logs(cx);
+            self.focus_shell_on_page_change(before);
             self.focus_start_if_current(window, cx);
             self.focus_logs_on_entry(before, window, cx);
             self.refresh_counts(cx);
@@ -617,6 +621,24 @@ impl MainWindow {
             self.sync_logs(cx);
             self.refresh_counts(cx);
             cx.notify();
+        }
+    }
+
+    /// The page changed: the shell takes the focus back when it is next drawn, before the new
+    /// page takes it (the pages do in their own render, after the shell's). An element of the old
+    /// page that had it (a canvas) is no longer drawn, and keys sent to an element that is not
+    /// drawn reach none of the shell's handlers, ⌘K and the tool shortcuts included.
+    fn focus_shell_on_page_change(&mut self, before: Page) {
+        self.page_changed |= self.current().page != before;
+    }
+
+    /// See [`MainWindow::focus_shell_on_page_change`]. Done while drawing, where a focus change
+    /// does not redraw every cached view; not while a dialog (the palette) has the focus, which
+    /// goes back to the shell when it closes.
+    fn take_focus_after_page_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.page_changed) && !window.has_active_dialog(cx) {
+            window.focus(&self.focus, cx);
+            self.focus_start_if_current(window, cx);
         }
     }
 
@@ -717,6 +739,7 @@ impl MainWindow {
         let before = self.current().page;
         if self.history.go_back().is_some() {
             self.sync_logs(cx);
+            self.focus_shell_on_page_change(before);
             self.focus_start_if_current(window, cx);
             self.focus_logs_on_entry(before, window, cx);
             self.refresh_counts(cx);
@@ -728,6 +751,7 @@ impl MainWindow {
         let before = self.current().page;
         if self.history.go_forward().is_some() {
             self.sync_logs(cx);
+            self.focus_shell_on_page_change(before);
             self.focus_start_if_current(window, cx);
             self.focus_logs_on_entry(before, window, cx);
             self.refresh_counts(cx);
@@ -760,8 +784,9 @@ impl MainWindow {
 }
 
 impl Render for MainWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::perf::bump(crate::perf::Counter::MainWindow, 1);
+        self.take_focus_after_page_change(window, cx);
         let t = cx.tokens();
         let page: gpui_kit::AnyElement = match self.current().page {
             Page::Start => match &self.start {
@@ -1155,6 +1180,84 @@ mod tests {
         assert!(keyed.span_ns < fit.span_ns, "{keyed:?} vs {fit:?}");
         run_command(cx, &shell, "Zoom In");
         assert!(trace.read_with(cx, |v, _| v.viewport()).span_ns < keyed.span_ns);
+    }
+
+    fn palette_open(cx: &mut gpui_kit::VisualTestContext) -> bool {
+        cx.update(|window, cx| window.has_active_dialog(cx))
+    }
+
+    fn is_focused(cx: &mut gpui_kit::VisualTestContext, focus: &FocusHandle) -> bool {
+        cx.update(|window, _| focus.is_focused(window))
+    }
+
+    /// A canvas that has the focus leaves the screen with its page or tab: the shell takes the
+    /// focus back first, so the global shortcuts keep working with no click.
+    #[gpui_kit::test]
+    fn global_shortcuts_work_after_leaving_a_canvas_page(cx: &mut TestAppContext) {
+        use crate::tools::performance::PerfTab;
+        let (shell, cx) = crate::test_support::open_shell_snapshot(cx, frames_demo());
+        let chart = shell.read_with(cx, |s, cx| {
+            let chart = s.performance_view().read(cx).chart().clone();
+            chart.read(cx).focus_handle().clone()
+        });
+        // Performance: the frame chart takes the focus. Then Memory, which has nothing to focus.
+        press(cx, "cmd-2", "ctrl-2");
+        assert!(is_focused(cx, &chart), "the frame chart has the focus");
+        press(cx, "cmd-3", "ctrl-3");
+        assert_eq!(page(&shell, cx), Page::Tool(Tool::Memory));
+        press(cx, "cmd-k", "ctrl-k");
+        assert!(
+            palette_open(cx),
+            "⌘K opens the palette after leaving the chart"
+        );
+        cx.update(|window, cx| window.close_dialog(cx));
+        cx.run_until_parked();
+        // A tab with no canvas replaces the frame chart.
+        press(cx, "cmd-2", "ctrl-2");
+        assert!(
+            is_focused(cx, &chart),
+            "the frame chart has the focus again"
+        );
+        shell.update(cx, |s, cx| {
+            s.performance_view()
+                .update(cx, |v, cx| v.set_tab(PerfTab::Rebuilds, cx))
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+        press(cx, "cmd-k", "ctrl-k");
+        assert!(
+            palette_open(cx),
+            "⌘K opens the palette after the tab change"
+        );
+        cx.update(|window, cx| window.close_dialog(cx));
+        cx.run_until_parked();
+        press(cx, "cmd-5", "ctrl-5");
+        assert_eq!(page(&shell, cx), Page::Tool(Tool::Logs));
+    }
+
+    /// The Timeline of a session with only logs has its lanes focused; Performance has no frames
+    /// to show, so its page focuses nothing. The shortcuts still work.
+    #[gpui_kit::test]
+    fn global_shortcuts_work_after_a_logs_only_timeline(cx: &mut TestAppContext) {
+        use crate::test_support::{log_at, snapshot};
+        let logs = snapshot(|w, run| {
+            for i in 0..5 {
+                w.push_log(log_at(run, i * 100, fdt_store::logs::LogLevel::Info));
+            }
+        });
+        let (shell, cx) = crate::test_support::open_shell_snapshot(cx, logs);
+        let lanes = shell.read_with(cx, |s, cx| {
+            s.timeline_view().read(cx).focus_handle().clone()
+        });
+        press(cx, "cmd-1", "ctrl-1");
+        assert!(is_focused(cx, &lanes), "the lanes have the focus");
+        press(cx, "cmd-2", "ctrl-2");
+        assert_eq!(page(&shell, cx), Page::Tool(Tool::Performance));
+        press(cx, "cmd-k", "ctrl-k");
+        assert!(
+            palette_open(cx),
+            "⌘K opens the palette after leaving the lanes"
+        );
     }
 
     #[gpui_kit::test]
