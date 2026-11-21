@@ -64,3 +64,13 @@ impl Default for CaptureConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_samples_are_fetched_every_15_s_by_default() {
+        assert_eq!(CaptureConfig::default().cpu_poll, Duration::from_secs(15));
+    }
+}

@@ -6,7 +6,7 @@
 //! ```
 //!
 //! Subscribes to the `Extension` stream only, takes the `build` value (microseconds) of each
-//! `Flutter.Frame` event that started after the subscription (the VM replays older ones), and prints the count, median, mean and p90 once `--frames` were seen.
+//! `Flutter.Frame` event that started after the subscription (the VM replays older ones), and prints the count, median, mean, p90 and p99 (nearest rank) once `--frames` were seen.
 //! Exits 1 if fewer arrive before the timeout.
 
 use std::time::{Duration, Instant};
@@ -88,4 +88,21 @@ async fn main() {
         builds[0],
         builds[builds.len() - 1],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percentile;
+
+    #[test]
+    fn percentiles_are_nearest_rank_over_sorted_builds() {
+        let builds: Vec<i64> = (1..=150).collect();
+        assert_eq!(percentile(&builds, 0.5), 75);
+        assert_eq!(percentile(&builds, 0.9), 135);
+        // ceil(150 * 0.99) = 149, so p99 of 150 frames is the second-largest build.
+        assert_eq!(percentile(&builds, 0.99), 149);
+        assert_eq!(percentile(&builds, 1.0), 150);
+        assert_eq!(percentile(&builds, 0.0), 1);
+        assert_eq!(percentile(&[7], 0.99), 7);
+    }
 }
