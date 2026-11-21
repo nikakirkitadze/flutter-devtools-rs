@@ -19,6 +19,10 @@ bases='Widget|StatelessWidget|StatefulWidget|InheritedWidget|ProxyWidget|ParentD
 # (Column extends Flex extends MultiChildRenderObjectWidget).
 names="$(cat "$lib"/widgets/*.dart "$lib"/material/*.dart "$lib"/cupertino/*.dart \
   | perl -0777 -ne '
+      # Comments hold sample apps (`class MyApp extends StatelessWidget` in a `///` example):
+      # skip block comments and comment lines before matching.
+      s{/\*.*?\*/}{}gs;
+      s{^[ \t]*//.*$}{}mg;
       my %base = map { $_ => 1 } split /\|/, "'"$bases"'";
       my %ext;
       while (/\b(?:abstract\s+|base\s+|final\s+|sealed\s+)*class\s+(\w+)\b(?:<[^{;]*?>)?\s+extends\s+(\w+)/g) { $ext{$1} = $2 }
@@ -72,8 +76,19 @@ mod tests {
         ] {
             assert!(is_framework_widget(n), "{n}");
         }
-        assert!(!is_framework_widget("ProductGrid"));
-        assert!(!is_framework_widget("CartScreen"));
+        // Sample classes in the framework's doc comments are not framework widgets.
+        for n in [
+            "ProductGrid",
+            "CartScreen",
+            "MyApp",
+            "HomePage",
+            "App",
+            "MyWidget",
+            "SecondPage",
+            "MyHomePage",
+        ] {
+            assert!(!is_framework_widget(n), "{n}");
+        }
     }
 
     #[test]
