@@ -265,6 +265,12 @@ impl Router {
             StreamEvent::IsolateStart { isolate }
                 if isolate.name == "main" && !isolate.is_system_isolate =>
             {
+                // The new isolate starts with widget-build tracing off: if it was on, the run's
+                // tracing ends here, until the app confirms it is applied again.
+                if isolate.id != self.main_isolate {
+                    let sink = self.sink.get();
+                    sink.send(Ingest::Tracing(sink.run, false));
+                }
                 self.perf.set_main_isolate(&isolate.id);
                 self.main_isolate = isolate.id;
             }

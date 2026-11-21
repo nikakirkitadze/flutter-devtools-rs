@@ -248,6 +248,62 @@ fn new_session_keeps_the_refresh_budget() {
     });
 }
 
+/// A hot restart starts a main isolate with tracing off: the run's tracing period ends there,
+/// and a new one starts once the app confirms tracing is applied again. Frames in between are
+/// not judged traced.
+#[test]
+fn hot_restart_ends_the_tracing_period_until_reapplied() {
+    use fdt_store::time::SessionTime;
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let server = Sim::new().server_with(&[TRACE]);
+        let cap = start(&server, config(), &rt);
+        common::settle(&cap, Duration::from_millis(100), Duration::from_secs(5)).await;
+        cap.set_trace_widget_builds(true);
+        let on = common::wait_for(&cap, Duration::from_secs(5), "tracing on", |s| {
+            s.runs.last().is_some_and(|r| r.tracing)
+        })
+        .await;
+        let (first_on, _) = on.runs[0].tracing_periods[0];
+        let note = |event: Value| {
+            server.notify(
+                "streamNotify",
+                json!({"streamId": "Isolate", "event": event}),
+            )
+        };
+        let isolate = |id: &str| {
+            json!({"type": "@Isolate", "id": id, "name": "main", "isSystemIsolate": false})
+        };
+        note(json!({"kind": "IsolateExit", "isolate": isolate("isolates/1")}));
+        note(json!({"kind": "IsolateStart", "isolate": isolate("isolates/2")}));
+        let off = common::wait_for(&cap, Duration::from_secs(5), "tracing off", |s| {
+            !s.runs[0].tracing
+        })
+        .await;
+        let run = &off.runs[0];
+        let ended = run.tracing_periods[0].1.expect("the period ended at the restart");
+        assert!(run.tracing_at(first_on), "frames before the restart stay traced");
+        assert!(!run.tracing_at(ended) && !run.tracing_at(SessionTime(u64::MAX)));
+        // The tracing switch appears in the new isolate: tracing is applied again.
+        note(json!({"kind": "ServiceExtensionAdded", "isolate": isolate("isolates/2"),
+            "extensionRPC": TRACE}));
+        let again = common::wait_for(&cap, Duration::from_secs(5), "tracing on again", |s| {
+            s.runs[0].tracing
+        })
+        .await;
+        let run = &again.runs[0];
+        assert_eq!(run.id, on.runs[0].id, "the same run");
+        assert_eq!(run.tracing_periods.len(), 2, "{:?}", run.tracing_periods);
+        let (second_on, second_off) = run.tracing_periods[1];
+        assert!(second_on >= ended && second_off.is_none());
+        assert!(run.tracing_at(SessionTime(u64::MAX)));
+        assert!(server.received().iter().any(|(m, p)| m == TRACE
+            && p["isolateId"] == "isolates/2"
+            && p["enabled"] == "true"));
+        drop(cap);
+    });
+}
+
 #[test]
 fn poll_windows_are_contiguous() {
     let rt = CaptureRuntime::new().unwrap();
