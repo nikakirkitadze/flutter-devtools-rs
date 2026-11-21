@@ -289,7 +289,8 @@ struct Open {
 /// depth when it holds the same trie node (same function, same frames above) and follows within
 /// 2 periods. A span ends at the next sample or at its last sample plus one period, whichever is
 /// first. Output is sorted by start time, then depth, and stops at `max_spans`; the flag says
-/// whether spans were left out.
+/// whether spans were left out. At the cap the spans still open (the outer frames) close at the
+/// time the walk stopped, so the part shown keeps its top rows: room for them is always kept.
 pub fn flame_spans_with_period(
     cpu: &CpuSnapshot,
     range: TimeRange,
@@ -299,20 +300,13 @@ pub fn flame_spans_with_period(
     let period = period_us as u64 * 1000;
     let mut out: Vec<FlameSpan> = Vec::new();
     let mut open: Vec<Option<Open>> = Vec::new();
+    // `out.len() + n_open <= max_spans` always holds, so every open span can still be closed.
+    let mut n_open = 0usize;
     let mut path: Vec<NodeId> = Vec::new();
-    let mut truncated = false;
+    // Where the walk stopped at the cap.
+    let mut stopped: Option<u64> = None;
 
-    // Closes the span at `depth`; false once the cap is hit.
-    let close = |o: Open,
-                 depth: usize,
-                 at: Option<u64>,
-                 out: &mut Vec<FlameSpan>,
-                 truncated: &mut bool|
-     -> bool {
-        if out.len() >= max_spans {
-            *truncated = true;
-            return false;
-        }
+    let close = |o: Open, depth: usize, at: Option<u64>, out: &mut Vec<FlameSpan>| {
         let natural = o.last + period;
         out.push(FlameSpan {
             depth: depth as u16,
@@ -320,7 +314,6 @@ pub fn flame_spans_with_period(
             end: SessionTime(at.map_or(natural, |t| natural.min(t))),
             function: cpu.node(o.node).function,
         });
-        true
     };
 
     'walk: for i in cpu.range(range) {
@@ -347,27 +340,30 @@ pub fn flame_spans_with_period(
                 continue;
             }
             broken = true;
-            if let Some(o) = slot.take()
-                && !close(o, d, Some(t), &mut out, &mut truncated)
-            {
-                break 'walk;
+            if let Some(o) = slot.take() {
+                n_open -= 1;
+                close(o, d, Some(t), &mut out);
             }
-            *slot = want.map(|node| Open {
-                node,
-                start: t,
-                last: t,
-            });
-        }
-    }
-    if !truncated {
-        'flush: for (d, slot) in open.iter_mut().enumerate() {
-            if let Some(o) = slot.take()
-                && !close(o, d, None, &mut out, &mut truncated)
-            {
-                break 'flush;
+            if let Some(node) = want {
+                if out.len() + n_open + 1 > max_spans {
+                    stopped = Some(t);
+                    break 'walk;
+                }
+                *slot = Some(Open {
+                    node,
+                    start: t,
+                    last: t,
+                });
+                n_open += 1;
             }
         }
     }
+    for (d, slot) in open.iter_mut().enumerate() {
+        if let Some(o) = slot.take() {
+            close(o, d, stopped, &mut out);
+        }
+    }
+    let truncated = stopped.is_some();
     out.sort_by_key(|s| (s.start, s.depth));
     (out, truncated)
 }
@@ -655,6 +651,29 @@ mod tests {
         assert_eq!(spans.len(), 5);
         let (spans, cut) = flame_spans(&s, rng(0, 100), 0);
         assert!(cut && spans.is_empty());
+    }
+
+    /// At the cap, the spans still open (the outer frames of the stack) close at the time the
+    /// walk stopped, so the part shown keeps its top rows.
+    #[test]
+    fn truncation_closes_open_spans_at_the_cap() {
+        // A for the whole time; B and C alternate below it every 5 ms.
+        let times: Vec<(f64, bool)> = (0..40).map(|i| (i as f64, (i / 5) % 2 == 0)).collect();
+        let s = flame_fixture(&times);
+        let (spans, cut) = flame_spans(&s, rng(0, 100), 4);
+        assert!(cut);
+        assert!(spans.len() <= 4, "{:?}", view(&s, &spans));
+        let top: Vec<_> = view(&s, &spans).into_iter().filter(|v| v.0 == 0).collect();
+        assert_eq!(top.len(), 1, "{:?}", view(&s, &spans));
+        let (_, name, start, end) = &top[0];
+        assert_eq!((name.as_str(), *start), ("A", 0.0));
+        // Closed at the cap, which is where the last span shown below it ends.
+        let below_end = view(&s, &spans)
+            .iter()
+            .filter(|v| v.0 == 1)
+            .map(|v| v.3)
+            .fold(0.0f64, f64::max);
+        assert_eq!(*end, below_end, "{:?}", view(&s, &spans));
     }
 
     #[test]

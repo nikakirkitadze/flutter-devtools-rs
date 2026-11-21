@@ -60,35 +60,10 @@ pub fn frame_rebuilds(snap: &Snapshot, frame_seq: usize) -> Option<FrameRebuilds
     frame_rebuilds_with(snap, frame_seq, &user_classes(snap))
 }
 
-/// [`frame_rebuilds`] with the CPU user-class set from [`user_classes`], for callers that look at
-/// many frames of one snapshot.
-pub fn frame_rebuilds_with(
-    snap: &Snapshot,
-    frame_seq: usize,
-    user: &HashSet<String>,
-) -> Option<FrameRebuilds> {
-    let frame = snap.frames.get(frame_seq)?;
-    let ui = frame.ui?;
-    let lanes = ui_lanes(snap, frame.run);
-    let window = TimeRange::new(
-        ui.begin,
-        SessionTime(ui.begin.0 + u64::from(ui.ui_us) * 1_000),
-    );
-    // BUILD is found by name and time, at whatever depth it sits.
-    let (build_depth, build) = lanes.iter().enumerate().find_map(|(d, lane)| {
-        lane.range_indices(window)
-            .map(|i| lane.get(i))
-            .find(|s| {
-                s.start >= window.start
-                    && s.end() <= window.end
-                    && snap.timeline.name(s.name) == BUILD
-            })
-            .map(|s| (d, *s))
-    })?;
-    let span = TimeRange::new(build.start, build.end());
-
-    // `levels[k]` holds the slices of lane `build_depth + 1 + k` inside BUILD.
-    let mut nodes: Vec<Node> = Vec::new();
+/// Appends the widget slices below the BUILD at `build_depth` spanning `span`: the slices of each
+/// lane further down that sit inside BUILD and inside a slice one lane up. The BUILD's direct
+/// children are roots. Children come after their parents.
+fn walk_build(lanes: &[LaneSnapshot], build_depth: usize, span: TimeRange, nodes: &mut Vec<Node>) {
     let mut prev: Vec<usize> = Vec::new();
     for lane in lanes.iter().skip(build_depth + 1) {
         let mut cur = Vec::new();
@@ -134,6 +109,57 @@ pub fn frame_rebuilds_with(
             break;
         }
         prev = cur;
+    }
+}
+
+/// [`frame_rebuilds`] with the CPU user-class set from [`user_classes`], for callers that look at
+/// many frames of one snapshot.
+pub fn frame_rebuilds_with(
+    snap: &Snapshot,
+    frame_seq: usize,
+    user: &HashSet<String>,
+) -> Option<FrameRebuilds> {
+    let frame = snap.frames.get(frame_seq)?;
+    let ui = frame.ui?;
+    let lanes = ui_lanes(snap, frame.run);
+    let window = TimeRange::new(
+        ui.begin,
+        SessionTime(ui.begin.0 + u64::from(ui.ui_us) * 1_000),
+    );
+    // Every BUILD in the window that is not inside another one, at whatever depth it sits: the
+    // frame's own BUILD, and those that layout runs for lazily built children (slivers,
+    // `LayoutBuilder`). The assembler's `widgets_built` counts the widgets under all of them.
+    let mut builds: Vec<(usize, TimeRange)> = Vec::new();
+    // Names are interned: once one BUILD is seen, the rest compare by id.
+    let mut build_id: Option<NameId> = None;
+    let mut is_build = |id: NameId| match build_id {
+        Some(b) => id == b,
+        None => {
+            let yes = snap.timeline.name(id) == BUILD;
+            if yes {
+                build_id = Some(id);
+            }
+            yes
+        }
+    };
+    for (d, lane) in lanes.iter().enumerate() {
+        for i in lane.range_indices(window) {
+            let s = lane.get(i);
+            if s.start < window.start || s.end() > window.end || !is_build(s.name) {
+                continue;
+            }
+            // Shallower BUILDs were found first; outermost ones never overlap each other.
+            let inside = builds
+                .iter()
+                .any(|(_, b)| b.start <= s.start && s.end() <= b.end);
+            if !inside {
+                builds.push((d, TimeRange::new(s.start, s.end())));
+            }
+        }
+    }
+    let mut nodes: Vec<Node> = Vec::new();
+    for (build_depth, span) in builds {
+        walk_build(lanes, build_depth, span, &mut nodes);
     }
     if nodes.is_empty() {
         return None;
@@ -274,7 +300,81 @@ pub fn range_rebuilds(
     cancel: &AtomicBool,
 ) -> Option<Vec<WidgetCount>> {
     let seqs = range.map_or(0..snap.frames.len(), |r| snap.frames.range(r));
+    let merged = fold_frames(snap, seqs, &user_classes(snap), cancel)?;
+    let mut out: Vec<WidgetCount> = merged.into_values().collect();
+    sort_widgets(&mut out);
+    Some(out)
+}
+
+/// How long a frame waits for its phases before it counts as final without them (ring loss,
+/// no timeline). Phases normally land within a poll, about 500 ms.
+const SETTLE_NS: u64 = 60_000_000_000;
+
+/// Counts over a time range (or the whole session) kept between snapshots, so that a newer
+/// snapshot folds in only the frames added since. Frames are only ever appended, and a frame's
+/// widget slices land together with its phases, so the frames before `settled` never change.
+#[derive(Clone, Debug, Default)]
+pub struct RebuildTally {
+    merged: HashMap<Arc<str>, WidgetCount>,
+    /// The frames before this seq are in `merged` and final.
+    settled: usize,
+}
+
+/// [`range_rebuilds`], starting from `prev`, an earlier tally of the same scope in the same
+/// session: only the frames from `prev`'s end on are walked. Returns the new tally and the
+/// widgets to show (the tally plus the frames that may still change). `None` when `cancel` was
+/// set.
+pub fn tally_rebuilds(
+    snap: &Snapshot,
+    range: Option<TimeRange>,
+    prev: Option<&RebuildTally>,
+    cancel: &AtomicBool,
+) -> Option<(RebuildTally, Vec<WidgetCount>)> {
+    let seqs = range.map_or(0..snap.frames.len(), |r| snap.frames.range(r));
+    let from = prev.map_or(seqs.start, |p| p.settled.clamp(seqs.start, seqs.end));
+    let latest = snap
+        .frames
+        .len()
+        .checked_sub(1)
+        .and_then(|i| snap.frames.get(i))
+        .map_or(0, |f| f.start.0);
+    let horizon = latest.saturating_sub(SETTLE_NS);
+    // The first frame that may still get its phases (and with them its widget slices).
+    let settled = (from..seqs.end)
+        .find(|&i| {
+            snap.frames
+                .get(i)
+                .is_some_and(|f| f.ui.is_none() && f.start.0 > horizon)
+        })
+        .unwrap_or(seqs.end);
     let user = user_classes(snap);
+    let mut kept = prev.map_or_else(HashMap::new, |p| p.merged.clone());
+    for w in fold_frames(snap, from..settled, &user, cancel)?.into_values() {
+        merge(&mut kept, w);
+    }
+    let mut shown = kept.clone();
+    for w in fold_frames(snap, settled..seqs.end, &user, cancel)?.into_values() {
+        merge(&mut shown, w);
+    }
+    let mut out: Vec<WidgetCount> = shown.into_values().collect();
+    sort_widgets(&mut out);
+    Some((
+        RebuildTally {
+            merged: kept,
+            settled,
+        },
+        out,
+    ))
+}
+
+/// The widgets of the frames `seqs` that built widgets, merged by name. `None` when `cancel` was
+/// set.
+fn fold_frames(
+    snap: &Snapshot,
+    seqs: std::ops::Range<usize>,
+    user: &HashSet<String>,
+    cancel: &AtomicBool,
+) -> Option<HashMap<Arc<str>, WidgetCount>> {
     let merged = seqs
         .into_par_iter()
         .filter(|&i| {
@@ -285,7 +385,7 @@ pub fn range_rebuilds(
         })
         .fold(HashMap::<Arc<str>, WidgetCount>::new, |mut acc, i| {
             if !cancel.load(Ordering::Relaxed)
-                && let Some(fr) = frame_rebuilds_with(snap, i, &user)
+                && let Some(fr) = frame_rebuilds_with(snap, i, user)
             {
                 for w in fr.widgets {
                     merge(&mut acc, w);
@@ -302,9 +402,7 @@ pub fn range_rebuilds(
     if cancel.load(Ordering::Relaxed) {
         return None;
     }
-    let mut out: Vec<WidgetCount> = merged.into_values().collect();
-    sort_widgets(&mut out);
-    Some(out)
+    Some(merged)
 }
 
 fn merge(acc: &mut HashMap<Arc<str>, WidgetCount>, w: WidgetCount) {
@@ -598,6 +696,65 @@ mod tests {
         assert!(r.roots.iter().all(|r| &*r.name != "CollectNewGeneration"));
     }
 
+    /// A scrolling list frame (reviewer B's probe): BUILD with 2 widgets, then LAYOUT holding 3
+    /// lazily built children, each in its own BUILD. Every BUILD counts, as the assembler's
+    /// `widgets_built` does.
+    #[test]
+    fn builds_inside_layout_are_counted() {
+        let (mut w, run) = writer();
+        frame(&mut w, run, 1, 10, 30_000);
+        let begin = 10 * MS;
+        w.set_frame_ui(
+            run,
+            1,
+            UiPhases {
+                begin: SessionTime(begin),
+                ui_us: 24_000,
+                build_us: 3000,
+                layout_us: 18_000,
+                paint_us: 1000,
+                composite_us: 500,
+                finalize_us: 500,
+                widgets_built: Some(2 + 9),
+            },
+        );
+        let ui = w.timeline_track(run, TrackKind::Thread, 1, "io.flutter.ui");
+        w.set_track_order(ui, 0);
+        let mut all = vec![
+            (0, "VsyncProcessCallback", 0, 24_000),
+            (1, "Animator::BeginFrame", 0, 24_000),
+            (2, "BUILD", 0, 3000),
+            (3, "CartBadge", 0, 2000),
+            (4, "Text", 0, 1000),
+            (2, "LAYOUT (root)", 3000, 18_000),
+        ];
+        for k in 0..3u64 {
+            let at = 3100 + k * 5000;
+            all.extend([
+                (3, "BUILD", at, 4800),
+                (4, "ProductTile", at, 4700),
+                (5, "Card", at, 4600),
+                (6, "Text", at, 100),
+            ]);
+        }
+        put_slices(&mut w, ui, begin, all);
+        let s = w.publish();
+        let r = frame_rebuilds(&s, 0).unwrap();
+        let built = s.frames.get(0).unwrap().ui.unwrap().widgets_built;
+        assert_eq!(Some(r.total), built);
+        assert_eq!(r.widgets.iter().map(|w| w.builds).sum::<u32>(), r.total);
+        let builds = |n: &str| r.widgets.iter().find(|w| &*w.name == n).map(|w| w.builds);
+        assert_eq!(
+            (builds("ProductTile"), builds("Card"), builds("Text")),
+            (Some(3), Some(3), Some(4))
+        );
+        // Each lazily built child is its own root.
+        assert_eq!(r.roots.len(), 4);
+        // Only the frame's BUILDs count: a BUILD of the next frame is outside the window.
+        let all = range_rebuilds(&s, None, &AtomicBool::new(false)).unwrap();
+        assert_eq!(all.iter().map(|w| w.builds).sum::<u32>(), 11);
+    }
+
     #[test]
     fn a_frame_without_widget_slices_has_no_rebuilds() {
         let (mut w, run) = writer();
@@ -606,6 +763,43 @@ mod tests {
         let s = w.publish();
         assert!(frame_rebuilds(&s, 1).is_none());
         assert!(frame_rebuilds(&s, 99).is_none());
+    }
+
+    /// Folding only the frames added since the last tally gives the same counts as counting the
+    /// whole scope again, also when a frame's phases (and so its widget slices) land late.
+    #[test]
+    fn incremental_merge_equals_full() {
+        let (mut w, run) = writer();
+        cart_frame(&mut w, run, 1, 10, 10);
+        cart_frame(&mut w, run, 2, 100, 30);
+        // Frame 3's phases have not arrived yet.
+        frame(&mut w, run, 3, 200, 30_000);
+        let cancel = AtomicBool::new(false);
+        let a = w.publish();
+        let (tally, shown) = tally_rebuilds(&a, None, None, &cancel).unwrap();
+        assert_eq!(shown, range_rebuilds(&a, None, &cancel).unwrap());
+        assert_eq!(tally.settled, 2, "frame 3 may still change");
+        // Frame 3's phases and slices land, and frames 4 and 5 follow.
+        cart_frame(&mut w, run, 3, 200, 5);
+        cart_frame(&mut w, run, 4, 300, 7);
+        cart_frame(&mut w, run, 5, 400, 2);
+        let b = w.publish();
+        let (tally, shown) = tally_rebuilds(&b, None, Some(&tally), &cancel).unwrap();
+        assert_eq!(shown, range_rebuilds(&b, None, &cancel).unwrap());
+        assert_eq!(tally.settled, 5);
+        let tile = shown.iter().find(|w| &*w.name == "ProductTile").unwrap();
+        assert_eq!((tile.builds, tile.frames), (54, 5));
+        // A range open at the end.
+        let r = TimeRange::new(SessionTime(150 * MS), SessionTime(10_000 * MS));
+        let (rt, _) = tally_rebuilds(&b, Some(r), None, &cancel).unwrap();
+        cart_frame(&mut w, run, 6, 500, 4);
+        let c = w.publish();
+        let (_, shown) = tally_rebuilds(&c, None, Some(&tally), &cancel).unwrap();
+        assert_eq!(shown, range_rebuilds(&c, None, &cancel).unwrap());
+        let (_, in_range) = tally_rebuilds(&c, Some(r), Some(&rt), &cancel).unwrap();
+        assert_eq!(in_range, range_rebuilds(&c, Some(r), &cancel).unwrap());
+        cancel.store(true, Ordering::Relaxed);
+        assert!(tally_rebuilds(&c, None, Some(&tally), &cancel).is_none());
     }
 
     #[test]

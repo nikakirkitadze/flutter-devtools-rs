@@ -542,6 +542,59 @@ fn reconnect_to_the_same_vm_does_not_duplicate_frames() {
     });
 }
 
+/// The frames table's Widgets column (the assembler's `widgets_built`) and the rebuild analysis
+/// count the same widgets: those under every BUILD of the frame, including the BUILDs that
+/// layout runs for lazily built children, and never a GC pause inside BUILD.
+#[test]
+fn assembler_and_rebuild_analysis_count_the_same_widgets() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let sim = Sim::new();
+        let t = BASE + LATER;
+        let mut events = vec![
+            ev("B", "VsyncProcessCallback", 7, t),
+            framed("B", "Animator::BeginFrame", 7, t + 1, 1),
+            ev("B", "BUILD", 7, t + 2),
+            ev("B", "CartBadge", 7, t + 3),
+            ev("B", "Text", 7, t + 4),
+            ev("E", "Text", 7, t + 5),
+            ev("E", "CartBadge", 7, t + 6),
+            json!({"ph": "B", "name": "CollectNewGeneration", "cat": "GC", "pid": 1, "tid": 7, "ts": t + 7}),
+            json!({"ph": "E", "name": "CollectNewGeneration", "cat": "GC", "pid": 1, "tid": 7, "ts": t + 8}),
+            ev("E", "BUILD", 7, t + 10),
+            ev("B", "LAYOUT (root)", 7, t + 11),
+        ];
+        for k in 0..3 {
+            let b = t + 12 + k * 10;
+            for (i, name) in ["BUILD", "ProductTile", "Card", "Text"].iter().enumerate() {
+                events.push(ev("B", name, 7, b + i as i64));
+            }
+            for (i, name) in ["Text", "Card", "ProductTile", "BUILD"].iter().enumerate() {
+                events.push(ev("E", name, 7, b + 4 + i as i64));
+            }
+        }
+        events.extend([
+            ev("E", "LAYOUT (root)", 7, t + 45),
+            framed("E", "Animator::BeginFrame", 7, t + 46, 1),
+            ev("E", "VsyncProcessCallback", 7, t + 47),
+        ]);
+        sim.push(events);
+        let server = sim.server();
+        let cap = start(&server, config(), &rt);
+        common::settle(&cap, Duration::from_millis(50), Duration::from_secs(5)).await;
+        server.notify("streamNotify", frame_event(1, t + 1, 45));
+        let snap = common::wait_for(&cap, Duration::from_secs(5), "frame phases", |s| {
+            s.frames.get(0).is_some_and(|f| f.ui.is_some())
+        })
+        .await;
+        let built = snap.frames.get(0).unwrap().ui.unwrap().widgets_built;
+        let r = fdt_analysis::rebuilds::frame_rebuilds(&snap, 0).unwrap();
+        assert_eq!(built, Some(11));
+        assert_eq!(Some(r.total), built);
+        drop(cap);
+    });
+}
+
 #[test]
 fn new_session_resets_the_assembler() {
     let rt = CaptureRuntime::new().unwrap();

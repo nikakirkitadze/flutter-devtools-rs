@@ -3,7 +3,7 @@
 use crate::breakdown::{Breakdown, Phase, breakdown};
 use crate::correlate::{Related, related_to_frame};
 use crate::cpu_tree::{FunctionCost, busiest, leaf_counts};
-use crate::rebuilds::{FrameRebuilds, frame_rebuilds};
+use crate::rebuilds::{FrameRebuilds, RootRebuild, frame_rebuilds};
 use crate::user_code::is_user_library;
 use fdt_store::Snapshot;
 use fdt_store::cpu::{CpuStatus, FunctionId, NodeId};
@@ -38,6 +38,8 @@ pub enum Cause {
     },
     Rebuilt {
         root: Arc<str>,
+        /// How many dirty roots of that name rebuilt; `widgets` is their total.
+        roots: u32,
         widgets: u32,
         child: Option<(Arc<str>, u32)>,
     },
@@ -49,7 +51,7 @@ pub enum Cause {
     Phase(Phase),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Explanation {
     pub sentence: String,
     pub cause: Cause,
@@ -196,23 +198,47 @@ fn save_layers(snap: &Snapshot, frame: &FrameRecord) -> u32 {
     n
 }
 
-/// Nanoseconds of garbage collection overlapping `window`, clipped to it.
+/// Nanoseconds the UI thread spent in garbage collection during `window`, clipped to it: the
+/// GC slices of the run's UI track (order 0) at any depth, nested ones counted once. GC on other
+/// threads (concurrent marking, parallel scavenge helpers) did not pause the UI thread.
 fn gc_ns(snap: &Snapshot, frame: &FrameRecord, window: TimeRange) -> u64 {
-    let mut total = 0u64;
-    for t in snap.timeline.tracks().iter().filter(|t| t.run == frame.run) {
-        let Some(lane) = snap.timeline.lanes(t.id).first() else {
-            continue;
-        };
+    let Some(ui) = snap
+        .timeline
+        .tracks()
+        .iter()
+        .find(|t| t.run == frame.run && t.order == 0)
+    else {
+        return 0;
+    };
+    let mut spans: Vec<(u64, u64)> = Vec::new();
+    for lane in snap.timeline.lanes(ui.id) {
         for i in lane.range_indices(window) {
             let s = lane.get(i);
             if s.cat != SliceCat::Gc {
                 continue;
             }
             let (a, b) = (s.start.0.max(window.start.0), s.end().0.min(window.end.0));
-            total += b.saturating_sub(a);
+            if b > a {
+                spans.push((a, b));
+            }
         }
     }
-    total
+    // The union of the spans: a GC phase nested in a GC pause is part of that pause.
+    spans.sort_unstable();
+    let mut total = 0u64;
+    let mut open: Option<(u64, u64)> = None;
+    for (a, b) in spans {
+        match &mut open {
+            Some((_, end)) if a <= *end => *end = (*end).max(b),
+            _ => {
+                if let Some((s, e)) = open {
+                    total += e - s;
+                }
+                open = Some((a, b));
+            }
+        }
+    }
+    total + open.map_or(0, |(s, e)| e - s)
 }
 
 struct Hot {
@@ -417,23 +443,34 @@ fn pick(
             );
         }
         // 6
-        if let Some(root) = r.roots.first() {
-            let n = group(u64::from(root.widgets));
-            let s = match &root.largest_child {
-                Some((c, m)) => format!(
+        if let Some((root, count, widgets)) = biggest_root_group(r) {
+            let n = group(u64::from(widgets));
+            // One root names its largest child, when that child is a real share of the rebuild.
+            let child = root
+                .largest_child
+                .clone()
+                .filter(|(_, m)| count == 1 && *m >= 2 && u64::from(*m) * 4 >= u64::from(widgets));
+            let s = match (&child, count) {
+                (_, c) if c > 1 => format!(
+                    "{} {} widgets rebuilt {n} widgets.",
+                    group(u64::from(c)),
+                    cut(&root.name)
+                ),
+                (Some((c, m)), _) => format!(
                     "{} rebuilt {n} widgets, including {} ({}).",
                     cut(&root.name),
                     cut(c),
                     group(u64::from(*m))
                 ),
-                None => format!("{} rebuilt {n} widgets.", cut(&root.name)),
+                (None, _) => format!("{} rebuilt {n} widgets.", cut(&root.name)),
             };
             return (
                 s,
                 Cause::Rebuilt {
                     root: root.name.clone(),
-                    widgets: root.widgets,
-                    child: root.largest_child.clone(),
+                    roots: count,
+                    widgets,
+                    child,
                 },
             );
         }
@@ -444,12 +481,22 @@ fn pick(
         && let Some(hot) = hot_function(snap, pw)
     {
         let name = snap.cpu.function(hot.function).name.clone();
-        let s = format!(
-            "{} ran for most of the {} ({:.0}% of samples).",
-            cut(&name),
-            phase_name(over),
-            hot.share * 100.0
-        );
+        // "Most of" needs at least half of the samples.
+        let s = if hot.share >= 0.5 {
+            format!(
+                "{} ran for most of the {} ({:.0}% of samples).",
+                cut(&name),
+                phase_name(over),
+                hot.share * 100.0
+            )
+        } else {
+            format!(
+                "{} was the busiest function in the {} ({:.0}% of samples).",
+                cut(&name),
+                phase_name(over),
+                hot.share * 100.0
+            )
+        };
         return (
             s,
             Cause::HotFunction {
@@ -466,10 +513,31 @@ fn pick(
         format_ms(u64::from(phase_us(bd, over))),
         times_budget(phase_us(bd, over), budget)
     );
-    if over == Phase::Build {
+    // With tracing on there is nothing to turn on: no rebuild was traced in this frame.
+    if over == Phase::Build && !snap.run(frame.run).is_some_and(|r| r.tracing) {
         s.push_str(" Turn on Trace widget builds to see which widgets rebuilt.");
     }
     (s, Cause::Phase(over))
+}
+
+/// The dirty roots grouped by name: the group with the most widgets in total, as `(its first
+/// root, how many roots, their widgets)`. Ties go to the group seen first (the biggest root).
+fn biggest_root_group(r: &FrameRebuilds) -> Option<(&RootRebuild, u32, u32)> {
+    let mut groups: Vec<(&RootRebuild, u32, u32)> = Vec::new();
+    let mut at: HashMap<&str, usize> = HashMap::new();
+    for root in &r.roots {
+        match at.get(&*root.name) {
+            Some(&i) => {
+                groups[i].1 += 1;
+                groups[i].2 = groups[i].2.saturating_add(root.widgets);
+            }
+            None => {
+                at.insert(&root.name, groups.len());
+                groups.push((root, 1, root.widgets));
+            }
+        }
+    }
+    groups.into_iter().rev().max_by_key(|g| g.2)
 }
 
 #[cfg(test)]
@@ -636,28 +704,100 @@ mod tests {
         assert_eq!(e.cause, Cause::Phase(Phase::Raster));
     }
 
+    /// A GC pause on the UI thread, nested where the VM puts it (inside the frame's work).
+    fn ui_gc(w: &mut SessionWriter, t: &Tracks, start: u64, at_us: u64, dur_us: u64) {
+        put(
+            w,
+            t.ui,
+            0,
+            "VsyncProcessCallback",
+            start,
+            0,
+            24_000,
+            SliceCat::Dart,
+        );
+        put(
+            w,
+            t.ui,
+            1,
+            "Animator::BeginFrame",
+            start,
+            0,
+            24_000,
+            SliceCat::Dart,
+        );
+        put(w, t.ui, 2, "BUILD", start, 0, 14_000, SliceCat::Dart);
+        let s = Slice {
+            start: SessionTime(start + at_us * 1000),
+            dur_ns: dur_us * 1000,
+            name: w.intern_name("CollectNewGeneration"),
+            cat: SliceCat::Gc,
+        };
+        assert!(w.push_slice(t.ui, 3, s, false));
+        // The scavenge's own phases sit below it: counted once.
+        let s = Slice {
+            start: SessionTime(start + (at_us + 100) * 1000),
+            dur_ns: (dur_us / 2) * 1000,
+            name: w.intern_name("ScavengeRoots"),
+            cat: SliceCat::Gc,
+        };
+        assert!(w.push_slice(t.ui, 4, s, false));
+    }
+
     #[test]
     fn rule_4_garbage_collection() {
         let (mut w, run) = writer();
         let start = put_frame(&mut w, run, 1, BUILD_OVER, 3000);
         let t = tracks(&mut w, run);
-        // 8 ms of the 24 ms of UI work, one third.
-        put(
-            &mut w,
-            t.worker,
-            0,
-            "CollectNewGeneration",
-            start,
-            2000,
-            8000,
-            SliceCat::Gc,
-        );
+        // 8 ms of the 24 ms of UI work, one third, paused on the UI thread inside BUILD.
+        ui_gc(&mut w, &t, start, 2000, 8000);
         let e = explain_of(&mut w, 0);
         assert_eq!(
             e.sentence,
             "Garbage collection ran for 8.0 ms during this frame's 24 ms of UI work."
         );
         assert_eq!(e.cause, Cause::Gc { gc_ns: 8_000_000 });
+    }
+
+    /// Concurrent marking and parallel scavenge helpers run on worker threads: the UI thread did
+    /// not pause for them.
+    #[test]
+    fn rule_4_ignores_gc_on_worker_threads() {
+        let (mut w, run) = writer();
+        let start = put_frame(&mut w, run, 1, BUILD_OVER, 3000);
+        let t = tracks(&mut w, run);
+        put(
+            &mut w,
+            t.ui,
+            0,
+            "VsyncProcessCallback",
+            start,
+            0,
+            24_000,
+            SliceCat::Dart,
+        );
+        put(
+            &mut w,
+            t.worker,
+            0,
+            "ConcurrentMark",
+            start,
+            2000,
+            7000,
+            SliceCat::Gc,
+        );
+        put(
+            &mut w,
+            t.raster,
+            0,
+            "Scavenge",
+            start,
+            2000,
+            7000,
+            SliceCat::Gc,
+        );
+        let e = explain_of(&mut w, 0);
+        assert!(!matches!(e.cause, Cause::Gc { .. }), "{}", e.sentence);
     }
 
     /// BUILD (14 ms) holding `HeavyList` (12 ms, 2 ms of it in `Small`).
@@ -763,6 +903,7 @@ mod tests {
             e.cause,
             Cause::Rebuilt {
                 root: "Cart".into(),
+                roots: 1,
                 widgets: 4,
                 child: Some(("CartBadge".into(), 2)),
             }
@@ -796,6 +937,111 @@ mod tests {
         put(&mut w, t.ui, 3, "B", start, 4000, 3000, SliceCat::Dart);
         let e = explain_of(&mut w, 0);
         assert_eq!(e.sentence, "A rebuilt 1 widgets.");
+    }
+
+    /// BUILD (14 ms) at depth 2 of the UI track, under the frame's two outer slices.
+    fn open_build(w: &mut SessionWriter, t: &Tracks, start: u64) {
+        put(
+            w,
+            t.ui,
+            0,
+            "VsyncProcessCallback",
+            start,
+            0,
+            24_000,
+            SliceCat::Dart,
+        );
+        put(
+            w,
+            t.ui,
+            1,
+            "Animator::BeginFrame",
+            start,
+            0,
+            24_000,
+            SliceCat::Dart,
+        );
+        put(w, t.ui, 2, "BUILD", start, 0, 14_000, SliceCat::Dart);
+    }
+
+    /// Reviewer B's probe: 40 separately dirty tiles (one `context.watch` each) of 5 widgets.
+    #[test]
+    fn rule_6_many_roots_of_one_name_are_counted_together() {
+        let (mut w, run) = writer();
+        let start = put_frame(&mut w, run, 1, BUILD_OVER, 3000);
+        let t = tracks(&mut w, run);
+        open_build(&mut w, &t, start);
+        let d = SliceCat::Dart;
+        for i in 0..40u64 {
+            let at = i * 300;
+            put(&mut w, t.ui, 3, "ProductTile", start, at, 290, d);
+            put(&mut w, t.ui, 4, "Card", start, at, 280, d);
+            put(&mut w, t.ui, 5, "Row", start, at, 270, d);
+            put(&mut w, t.ui, 6, "Text", start, at, 100, d);
+            put(&mut w, t.ui, 6, "PriceTag", start, at + 150, 100, d);
+        }
+        // A bigger single root of another name does not outweigh the 40 tiles.
+        put(&mut w, t.ui, 3, "Header", start, 12_100, 1000, d);
+        for i in 0..9u64 {
+            put(&mut w, t.ui, 4, "Text", start, 12_100 + i * 100, 50, d);
+        }
+        let e = explain_of(&mut w, 0);
+        assert_eq!(e.sentence, "40 ProductTile widgets rebuilt 200 widgets.");
+        assert_eq!(
+            e.cause,
+            Cause::Rebuilt {
+                root: "ProductTile".into(),
+                roots: 40,
+                widgets: 200,
+                child: None,
+            }
+        );
+    }
+
+    /// One root: the child is named only when it is a real share of the rebuild.
+    #[test]
+    fn rule_6_names_a_child_only_when_it_is_a_quarter_or_more() {
+        let sentence = |kids: &[(&str, u64)]| {
+            let (mut w, run) = writer();
+            let start = put_frame(&mut w, run, 1, BUILD_OVER, 3000);
+            let t = tracks(&mut w, run);
+            open_build(&mut w, &t, start);
+            let d = SliceCat::Dart;
+            // Tight parents, so that no widget's own time dominates the build (rule 5).
+            let width: u64 = kids.iter().map(|&(_, size)| size * 10 + 10).sum();
+            put(&mut w, t.ui, 3, "RootShell", start, 0, width + 10, d);
+            put(&mut w, t.ui, 4, "Column", start, 0, width, d);
+            let mut at = 0;
+            for &(name, size) in kids {
+                // `name` holds `size - 1` framework Texts.
+                put(&mut w, t.ui, 5, name, start, at, size * 10, d);
+                for k in 1..size {
+                    put(&mut w, t.ui, 6, "Text", start, at + k * 10 - 5, 4, d);
+                }
+                at += size * 10 + 10;
+            }
+            explain_of(&mut w, 0).sentence
+        };
+        let with_texts = |first: (&'static str, u64), texts: usize| {
+            let mut kids = vec![first];
+            kids.extend(std::iter::repeat_n(("Text", 1), texts));
+            kids
+        };
+        // The only user widget below the root is a leaf: not worth naming.
+        assert_eq!(
+            sentence(&with_texts(("PriceTag", 1), 10)),
+            "RootShell rebuilt 13 widgets."
+        );
+        // 3 of 13 is under a quarter...
+        assert_eq!(
+            sentence(&with_texts(("PriceTag", 3), 8)),
+            "RootShell rebuilt 13 widgets."
+        );
+        // ...and 4 of 14 is not.
+        assert_eq!(
+            sentence(&with_texts(("PriceTag", 4), 8)),
+            "RootShell rebuilt 14 widgets, including PriceTag (4)."
+        );
     }
 
     /// Ten samples in the BUILD phase of frame 1: `a` with the stack `[framework, outer]` and `b`
@@ -844,6 +1090,44 @@ mod tests {
             "innerWork ran for most of the build (90% of samples)."
         );
         assert_eq!(e.functions.len(), 3);
+    }
+
+    /// Twenty samples in the build, `user` of them in `ProductTile.build` and the rest in
+    /// framework code.
+    fn shared_build(user: u64) -> String {
+        let (mut w, run) = writer();
+        let start = put_frame(&mut w, run, 1, BUILD_OVER, 3000);
+        let fw = w.intern_function("buildScope", Some(FW));
+        let tile = w.intern_function("ProductTile.build", Some(APP));
+        let other = w.intern_function("Element.updateChild", Some(FW));
+        let a = w.intern_stack(&[fw, tile]);
+        let b = w.intern_stack(&[fw, other]);
+        let samples = (0..20u64)
+            .map(|i| CpuSample {
+                time: SessionTime(start + (i + 1) * 600_000),
+                leaf: if i < user { a } else { b },
+            })
+            .collect();
+        w.push_cpu_samples(run, samples);
+        w.set_cpu_coverage(run, SessionTime(start + 100 * MS));
+        w.set_cpu_status(run, CpuStatus::On);
+        explain_of(&mut w, 0).sentence
+    }
+
+    #[test]
+    fn rule_7_says_most_only_from_half_of_the_samples() {
+        assert_eq!(
+            shared_build(10),
+            "ProductTile.build ran for most of the build (50% of samples)."
+        );
+        assert_eq!(
+            shared_build(9),
+            "ProductTile.build was the busiest function in the build (45% of samples)."
+        );
+        assert_eq!(
+            shared_build(3),
+            "ProductTile.build was the busiest function in the build (15% of samples)."
+        );
     }
 
     #[test]
@@ -899,22 +1183,23 @@ mod tests {
         );
     }
 
+    /// With tracing on, a build with no traced rebuilds gets no hint to turn tracing on.
+    #[test]
+    fn rule_8_hint_only_while_tracing_is_off() {
+        let (mut w, run) = writer();
+        w.set_tracing(run, true);
+        put_frame(&mut w, run, 1, ([20_000, 500, 500, 500, 500], 22_000), 3000);
+        let e = explain_of(&mut w, 0);
+        assert_eq!(e.sentence, "Build took 20 ms, 1.2× the budget.");
+    }
+
     #[test]
     fn rules_are_ordered() {
         // Raster beats GC.
         let (mut w, run) = writer();
         let start = put_frame(&mut w, run, 1, BUILD_OVER, 40_000);
         let t = tracks(&mut w, run);
-        put(
-            &mut w,
-            t.worker,
-            0,
-            "CollectNewGeneration",
-            start,
-            2000,
-            8000,
-            SliceCat::Gc,
-        );
+        ui_gc(&mut w, &t, start, 2000, 8000);
         assert_eq!(
             explain_of(&mut w, 0).sentence,
             "Raster took 40 ms, 2.4× the budget."
@@ -924,16 +1209,14 @@ mod tests {
         let start = put_frame(&mut w, run, 1, BUILD_OVER, 3000);
         let t = tracks(&mut w, run);
         heavy_build(&mut w, &t, start);
-        put(
-            &mut w,
-            t.worker,
-            0,
-            "CollectNewGeneration",
-            start,
-            14_000,
-            8000,
-            SliceCat::Gc,
-        );
+        // A pause during the frame's compositing, after BUILD.
+        let s = Slice {
+            start: SessionTime(start + 14_000 * 1000),
+            dur_ns: 8000 * 1000,
+            name: w.intern_name("CollectNewGeneration"),
+            cat: SliceCat::Gc,
+        };
+        assert!(w.push_slice(t.ui, 2, s, false));
         assert!(matches!(explain_of(&mut w, 0).cause, Cause::Gc { .. }));
         // A dominant widget beats the rebuilt roots (both match), and rebuilt beats a hot
         // function.

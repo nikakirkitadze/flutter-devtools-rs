@@ -488,7 +488,8 @@ fn close(
 ) {
     let dur = end.saturating_sub(open.start).max(0);
     stack.has_slice = true;
-    let widget = open.under_build;
+    // Widget builds are Dart slices: a GC pause inside BUILD is not one (as in the analysis).
+    let widget = open.under_build && open.cat == Category::Dart;
     if widget {
         stack.widget_count += 1;
     }
