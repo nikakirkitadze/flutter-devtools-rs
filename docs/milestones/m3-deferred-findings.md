@@ -43,3 +43,30 @@ These are review findings that were deliberately not fixed in M3. The per-task r
 ## Carried from M2 and still open
 
 See `m2-deferred-findings.md`. Items closed in M3 (Task 1 and the plan's "Inputs carried in"): the streaming bench scenario (`live-logs`), the tail log chunk copy, the incremental level counts, the Logs match count that disappeared during every incremental job, the capture host's dependence on a drawn frame, and profiling left on after disconnect. The rest (Windows and Linux paths, the token in `settings.json`, decompression-bomb PNGs) is unchanged.
+
+## Parked after the final fix wave and the residual fix round
+
+The residual round, user-approved before the merge, fixed these:
+- the 500 ms delay on every Timeline lane click: lane clicks act at once, and a double-click clears the range on the ruler;
+- frames recorded before tracing reading "None of your app's widgets rebuilt": tracing is judged at each frame's start, and a hot restart ends the tracing period;
+- canvases keeping keyboard focus after leaving the screen: the shell takes focus back on every page and tab change.
+
+The items below are parked for M4.
+
+- **Focus.**
+  - ⌘N while disconnected, or on the Frames tab with an idle app, can still leave focus on a canvas that is no longer drawn.
+  - `focus_pending` stays set while a page is empty, so the first data to arrive takes focus, even from the palette input.
+  - After any palette command on the Timeline or Performance page, canvas keys (⌘=, ⌘-, ←, →) need a click again.
+  - The Performance page's tab-change refocus has no dialog guard, and can pull focus out of the palette after a reconnect.
+  - Esc after an app connects while the palette is open on Start returns focus to the Start list, which is no longer drawn.
+- **Tracing stamps.**
+  - The "off" stamp is taken when the app confirms, about one round trip late, so a frame in that gap can say "None … rebuilt". Fix: stamp "off" when the request is sent.
+  - During the gap after a hot restart, before tracing is re-applied, the toolbar and Rebuilds switches show "off", and a click is a no-op because tracing is still wanted. The rebuild hint and button also show.
+  - A pre-restart apply still in flight can land after the router's "off". `Reapply` corrects it.
+- **Rebuilds.**
+  - The build-cap note is session-wide, so it shows on frames from before the cap that rebuilt nothing.
+  - A Settings default changed while connected overrides a later toolbar choice at the next user connect.
+  - The Rebuilds tab keeps one tally slot (`kept: Option<Kept>`), so switching scope and back recomputes in full.
+- **Code hygiene.**
+  - `cpu_tab.rs:778-779`: `flame_shown` carries `has_result`'s doc line.
+  - `scripts/gen-framework-widgets.sh` strips block comments with `s{/\*.*?\*/}{}gs`. That would delete real code if a Dart string literal held `/*`. It is fine for Flutter 3.47.9.
