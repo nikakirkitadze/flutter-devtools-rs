@@ -478,7 +478,6 @@ impl CpuTab {
         }
     }
 
-    #[cfg(test)]
     pub fn mode(&self) -> CpuMode {
         self.mode
     }
@@ -777,6 +776,11 @@ impl CpuTab {
     }
 
     /// Whether the latest result is for the mode on screen.
+    /// Whether the flame chart is on screen (the next render draws it).
+    pub fn flame_shown(&self, cx: &App) -> bool {
+        self.mode == CpuMode::Flame && self.sample_count(cx) > 0 && self.has_result()
+    }
+
     fn has_result(&self) -> bool {
         self.result
             .as_ref()

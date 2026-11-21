@@ -39,6 +39,8 @@ pub(crate) enum Command {
     SetBodyLimits(BodyLimits),
     FetchCpuNow,
     SetTraceWidgetBuilds(bool),
+    /// The settings' default for widget-build tracing changed.
+    SetTraceDefault(bool),
     /// Sent when the `Capture` is dropped.
     Shutdown,
 }
@@ -126,6 +128,12 @@ impl Capture {
         self.command(Command::SetTraceWidgetBuilds(on));
     }
 
+    /// The default for widget-build tracing changed (the "Trace widget builds by default"
+    /// setting): the next connection starts with it. A live connection is left as it is.
+    pub fn set_trace_default(&self, on: bool) {
+        self.command(Command::SetTraceDefault(on));
+    }
+
     pub fn status(&self) -> watch::Receiver<ConnStatus> {
         self.status.clone()
     }
@@ -168,6 +176,8 @@ pub(crate) struct Session {
     /// Whether widget builds should be traced, whatever the connection (from the settings, then
     /// the command).
     wanted_tracing: bool,
+    /// The default changed while a connection was live: the next user connect starts from it.
+    trace_default_pending: bool,
     /// Whether the app answered that tracing is on, for runs that start on this connection.
     pub(crate) tracing_actual: bool,
 }
@@ -183,6 +193,7 @@ impl Session {
     ) -> Session {
         Session {
             wanted_tracing: cfg.trace_widget_builds,
+            trace_default_pending: false,
             cfg,
             discovery,
             tx,
@@ -220,6 +231,9 @@ impl Session {
                     // Automatic reconnects and retries call `begin_connect` directly.
                     Some(SessionMsg::Command(Command::Connect(t))) => {
                         self.restore_profiling().await;
+                        if std::mem::take(&mut self.trace_default_pending) {
+                            self.wanted_tracing = self.cfg.trace_widget_builds;
+                        }
                         self.begin_connect(t, false);
                     }
                     Some(SessionMsg::Command(Command::Disconnect)) => {
@@ -317,6 +331,16 @@ impl Session {
                 self.wanted_tracing = on;
                 if let Some(p) = &self.perf {
                     p.set_tracing(on);
+                }
+            }
+            Command::SetTraceDefault(on) => {
+                self.cfg.trace_widget_builds = on;
+                // No live connection: the next one starts with it. A live one keeps what it has
+                // until the user connects again.
+                if self.perf.is_none() {
+                    self.wanted_tracing = on;
+                } else {
+                    self.trace_default_pending = true;
                 }
             }
             Command::StopWaiting => self.stop_waiting(),

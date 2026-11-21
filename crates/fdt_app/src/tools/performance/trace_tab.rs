@@ -603,6 +603,15 @@ impl TraceView {
         cx.notify();
     }
 
+    /// A zoom command, from the trace's own keys or handed over by the shell (the palette).
+    pub fn key_zoom(&mut self, z: crate::tools::KeyZoom, cx: &mut Context<Self>) {
+        match z {
+            crate::tools::KeyZoom::In => self.zoom_key(KEY_ZOOM, cx),
+            crate::tools::KeyZoom::Out => self.zoom_key(1.0 / KEY_ZOOM, cx),
+            crate::tools::KeyZoom::Fit => self.zoom_to_fit(cx),
+        }
+    }
+
     pub fn zoom_to_fit(&mut self, cx: &mut Context<Self>) {
         self.fit();
         self.scroll_y = 0.0;

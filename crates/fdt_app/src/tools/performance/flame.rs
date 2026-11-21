@@ -355,6 +355,15 @@ impl FlameChart {
         self.fitted = true;
     }
 
+    /// A zoom command, from the chart's own keys or handed over by the shell (the palette).
+    pub fn key_zoom(&mut self, z: crate::tools::KeyZoom, cx: &mut Context<Self>) {
+        match z {
+            crate::tools::KeyZoom::In => self.zoom_key(KEY_ZOOM, cx),
+            crate::tools::KeyZoom::Out => self.zoom_key(1.0 / KEY_ZOOM, cx),
+            crate::tools::KeyZoom::Fit => self.zoom_to_fit(cx),
+        }
+    }
+
     pub fn zoom_to_fit(&mut self, cx: &mut Context<Self>) {
         self.fit();
         self.row_offset = 0;

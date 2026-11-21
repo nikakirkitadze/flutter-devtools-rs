@@ -339,6 +339,8 @@ pub(crate) struct NetStore {
     host_set: HashSet<String>,
     hosts_cache: Arc<[String]>,
     hosts_changed: bool,
+    /// Bumped by every request added or changed in place.
+    request_updates: u64,
     limits: BodyLimits,
     bodies: VecDeque<(EntryId, BodyKind, usize)>,
     body_bytes: usize,
@@ -359,6 +361,7 @@ impl NetStore {
             host_set: HashSet::new(),
             hosts_cache: Arc::from(Vec::new()),
             hosts_changed: false,
+            request_updates: 0,
             limits: BodyLimits::default(),
             bodies: VecDeque::new(),
             body_bytes: 0,
@@ -393,6 +396,7 @@ impl NetStore {
                 (idx, done)
             }
         };
+        self.request_updates += 1;
         let rec = self.requests.get(idx).expect("just stored");
         if rec.is_error() {
             self.lod.raise(rec.start, 1);
@@ -565,6 +569,7 @@ impl NetStore {
         rec.end = Some(at.max(rec.start));
         rec.error = Some(error.to_string());
         rec.ended_locally = true;
+        self.request_updates += 1;
         if rec.is_error() {
             let start = rec.start;
             self.lod.raise(start, 1);
@@ -651,6 +656,7 @@ impl NetStore {
             hosts: self.hosts_cache.clone(),
             body_bytes: self.body_bytes,
             latest,
+            request_updates: self.request_updates,
         }
     }
 }
@@ -663,6 +669,7 @@ pub struct NetSnapshot {
     hosts: Arc<[String]>,
     body_bytes: usize,
     latest: SessionTime,
+    request_updates: u64,
 }
 
 impl Default for NetSnapshot {
@@ -674,11 +681,18 @@ impl Default for NetSnapshot {
             hosts: Arc::from(Vec::new()),
             body_bytes: 0,
             latest: SessionTime(0),
+            request_updates: 0,
         }
     }
 }
 
 impl NetSnapshot {
+    /// Changes whenever a request is added or changes in place (it completes, fails, gets a
+    /// status), so a view that keeps derived copies of requests can tell they went stale.
+    pub fn request_updates(&self) -> u64 {
+        self.request_updates
+    }
+
     /// Level-of-detail summary of the requests by start time. A bucket's `count` is its
     /// requests; `max_us == 1` marks a bucket holding an error.
     pub fn lod(&self) -> &LodSnapshot {

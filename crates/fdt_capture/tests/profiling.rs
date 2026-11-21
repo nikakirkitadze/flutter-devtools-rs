@@ -259,6 +259,45 @@ fn wanted_before_connect_is_kept() {
     });
 }
 
+/// The "trace widget builds by default" setting changes after the capture started: the next
+/// connect uses the new default, and a connection in progress is left as it is.
+#[test]
+fn a_changed_default_applies_at_the_next_connect() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        // Changed before any connect: the first connect traces.
+        let sim = Sim::new(false);
+        let server = sim.server();
+        let cap = Capture::start(rt.handle(), config(), None);
+        cap.set_trace_default(true);
+        cap.connect(Target::Uri(
+            VmServiceUri::parse(server.ws_uri().as_str()).unwrap(),
+        ));
+        common::wait_for(&cap, SECS5, "tracing on", tracing_on).await;
+        drop(cap);
+
+        // Changed while connected: this connection keeps tracing off, the next one traces.
+        let sim = Sim::new(false);
+        let server = sim.server();
+        let cap = connected(&server, config(), &rt).await;
+        cap.set_trace_default(true);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            sets(&server, TRACE, true),
+            0,
+            "the live connection is left alone"
+        );
+        cap.connect(Target::Uri(
+            VmServiceUri::parse(server.ws_uri().as_str()).unwrap(),
+        ));
+        common::eventually(SECS5, "tracing turned on", || {
+            sets(&server, TRACE, true) > 0
+        })
+        .await;
+        drop(cap);
+    });
+}
+
 #[test]
 fn hot_restart_reapplies_tracing() {
     let rt = CaptureRuntime::new().unwrap();

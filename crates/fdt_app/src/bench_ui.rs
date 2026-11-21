@@ -707,10 +707,10 @@ impl Script {
             Scenario::LivePerf => {
                 let chart = shell.read(cx).performance_view().read(cx).chart().read(cx);
                 let grown = seen.rows.saturating_sub(seen.rows0);
-                let expected = self.started.map_or(0, |t| {
-                    (t.elapsed().as_millis() / LIVE_EVERY.as_millis()) as usize
-                });
-                let want = LIVE_FRAMES.max(LIVE_FRAMES * expected / 10);
+                // Counted in steps, not wall-clock time: a slow machine takes fewer steps in the
+                // same time, and the feed is not the thing measured. A tenth of one publish per
+                // step (the feed publishes about every other frame at 120 Hz).
+                let want = LIVE_FRAMES.max(LIVE_FRAMES * self.frame / 10);
                 if grown < want {
                     Err(format!(
                         "the session grew by {grown} frames, expected at least {want}"
@@ -1171,6 +1171,7 @@ impl crate::capture_host::CaptureControl for LiveFeed {
     fn set_body_limits(&self, _: fdt_store::net::BodyLimits) {}
     fn fetch_cpu_samples(&self) {}
     fn set_trace_widget_builds(&self, _on: bool) {}
+    fn set_trace_default(&self, _on: bool) {}
     fn status(&self) -> tokio::sync::watch::Receiver<ConnStatus> {
         self.status.clone()
     }
@@ -1895,6 +1896,16 @@ mod tests {
     /// Steps `LivePerf` over a session a [`fdt_store::synth::PerfFeed`] keeps growing by
     /// `per_step` frames before each step.
     fn run_live_perf(cx: &mut TestAppContext, per_step: usize, len: usize) -> Script {
+        run_live_perf_paced(cx, per_step, len, Duration::ZERO)
+    }
+
+    /// [`run_live_perf`] with `pause` of wall-clock time after each step, as on a loaded machine.
+    fn run_live_perf_paced(
+        cx: &mut TestAppContext,
+        per_step: usize,
+        len: usize,
+        pause: Duration,
+    ) -> Script {
         use crate::test_support::open_shell_fake;
         let (shell, vcx, handle) = open_shell_fake(cx);
         let (mut w, run) = fdt_store::synth::writer(3, 0, 0, 0);
@@ -1913,6 +1924,9 @@ mod tests {
                 script.step(&shell, window, cx);
             });
             vcx.run_until_parked();
+            if !pause.is_zero() {
+                std::thread::sleep(pause);
+            }
             if script.is_done() {
                 break;
             }
@@ -1930,6 +1944,15 @@ mod tests {
         assert!(rows >= 600 + 10 * LIVE_FRAMES, "{rows} frames");
         assert!(s.seen.rows - s.seen.rows0 >= 10 * LIVE_FRAMES);
         assert!(s.seen.followed);
+    }
+
+    /// Reviewer C's reproduction of the known flake: 200 ms of wall-clock time per step (a debug
+    /// build under workspace load). The growth asked for follows the steps, not the clock.
+    #[gpui_kit::test]
+    fn live_perf_passes_on_a_slow_machine(cx: &mut TestAppContext) {
+        let s = run_live_perf_paced(cx, LIVE_FRAMES, 10, Duration::from_millis(200));
+        assert!(s.is_done());
+        assert_eq!(s.outcome().error, None);
     }
 
     #[gpui_kit::test]

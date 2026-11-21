@@ -21,8 +21,9 @@ use crate::actions::{
     UseSystemTheme, Zoom,
 };
 use crate::actions::{
-    FetchCpuSamples, NextSlowFrame, PreviousSlowFrame, ShowCpuTab, ShowFramesTab, ShowRebuildsTab,
-    ShowTraceTab, ToggleTraceWidgetBuilds,
+    FetchCpuSamples, NextFrame, NextSlowFrame, PreviousFrame, PreviousSlowFrame, ShowCpuTab,
+    ShowFramesTab, ShowRebuildsTab, ShowTraceTab, ToggleTraceWidgetBuilds, ZoomIn, ZoomOut,
+    ZoomToFit,
 };
 use crate::capture_host::{CaptureControl, CaptureHost, CaptureHostFailure};
 use crate::keymap::SHELL_CONTEXT;
@@ -35,7 +36,7 @@ use crate::tools::logs::{LogsEvent, LogsView};
 use crate::tools::network::{NetworkEvent, NetworkView};
 use crate::tools::performance::{PerfTab, PerformanceView, adjacent_slow};
 use crate::tools::timeline::TimelineView;
-use crate::tools::{OpenLocation, ReplaceLocation};
+use crate::tools::{KeyZoom, OpenLocation, ReplaceLocation};
 use fdt_capture::ConnStatus;
 use fdt_ui::hud::FrameHud;
 use fdt_ui::theme::{self, ThemePreference, TokensExt as _};
@@ -349,6 +350,16 @@ impl MainWindow {
             || matches!(session.status(), ConnStatus::Connected { .. })
     }
 
+    /// Whether the Timeline page shows its lanes: any lane has data, or an app is connected. Data
+    /// stays when the app goes (§10.5), frames or not.
+    fn timeline_routed(&self, cx: &App) -> bool {
+        let snap = self.session.read(cx).snapshot();
+        self.frames_routed(cx)
+            || !snap.logs.is_empty()
+            || !snap.net.is_empty()
+            || snap.timeline.slice_count() > 0
+    }
+
     /// Hands the location's range, and the selected frame, to the Performance and Timeline
     /// pages.
     fn sync_frames_tools(&mut self, cx: &mut Context<Self>) {
@@ -459,6 +470,12 @@ impl MainWindow {
         if before != Page::Tool(Tool::Network) {
             self.focus_network_if_current(cx);
         }
+        // The Timeline lanes, so their zoom keys work. (The Performance page focuses its tab's
+        // canvas itself when it is shown.)
+        if before != Page::Tool(Tool::Timeline) && self.current().page == Page::Tool(Tool::Timeline)
+        {
+            self.timeline.update(cx, |t, cx| t.focus_when_shown(cx));
+        }
     }
 
     /// Asks the Network table to take focus when it is the current page. The table declines
@@ -501,6 +518,28 @@ impl MainWindow {
         self.current().page == Page::Tool(Tool::Network)
             && self.network_routed(cx)
             && self.network.update(cx, |net, cx| net.close_details(cx))
+    }
+
+    /// Hands a zoom command to the current page's canvas: the Timeline lanes, or the Raw trace or
+    /// flame chart on the Performance page.
+    fn key_zoom(&mut self, z: KeyZoom, cx: &mut Context<Self>) {
+        match self.current().page {
+            Page::Tool(Tool::Timeline) if self.timeline_routed(cx) => {
+                self.timeline.update(cx, |t, cx| t.key_zoom(z, cx))
+            }
+            Page::Tool(Tool::Performance) if self.frames_routed(cx) => {
+                self.performance.update(cx, |p, cx| p.key_zoom(z, cx))
+            }
+            _ => {}
+        }
+    }
+
+    /// Hands Previous or Next Frame to the Performance page's frame chart.
+    fn step_frame(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if self.current().page == Page::Tool(Tool::Performance) && self.frames_routed(cx) {
+            self.performance
+                .update(cx, |p, cx| p.step_frame(forward, cx));
+        }
     }
 
     /// Runs `f` on the Logs list when it is the current page (the palette reaches it this way).
@@ -738,7 +777,7 @@ impl Render for MainWindow {
                 tool_page::render_with(Tool::Network, strip, self.network.clone())
                     .into_any_element()
             }
-            Page::Tool(Tool::Timeline) if self.frames_routed(cx) => {
+            Page::Tool(Tool::Timeline) if self.timeline_routed(cx) => {
                 let strip = self.strip_view();
                 tool_page::render_with(Tool::Timeline, strip, self.timeline.clone())
                     .into_any_element()
@@ -813,6 +852,13 @@ impl Render for MainWindow {
             .on_action(cx.listener(|this, _: &ToggleTraceWidgetBuilds, _, cx| {
                 this.toggle_trace_widget_builds(cx)
             }))
+            // The canvases handle these themselves while they have the focus; otherwise (the
+            // palette focuses the shell before it runs a command) the shell hands them over.
+            .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.key_zoom(KeyZoom::In, cx)))
+            .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.key_zoom(KeyZoom::Out, cx)))
+            .on_action(cx.listener(|this, _: &ZoomToFit, _, cx| this.key_zoom(KeyZoom::Fit, cx)))
+            .on_action(cx.listener(|this, _: &PreviousFrame, _, cx| this.step_frame(false, cx)))
+            .on_action(cx.listener(|this, _: &NextFrame, _, cx| this.step_frame(true, cx)))
             .on_action(cx.listener(|this, _: &SelectNext, _, cx| {
                 this.with_logs(cx, |v, cx| v.select_next(cx));
                 this.with_network(cx, |v, cx| v.select_next(cx));
@@ -988,6 +1034,127 @@ mod tests {
                 "Back must not reach the old session"
             );
         });
+    }
+
+    /// Thirty frames with a log line and a request each.
+    fn frames_demo() -> std::sync::Arc<fdt_store::Snapshot> {
+        use crate::test_support::{frame_at, log_at, request, snapshot};
+        snapshot(|w, run| {
+            for i in 0..30u64 {
+                let b = if i == 5 { 80 } else { 4 };
+                w.push_frame(frame_at(run, i + 1, i * 100, b, 4));
+                w.push_log(log_at(run, i * 100 + 7, fdt_store::logs::LogLevel::Info));
+                request(
+                    w,
+                    run,
+                    "GET",
+                    &format!("http://h/p{i}"),
+                    Some(200),
+                    i * 100 + 3,
+                    Some(i * 100 + 50),
+                );
+            }
+        })
+    }
+
+    /// Runs the palette command whose label is `label`.
+    fn run_command(
+        cx: &mut gpui_kit::VisualTestContext,
+        shell: &gpui_kit::Entity<MainWindow>,
+        label: &str,
+    ) {
+        press(cx, "cmd-k", "ctrl-k");
+        cx.simulate_input(label);
+        cx.run_until_parked();
+        let top = shell.read_with(cx, |s, cx| {
+            s.palette().unwrap().read(cx).item(0).label.clone()
+        });
+        assert_eq!(top.to_string(), label);
+        press(cx, "enter", "enter");
+    }
+
+    #[gpui_kit::test]
+    fn zoom_reaches_the_timeline_without_a_click(cx: &mut TestAppContext) {
+        let (shell, cx) = crate::test_support::open_shell_snapshot(cx, frames_demo());
+        press(cx, "cmd-1", "ctrl-1");
+        assert_eq!(page(&shell, cx), Page::Tool(Tool::Timeline));
+        let tl = shell.read_with(cx, |s, _| s.timeline_view().clone());
+        let fit = tl.read_with(cx, |v, _| v.viewport());
+        // The keys: the lanes took the focus when the page opened.
+        press(cx, "cmd-=", "ctrl-=");
+        let keyed = tl.read_with(cx, |v, _| v.viewport());
+        assert!(keyed.span_ns < fit.span_ns, "{keyed:?} vs {fit:?}");
+        // The palette: the shell hands the command to the page.
+        run_command(cx, &shell, "Zoom In");
+        let zoomed = tl.read_with(cx, |v, _| v.viewport());
+        assert!(zoomed.span_ns < keyed.span_ns, "{zoomed:?} vs {keyed:?}");
+        run_command(cx, &shell, "Zoom Out");
+        assert!(tl.read_with(cx, |v, _| v.viewport()).span_ns > zoomed.span_ns);
+        run_command(cx, &shell, "Zoom to Fit");
+        assert_eq!(tl.read_with(cx, |v, _| v.viewport()), fit);
+    }
+
+    #[gpui_kit::test]
+    fn frame_steps_reach_the_frame_chart_without_a_click(cx: &mut TestAppContext) {
+        let snap = frames_demo();
+        let (shell, cx) = crate::test_support::open_shell_snapshot(cx, snap.clone());
+        let frame = |seq: usize| Some(Selection::Frame(snap.frames.get(seq).unwrap().id));
+        let to = Location {
+            page: Page::Tool(Tool::Performance),
+            selection: frame(3),
+            range: None,
+        };
+        cx.update(|window, cx| shell.update(cx, |s, cx| s.navigate(to, window, cx)));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+        // The chart took the focus when the page opened: the arrow keys step frames.
+        press(cx, "right", "right");
+        assert_eq!(shell.read_with(cx, |s, _| s.current().selection), frame(4));
+        run_command(cx, &shell, "Next Frame");
+        assert_eq!(shell.read_with(cx, |s, _| s.current().selection), frame(5));
+        // "Previous Frame" ranks below "Previous Slow Frame" in the palette; run it the way the
+        // palette does: focus the shell, then dispatch.
+        let focus = shell.read_with(cx, |s, _| s.focus_handle());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.dispatch_action(crate::actions::PreviousFrame);
+        cx.run_until_parked();
+        assert_eq!(shell.read_with(cx, |s, _| s.current().selection), frame(4));
+    }
+
+    #[gpui_kit::test]
+    fn zoom_reaches_the_raw_trace_without_a_click(cx: &mut TestAppContext) {
+        use crate::tools::performance::PerfTab;
+        use fdt_store::timeline::{Slice, SliceCat, TrackKind};
+        let snap = crate::test_support::snapshot(|w, run| {
+            let t = w.timeline_track(run, TrackKind::Thread, 1, "io.flutter.ui");
+            w.set_track_order(t, 0);
+            for i in 0..40u64 {
+                w.push_frame(crate::test_support::frame_at(run, i + 1, i * 20, 4, 4));
+                let s = Slice {
+                    start: SessionTime(i * 20_000_000),
+                    dur_ns: 5_000_000,
+                    name: w.intern_name("BUILD"),
+                    cat: SliceCat::Dart,
+                };
+                w.push_slice(t, 0, s, false);
+            }
+        });
+        let (shell, cx) = crate::test_support::open_shell_snapshot(cx, snap);
+        cx.dispatch_action(crate::actions::ShowPerformance);
+        cx.run_until_parked();
+        shell.update(cx, |s, cx| {
+            s.performance_view()
+                .update(cx, |v, cx| v.set_tab(PerfTab::Trace, cx))
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+        let trace = shell.read_with(cx, |s, cx| s.performance_view().read(cx).trace().clone());
+        let fit = trace.read_with(cx, |v, _| v.viewport());
+        press(cx, "cmd-=", "ctrl-=");
+        let keyed = trace.read_with(cx, |v, _| v.viewport());
+        assert!(keyed.span_ns < fit.span_ns, "{keyed:?} vs {fit:?}");
+        run_command(cx, &shell, "Zoom In");
+        assert!(trace.read_with(cx, |v, _| v.viewport()).span_ns < keyed.span_ns);
     }
 
     #[gpui_kit::test]
@@ -1415,6 +1582,24 @@ mod tests {
         // Memory, Widgets and State are still not built.
         press(cx, "cmd-3", "ctrl-3");
         assert!(exists(cx, "empty-state-memory"));
+    }
+
+    /// Disconnected, with logs and requests but no frames (an app that never drew): the
+    /// Timeline still shows its lanes, since data stays when the app goes (§10.5).
+    #[gpui_kit::test]
+    fn the_timeline_routes_when_any_lane_has_data(cx: &mut TestAppContext) {
+        use crate::test_support::{log_at, request, snapshot};
+        let snap = snapshot(|w, run| {
+            w.push_log(log_at(run, 10, fdt_store::logs::LogLevel::Info));
+            request(w, run, "GET", "http://h/a", Some(200), 20, Some(30));
+        });
+        let (_shell, cx) = open_shell_snapshot(cx, snap);
+        press(cx, "cmd-1", "ctrl-1");
+        assert!(exists(cx, "timeline-view"));
+        assert!(!exists(cx, "empty-state-timeline"));
+        // Performance needs frames (or a connection).
+        press(cx, "cmd-2", "ctrl-2");
+        assert!(exists(cx, "empty-state-performance"));
     }
 
     #[gpui_kit::test]

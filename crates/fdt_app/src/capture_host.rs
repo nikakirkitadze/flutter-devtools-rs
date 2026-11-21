@@ -29,6 +29,8 @@ pub trait CaptureControl: 'static {
     fn set_body_limits(&self, limits: BodyLimits);
     fn fetch_cpu_samples(&self);
     fn set_trace_widget_builds(&self, on: bool);
+    /// The "Trace widget builds by default" setting changed: the next connection starts with it.
+    fn set_trace_default(&self, on: bool);
     fn status(&self) -> watch::Receiver<ConnStatus>;
     fn snapshots(&self) -> watch::Receiver<Arc<Snapshot>>;
 }
@@ -63,6 +65,9 @@ impl CaptureControl for Capture {
     }
     fn set_trace_widget_builds(&self, on: bool) {
         Capture::set_trace_widget_builds(self, on);
+    }
+    fn set_trace_default(&self, on: bool) {
+        Capture::set_trace_default(self, on);
     }
     fn status(&self) -> watch::Receiver<ConnStatus> {
         Capture::status(self)

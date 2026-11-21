@@ -87,12 +87,13 @@ impl LaneKind {
                 .gc_lod()
                 .level(0)
                 .is_some_and(|l| !l.is_empty()),
+            // The session's worst frame, from the coarsest cells: no frame is read.
             LaneKind::Findings => {
-                // Bounded: a long list of slow frames is taken to hold a janky one.
-                let slow = snap.frames.slow();
-                slow.len() > 4_096
-                    || (0..slow.len())
-                        .any(|i| slow.get(i).is_some_and(|&s| is_janky(snap, s as usize)))
+                let all = TimeRange::new(SessionTime(0), SessionTime(u64::MAX));
+                let janky = 2 * u64::from(snap.latest_budget_us());
+                lod_cells(snap.frames.lod(), all, 1)
+                    .iter()
+                    .any(|c| u64::from(c.max_us) > janky)
             }
         }
     }
@@ -103,6 +104,9 @@ impl LaneKind {
 pub enum LaneHit {
     /// A frame, by index into the frames.
     Frame(usize),
+    /// A pixel column of the Findings lane holding at least one janky frame; the view looks
+    /// its worst frame up for the point under the pointer only.
+    FindingCell(TimeRange),
     /// One request, by seq.
     Request(u32),
     /// The requests of a pixel column of the request lane.
@@ -191,6 +195,8 @@ pub struct Spans {
     pub range: TimeRange,
     /// Sorted by start; never more than `SPAN_CAP`.
     pub items: Arc<[PackedSpan]>,
+    /// A request was still pending: its span ends at the fetch's latest time, which moves on.
+    pub pending: bool,
 }
 
 /// The most spans a fetch keeps, so drawing them is bounded by this and not by the data.
@@ -243,30 +249,6 @@ fn cell_range(c: &StripBar) -> TimeRange {
         c.start,
         SessionTime(c.end.0.saturating_sub(1).max(c.start.0)),
     )
-}
-
-/// The positions in the slow list of the frames with an index in `frames`.
-fn slow_bounds(snap: &Snapshot, frames: std::ops::Range<usize>) -> std::ops::Range<usize> {
-    let slow = snap.frames.slow();
-    let first = |at: usize| {
-        let (mut lo, mut hi) = (0, slow.len());
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if slow.get(mid).is_some_and(|&s| (s as usize) < at) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        lo
-    };
-    first(frames.start)..first(frames.end)
-}
-
-fn is_janky(snap: &Snapshot, i: usize) -> bool {
-    read_frame(snap, i).is_some_and(|f| {
-        frame_status(f.time_us(), snap.frame_budget_us(f.run)) == FrameStatus::Janky
-    })
 }
 
 /// The slowest frame with a start in `range` (the earliest among equals). Scans the frames of
@@ -433,10 +415,12 @@ pub fn fetch_spans(snap: &Snapshot, range: TimeRange, ns_per_px: u64) -> Spans {
     );
     seqs.truncate(SPAN_CAP);
     let latest = snap.net.latest();
+    let mut pending = false;
     let mut found: Vec<PackedSpan> = seqs
         .into_iter()
         .filter_map(|seq| {
             let r = snap.net.get(seq as usize)?;
+            pending |= r.end.is_none();
             Some(PackedSpan {
                 start: r.start,
                 end: r.end.unwrap_or(latest).max(r.start),
@@ -462,6 +446,7 @@ pub fn fetch_spans(snap: &Snapshot, range: TimeRange, ns_per_px: u64) -> Spans {
     Spans {
         range,
         items: found.into(),
+        pending,
     }
 }
 
@@ -659,25 +644,23 @@ pub fn navigation_lane(snap: &Snapshot, vp: Viewport, width: f32, budget: usize)
     marker_lane(items, width, budget)
 }
 
-/// A `Jank` marker per janky frame. With more slow frames in view than the lane has pixels, one
-/// in every few of them is looked at: bounded by the width, not by the data.
+/// A `Jank` marker on every pixel column that holds a janky frame: the frames' level-of-detail
+/// cells over the view, kept where the worst frame is over twice the budget. Bounded by the
+/// width, never by the data, and never a sample: every frame is in some cell.
 pub fn findings_lane(snap: &Snapshot, vp: Viewport, width: f32, budget: usize) -> LaneGeometry {
-    let idx = snap.frames.range(range_of(vp));
-    let slow = snap.frames.slow();
-    let b = slow_bounds(snap, idx);
-    let cap = (width as usize).min(budget).saturating_mul(2);
-    let items = strided(b.start, b.end, cap).filter_map(|k| {
-        let i = *slow.get(k)? as usize;
-        if !is_janky(snap, i) {
-            return None;
-        }
-        let f = snap.frames.get(i)?;
-        Some((
-            vp.x_of(f.start.0, width),
-            LaneHit::Finding(i),
-            "Jank".to_string(),
-        ))
-    });
+    let janky = 2 * u64::from(snap.latest_budget_us());
+    let cells = lane_cells(snap.frames.lod(), range_of(vp), width as usize);
+    let items = cells
+        .into_iter()
+        .filter(|c| u64::from(c.max_us) > janky)
+        .filter_map(|c| {
+            let rect = cell_rect(vp, width, &c, 0.0, 1.0)?;
+            Some((
+                rect.x + rect.w / 2.0,
+                LaneHit::FindingCell(cell_range(&c)),
+                "Jank".to_string(),
+            ))
+        });
     marker_lane(items, width, budget)
 }
 
@@ -724,7 +707,10 @@ pub fn location_for(snap: &Snapshot, hit: &LaneHit, range: Option<TimeRange>) ->
             Some(at(Tool::Logs, Some(Selection::Log(row.id))))
         }
         LaneHit::Gc(_) => Some(at(Tool::Performance, None)),
-        LaneHit::LogCell(_) | LaneHit::RequestCell(_) | LaneHit::FrameCell(_) => None,
+        LaneHit::LogCell(_)
+        | LaneHit::RequestCell(_)
+        | LaneHit::FrameCell(_)
+        | LaneHit::FindingCell(_) => None,
     }
 }
 
@@ -817,7 +803,10 @@ pub fn tooltip_text(snap: &Snapshot, hit: &LaneHit) -> Option<String> {
                 format_duration_ns(u64::from(worst_us) * 1_000)
             ))
         }
-        LaneHit::LogCell(_) | LaneHit::RequestCell(_) | LaneHit::FrameCell(_) => None,
+        LaneHit::LogCell(_)
+        | LaneHit::RequestCell(_)
+        | LaneHit::FrameCell(_)
+        | LaneHit::FindingCell(_) => None,
     }
 }
 
@@ -828,7 +817,11 @@ pub fn cell_tooltip(snap: &Snapshot, hit: &LaneHit) -> Option<String> {
         LaneHit::LogCell(range) => {
             let counts = snap.logs.level_counts(Some(range));
             let n: u64 = counts.iter().sum();
-            Some(format!("{n} lines, {} errors", counts[3]))
+            Some(format!(
+                "{}, {}",
+                plural(n, "line", "lines"),
+                plural(counts[3], "error", "errors")
+            ))
         }
         LaneHit::RequestCell(range) => {
             let seqs = filter_requests(
@@ -842,10 +835,18 @@ pub fn cell_tooltip(snap: &Snapshot, hit: &LaneHit) -> Option<String> {
                 .iter()
                 .filter(|&&s| snap.net.get(s as usize).is_some_and(|r| r.is_error()))
                 .count();
-            Some(format!("{} requests ({failed} failed)", seqs.len()))
+            Some(format!(
+                "{} ({failed} failed)",
+                plural(seqs.len() as u64, "request", "requests")
+            ))
         }
         _ => None,
     }
+}
+
+/// `1 line`, `2 lines`.
+fn plural(n: u64, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 #[cfg(test)]
@@ -1219,9 +1220,103 @@ mod tests {
             None,
         );
         assert_eq!(f.quads.len(), 1, "only the janky frame is a finding");
-        assert_eq!(f.hits[0].1, LaneHit::Finding(5));
+        let LaneHit::FindingCell(r) = f.hits[0].1 else {
+            panic!("{:?}", f.hits[0].1)
+        };
+        assert_eq!(worst_frame(&snap, r), Some(5));
         assert_eq!(f.labels.len(), 1);
         assert_eq!(f.labels[0].text, "Jank");
+    }
+
+    /// Reviewer C's probe: 10 minutes at 120 Hz, fitted into 1,400 px. Every pixel column with
+    /// a janky frame is marked, and only those.
+    #[test]
+    fn findings_mark_every_column_with_a_janky_frame() {
+        // Every 8th frame slow (12 ms against 8.3), every 97th janky (30 ms).
+        let snap = snapshot(|w, run| {
+            w.set_refresh_rate(run, 120.0);
+            for i in 0..72_000u64 {
+                let ms = if i % 97 == 0 {
+                    30
+                } else if i % 8 == 0 {
+                    12
+                } else {
+                    5
+                };
+                w.push_frame(frame_at(run, i + 1, i * 1000 / 120, ms, 2));
+            }
+        });
+        let width = 1400.0_f32;
+        let vp = Viewport::fit(0, snap.latest_time().0);
+        let g = lane_geometry(LaneKind::Findings, &snap, vp, width, CANVAS_MAX_QUADS, None);
+        assert!(g.quads.len() <= width as usize, "bounded by the width");
+        // The time each marker stands for.
+        let marked: Vec<TimeRange> = g
+            .hits
+            .iter()
+            .map(|(_, h)| match *h {
+                LaneHit::FindingCell(r) => r,
+                LaneHit::Finding(i) => {
+                    let t = snap.frames.get(i).unwrap().start;
+                    TimeRange::new(t, t)
+                }
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        let budget = snap.frame_budget_us(snap.runs[0].id);
+        let mut janky = 0;
+        for i in 0..snap.frames.len() {
+            let f = snap.frames.get(i).unwrap();
+            if frame_status(f.time_us(), budget) == FrameStatus::Janky {
+                janky += 1;
+                assert!(
+                    marked
+                        .iter()
+                        .any(|r| r.start <= f.start && f.start <= r.end),
+                    "janky frame {i} at {:?} is not marked ({} markers for {janky} so far)",
+                    f.start,
+                    marked.len()
+                );
+            }
+        }
+        // Each marker holds a janky frame.
+        for r in &marked {
+            let worst = worst_frame(&snap, *r).unwrap();
+            let f = snap.frames.get(worst).unwrap();
+            assert_eq!(frame_status(f.time_us(), budget), FrameStatus::Janky);
+        }
+    }
+
+    /// Cell tooltips are plain English: "1 line", not "1 lines".
+    #[test]
+    fn cell_tooltips_pluralise() {
+        let all = TimeRange::new(SessionTime(0), SessionTime(10_000 * MS));
+        let one = snapshot(|w, run| {
+            w.push_log(log_at(run, 10, LogLevel::Info));
+            request(w, run, "GET", "http://h/a", Some(200), 10, Some(20));
+        });
+        assert_eq!(
+            cell_tooltip(&one, &LaneHit::LogCell(all)).as_deref(),
+            Some("1 line, 0 errors")
+        );
+        assert_eq!(
+            cell_tooltip(&one, &LaneHit::RequestCell(all)).as_deref(),
+            Some("1 request (0 failed)")
+        );
+        let two = snapshot(|w, run| {
+            w.push_log(log_at(run, 10, LogLevel::Info));
+            w.push_log(log_at(run, 20, LogLevel::Error));
+            request(w, run, "GET", "http://h/a", Some(500), 10, Some(20));
+            request(w, run, "GET", "http://h/b", Some(200), 30, Some(40));
+        });
+        assert_eq!(
+            cell_tooltip(&two, &LaneHit::LogCell(all)).as_deref(),
+            Some("2 lines, 1 error")
+        );
+        assert_eq!(
+            cell_tooltip(&two, &LaneHit::RequestCell(all)).as_deref(),
+            Some("2 requests (1 failed)")
+        );
     }
 
     #[test]
@@ -1415,7 +1510,7 @@ mod tests {
         );
         assert_eq!(
             cell_tooltip(&snap, &LaneHit::RequestCell(cell)).as_deref(),
-            Some("1 requests (0 failed)")
+            Some("1 request (0 failed)")
         );
         assert_eq!(tip(LaneHit::Frame(5)), None);
     }

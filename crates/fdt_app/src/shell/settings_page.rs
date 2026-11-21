@@ -132,8 +132,11 @@ fn free_http_memory_row(on: bool, shell: WeakEntity<MainWindow>, cx: &App) -> An
         .into_any_element()
 }
 
+/// Switches the tracing default for the setting and for every open window's capture: each
+/// one's next connection starts with it.
 fn set_trace_by_default(on: bool, shell: &WeakEntity<MainWindow>, cx: &mut App) {
     update_settings(cx, |s| s.trace_widget_builds = on);
+    for_each_control(cx, |control| control.set_trace_default(on));
     let _ = shell.update(cx, |_, cx| cx.notify());
 }
 

@@ -90,6 +90,9 @@ pub struct PerformanceView {
     following: bool,
     /// Whether the Performance page is the current one.
     page_active: bool,
+    /// The page or a tab was just shown: the next render gives the tab's canvas the focus, so
+    /// its keys work without a click.
+    focus_pending: bool,
     _observe: Subscription,
     _subs: Vec<Subscription>,
 }
@@ -139,6 +142,7 @@ impl PerformanceView {
             hover: None,
             following: true,
             page_active: false,
+            focus_pending: false,
             _observe: observe,
             _subs: subs,
         }
@@ -270,6 +274,7 @@ impl PerformanceView {
     pub fn set_tab(&mut self, tab: PerfTab, cx: &mut Context<Self>) {
         if self.tab != tab {
             self.tab = tab;
+            self.focus_pending = self.page_active;
             self.refresh_active(cx);
             cx.notify();
         }
@@ -279,8 +284,64 @@ impl PerformanceView {
     pub fn set_page_active(&mut self, active: bool, cx: &mut Context<Self>) {
         if self.page_active != active {
             self.page_active = active;
+            self.focus_pending = active;
             self.refresh_active(cx);
+            cx.notify();
         }
+    }
+
+    /// A zoom command the shell hands over (the palette): the Raw trace, or the CPU tab's flame
+    /// chart, whichever is showing.
+    pub fn key_zoom(&mut self, z: crate::tools::KeyZoom, cx: &mut Context<Self>) {
+        match self.tab {
+            PerfTab::Trace => self.trace.update(cx, |t, cx| t.key_zoom(z, cx)),
+            PerfTab::Cpu if self.cpu.read(cx).mode() == super::cpu_tab::CpuMode::Flame => {
+                let flame = self.cpu.read(cx).flame().clone();
+                flame.update(cx, |f, cx| f.key_zoom(z, cx));
+            }
+            _ => {}
+        }
+    }
+
+    /// Previous or next frame, handed over by the shell (the palette): on the Frames tab.
+    pub fn step_frame(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if self.tab == PerfTab::Frames {
+            self.chart.update(cx, |c, cx| c.select_step(forward, cx));
+        }
+    }
+
+    /// Gives the shown tab's canvas the focus: the frame chart, the Raw trace, or the CPU tab's
+    /// flame chart (the CPU tab focuses its own tree). A canvas that is not drawn yet (no data,
+    /// or its result is still computing) gets it once it is; focus on an element that is not
+    /// drawn would leave the keys with nowhere to go. Returns whether that is done.
+    fn focus_canvas(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let handle = match self.tab {
+            PerfTab::Frames => {
+                if self.session.read(cx).snapshot().frames.is_empty() {
+                    return false;
+                }
+                self.chart.read(cx).focus_handle().clone()
+            }
+            PerfTab::Trace => {
+                if self.trace.read(cx).is_empty() {
+                    return false;
+                }
+                self.trace.read(cx).focus_handle().clone()
+            }
+            PerfTab::Cpu => {
+                let cpu = self.cpu.read(cx);
+                if cpu.mode() != super::cpu_tab::CpuMode::Flame {
+                    return true;
+                }
+                if !cpu.flame_shown(cx) {
+                    return false;
+                }
+                cpu.flame().read(cx).focus_handle().clone()
+            }
+            PerfTab::Rebuilds => return true,
+        };
+        window.focus(&handle, cx);
+        true
     }
 
     fn refresh_active(&mut self, cx: &mut Context<Self>) {
@@ -553,6 +614,9 @@ impl PerformanceView {
 impl Render for PerformanceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::perf::bump(crate::perf::Counter::PerformanceView, 1);
+        if self.focus_pending && self.page_active && self.focus_canvas(window, cx) {
+            self.focus_pending = false;
+        }
         if self.tab != PerfTab::Cpu {
             let to = self.focus.clone();
             self.cpu

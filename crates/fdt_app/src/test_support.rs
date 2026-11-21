@@ -206,6 +206,9 @@ impl CaptureControl for FakeCapture {
     fn set_trace_widget_builds(&self, on: bool) {
         self.record(format!("trace_builds {on}"));
     }
+    fn set_trace_default(&self, on: bool) {
+        self.record(format!("trace_default {on}"));
+    }
     fn status(&self) -> watch::Receiver<ConnStatus> {
         self.status.clone()
     }

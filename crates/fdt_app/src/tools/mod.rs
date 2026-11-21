@@ -15,6 +15,15 @@ use crate::nav::Location;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenLocation(pub Location);
 
+/// A zoom command from the keyboard or the palette, which the shell hands to the page's canvas.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyZoom {
+    In,
+    Out,
+    /// To the range if one is set, else the session.
+    Fit,
+}
+
 /// Like [`OpenLocation`], but the shell rewrites the current history entry instead of adding one.
 /// Keyboard movement through rows and frames sends this, so it adds no Back step.
 #[derive(Clone, Debug, PartialEq, Eq)]

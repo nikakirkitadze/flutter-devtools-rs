@@ -1099,6 +1099,24 @@ mod tests {
         assert_eq!(tile.map(|r| r.1).as_deref(), Some("44"));
     }
 
+    /// The default reaches the window's capture when it changes, not only when the window opens:
+    /// the next connect starts with it.
+    #[gpui_kit::test]
+    fn settings_switch_reaches_the_capture(cx: &mut TestAppContext) {
+        let (_shell, cx, fake) = open_shell_fake(cx);
+        crate::test_support::press(cx, "cmd-,", "ctrl-,");
+        click(cx, "settings-trace-widget-builds");
+        assert_eq!(
+            fake.commands().last().map(String::as_str),
+            Some("trace_default true")
+        );
+        click(cx, "settings-trace-widget-builds");
+        assert_eq!(
+            fake.commands().last().map(String::as_str),
+            Some("trace_default false")
+        );
+    }
+
     #[gpui_kit::test]
     fn settings_switch_persists(cx: &mut TestAppContext) {
         let (_shell, cx, _fake) = open_shell_fake(cx);

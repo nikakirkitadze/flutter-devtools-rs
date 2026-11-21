@@ -41,8 +41,14 @@ use std::sync::Arc;
 
 /// What the page says when nothing was recorded.
 pub const EMPTY_TEXT: &str = "Nothing recorded yet. Connect to an app to fill the timeline.";
+/// The same while an app is connected.
+pub const EMPTY_CONNECTED_TEXT: &str =
+    "Nothing recorded yet. Timeline lanes fill in as your app runs.";
 /// How much one press of the zoom keys changes the scale.
 const KEY_ZOOM: f32 = 1.5; // token-check: allow: zoom step, not a visual size
+/// How long a click on a lane waits before it opens what is under it, so that a double-click
+/// (which clears the range) does not navigate first. The macOS default double-click time.
+const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(500); // token-check: allow: double-click time, not a visual duration
 /// The page size before it has been drawn once.
 const FIRST_WIDTH_PX: f32 = 900.0; // token-check: allow: stand-in until the first paint
 const FIRST_HEIGHT_PX: f32 = 400.0; // token-check: allow: stand-in until the first paint
@@ -261,11 +267,16 @@ pub struct TimelineView {
     /// Requests fetched for the request lane's spans, and what they were fetched for.
     spans: Option<Spans>,
     /// The (session, request count) the spans were fetched for.
-    spans_for: Option<(u64, usize)>,
+    /// What the spans were fetched from: see [`TimelineView::spans_key`].
+    spans_for: Option<SpansKey>,
     spans_jobs: usize,
     spans_task: Option<Task<()>>,
+    /// A lane click waiting out the double-click time.
+    pending_click: Option<Task<()>>,
     click_task: Option<Task<()>>,
     focus: FocusHandle,
+    /// The page was just opened: the lanes take the focus when they are next drawn.
+    focus_pending: bool,
     _observe: Subscription,
 }
 
@@ -302,8 +313,10 @@ impl TimelineView {
             spans_for: None,
             spans_jobs: 0,
             spans_task: None,
+            pending_click: None,
             click_task: None,
             focus: cx.focus_handle(),
+            focus_pending: false,
             _observe: observe,
         };
         v.refresh_visible();
@@ -318,6 +331,28 @@ impl TimelineView {
 
     pub fn viewport(&self) -> Viewport {
         self.viewport
+    }
+
+    /// The lanes' focus.
+    pub fn focus_handle(&self) -> &FocusHandle {
+        &self.focus
+    }
+
+    /// The page was opened: the lanes take the focus when they are next drawn, so their keys
+    /// work without a click. (With no lanes there is nothing to focus; focus on an element that
+    /// is not drawn would leave the keys with nowhere to go.)
+    pub fn focus_when_shown(&mut self, cx: &mut Context<Self>) {
+        self.focus_pending = true;
+        cx.notify();
+    }
+
+    /// A zoom command, from the lanes' own keys or handed over by the shell (the palette).
+    pub fn key_zoom(&mut self, z: crate::tools::KeyZoom, cx: &mut Context<Self>) {
+        match z {
+            crate::tools::KeyZoom::In => self.zoom_key(KEY_ZOOM, cx),
+            crate::tools::KeyZoom::Out => self.zoom_key(1.0 / KEY_ZOOM, cx),
+            crate::tools::KeyZoom::Fit => self.zoom_to_fit(cx),
+        }
     }
 
     /// Whether the view fits its range or the session (it has not been zoomed or panned).
@@ -398,7 +433,10 @@ impl TimelineView {
     fn take_snapshot(&mut self, cx: &mut Context<Self>) {
         let snap = self.session.read(cx).snapshot().clone();
         if Arc::ptr_eq(&snap, &self.snap) {
-            // A status change: nothing the page shows.
+            // A status change: only the empty state's copy shows it.
+            if self.visible.is_empty() {
+                cx.notify();
+            }
             return;
         }
         if snap.session != self.snap.session {
@@ -410,6 +448,7 @@ impl TimelineView {
             self.spans_for = None;
             self.spans_task = None;
             self.click_task = None;
+            self.pending_click = None;
         }
         self.snap = snap;
         self.refresh_visible();
@@ -456,8 +495,8 @@ impl TimelineView {
             .spans
             .as_ref()
             .is_some_and(|s| s.range.start <= view.start && s.range.end >= view.end);
-        let latest = (self.snap.session, self.snap.net.len());
-        if covered && self.spans_for == Some(latest) {
+        let pending = self.spans.as_ref().is_some_and(|s| s.pending);
+        if covered && self.spans_for == Some(spans_key(&self.snap, pending)) {
             return;
         }
         let want = span_fetch_range(self.viewport);
@@ -473,8 +512,8 @@ impl TimelineView {
                 this.spans_task = None;
                 // Another session: the result means nothing here.
                 if this.snap.session == snap.session {
+                    this.spans_for = Some(spans_key(&snap, spans.pending));
                     this.spans = Some(spans);
-                    this.spans_for = Some((snap.session, snap.net.len()));
                 }
                 // Trailing: `sync` fetches again if the view moved on meanwhile.
                 this.sync(cx);
@@ -579,6 +618,7 @@ impl TimelineView {
         match hit_at(&*self.lane_geometry(kind, cx)?, x, y)? {
             // Only the cell under the pointer is searched, for its worst frame.
             LaneHit::FrameCell(r) => worst_frame(&self.snap, r).map(LaneHit::Frame),
+            LaneHit::FindingCell(r) => worst_frame(&self.snap, r).map(LaneHit::Finding),
             hit => Some(hit),
         }
     }
@@ -643,6 +683,8 @@ impl TimelineView {
             return;
         }
         if click_count >= 2 {
+            // The first click of a double-click opens nothing.
+            self.pending_click = None;
             self.drag = None;
             self.open_timeline(None, cx);
             return;
@@ -710,11 +752,22 @@ impl TimelineView {
         cx.notify();
         let label_w = f32::from(layout::LANE_LABEL_WIDTH);
         if (x - d.start_x).abs() < MIN_DRAG_PX {
-            // A click: on a lane it opens what is under it; on the ruler it does nothing.
+            // A click: on a lane it opens what is under it, unless it turns out to be the first
+            // of a double-click; on the ruler it does nothing.
             if let Some((kind, ly)) = self.lane_at(d.start_y) {
                 let lx = d.start_x - label_w;
                 if let Some(hit) = self.lane_hit(kind, lx, ly, cx) {
-                    self.activate(hit, cx);
+                    let session = self.snap.session;
+                    self.pending_click = Some(cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(DOUBLE_CLICK).await;
+                        this.update(cx, |this, cx| {
+                            this.pending_click = None;
+                            if this.snap.session == session {
+                                this.activate(hit, cx);
+                            }
+                        })
+                        .ok();
+                    }));
                 }
             }
             return;
@@ -928,11 +981,41 @@ impl TimelineView {
     }
 }
 
+/// What fetched spans depend on: the session, every change to a request (one that completes or
+/// fails, with no request after it, still changes its span), and while one is pending the latest
+/// time, which its span ends at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SpansKey {
+    session: u64,
+    updates: u64,
+    pending_until: Option<SessionTime>,
+}
+
+fn spans_key(snap: &Snapshot, pending: bool) -> SpansKey {
+    SpansKey {
+        session: snap.session,
+        updates: snap.net.request_updates(),
+        pending_until: pending.then(|| snap.net.latest()),
+    }
+}
+
 impl Render for TimelineView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::perf::bump(crate::perf::Counter::TimelineView, 1);
         let t = *cx.tokens();
         if self.visible.is_empty() {
+            let connected = matches!(
+                self.session.read(cx).status(),
+                fdt_capture::ConnStatus::Connected { .. }
+            );
+            let (label, body) = if connected {
+                (
+                    EMPTY_CONNECTED_TEXT,
+                    "Timeline lanes fill in as your app runs.",
+                )
+            } else {
+                (EMPTY_TEXT, "Connect to an app to fill the timeline.")
+            };
             return div()
                 .id("timeline-view")
                 .test_support()
@@ -944,15 +1027,18 @@ impl Render for TimelineView {
                     div()
                         .id("timeline-empty")
                         .test_support()
-                        .aria_label(EMPTY_TEXT)
+                        .aria_label(label)
                         .child(EmptyState::new(
                             "timeline-empty-state",
                             tool_icon(Tool::Timeline),
                             "Nothing recorded yet",
-                            "Connect to an app to fill the timeline.",
+                            body,
                         )),
                 )
                 .into_any_element();
+        }
+        if std::mem::take(&mut self.focus_pending) {
+            window.focus(&self.focus, cx);
         }
         // The page was resized: lay the lanes out for the new width.
         let width = self.plot_width();
@@ -1168,12 +1254,57 @@ mod tests {
         TimeRange::new(SessionTime(0), SessionTime(4_000 * MS))
     }
 
+    /// A single click, and the double-click time after it.
     fn click(v: &Entity<TimelineView>, cx: &mut VisualTestContext, x: f32, y: f32) {
         v.update(cx, |v, cx| {
             v.press(x, y, 1, cx);
             v.released(x, cx);
         });
         cx.run_until_parked();
+        cx.executor().advance_clock(DOUBLE_CLICK);
+        cx.run_until_parked();
+    }
+
+    /// A double-click on a lane clears the range, as on the ruler; the first click of it does not
+    /// open what is under the pointer.
+    #[gpui_kit::test]
+    fn a_double_click_on_a_lane_clears_the_range(cx: &mut gpui_kit::TestAppContext) {
+        let snap = demo();
+        let (v, cx, _h) = open(cx, snap.clone());
+        let range = range_0_to_4s();
+        v.update(cx, |v, cx| v.set_location(Some(range), cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+        let (events, _sub) = log(cx, &v);
+        let (x, y, _) = point_of(&v, cx, LaneKind::Frames, |h| *h == LaneHit::Frame(5));
+        v.update(cx, |v, cx| {
+            v.press(x, y, 1, cx);
+            v.released(x, cx);
+        });
+        cx.run_until_parked();
+        v.update(cx, |v, cx| {
+            v.press(x, y, 2, cx);
+            v.released(x, cx);
+        });
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(
+            events.borrow().as_slice(),
+            [Location {
+                page: Page::Tool(Tool::Timeline),
+                selection: None,
+                range: None,
+            }]
+        );
+        // A single click still opens the frame, once the double-click time has passed.
+        click(&v, cx, x, y);
+        let id = snap.frames.get(5).unwrap().id;
+        assert_eq!(
+            events.borrow().last().map(|l| l.selection),
+            Some(Some(Selection::Frame(id)))
+        );
     }
 
     #[gpui_kit::test]
@@ -1232,6 +1363,27 @@ mod tests {
         );
     }
 
+    /// Connected, with nothing recorded yet: the copy does not tell the user to connect.
+    #[gpui_kit::test]
+    fn nothing_recorded_while_connected_says_the_lanes_fill_in(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt as _;
+        let (_v, cx, h) = open(cx, Arc::new(Snapshot::empty()));
+        h.status
+            .send(crate::test_support::connected("demo", true))
+            .unwrap();
+        cx.run_until_parked();
+        let label = cx.update(|window, cx| {
+            window.render_frame(cx);
+            window
+                .try_find("timeline-empty")
+                .and_then(|e| e.label().map(str::to_string))
+        });
+        assert_eq!(
+            label.as_deref(),
+            Some("Nothing recorded yet. Timeline lanes fill in as your app runs.")
+        );
+    }
+
     #[gpui_kit::test]
     fn clicks_map_to_locations_with_range_kept(cx: &mut gpui_kit::TestAppContext) {
         let snap = demo();
@@ -1264,7 +1416,7 @@ mod tests {
             want(Page::Tool(Tool::Performance), Some(Selection::Frame(id)))
         );
         let (x, y, hit) = point_of(&v, cx, LaneKind::Findings, |_| true);
-        assert_eq!(hit, LaneHit::Finding(5));
+        assert!(matches!(hit, LaneHit::FindingCell(_)), "{hit:?}");
         click(&v, cx, x, y);
         assert_eq!(
             last(&events),
@@ -1622,12 +1774,15 @@ mod tests {
         v.update(cx, |v, cx| v.moved(x, y, at, false, true, cx));
         cx.run_until_parked();
         let counts = snap.logs.level_counts(Some(cell));
+        let n = counts.iter().sum::<u64>();
+        let noun =
+            |n: u64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
         assert_eq!(
             v.read_with(cx, |v, _| v.tooltip().map(str::to_string)),
             Some(format!(
-                "{} lines, {} errors",
-                counts.iter().sum::<u64>(),
-                counts[3]
+                "{}, {}",
+                noun(n, "line", "lines"),
+                noun(counts[3], "error", "errors")
             ))
         );
         // Leaving the lanes clears it.
@@ -1853,6 +2008,62 @@ mod tests {
             let (a, z) = v.viewport().range();
             assert!(s.range.start.0 <= a && s.range.end.0 >= z);
         });
+    }
+
+    /// A request that completes or fails with no new request after it: the span is fetched
+    /// again and drawn as it is now.
+    #[gpui_kit::test]
+    fn a_request_that_ends_changes_its_span(cx: &mut gpui_kit::TestAppContext) {
+        let (mut w, run) = writer();
+        w.push_frame(frame_at(run, 1, 10, 4, 4));
+        request(&mut w, run, "GET", "http://h/slow", None, 100, None);
+        request(&mut w, run, "GET", "http://h/other", None, 120, None);
+        w.push_log(log_at(run, 1_000, LogLevel::Info));
+        let (v, cx, h) = open(cx, w.publish());
+        let span = |v: &Entity<TimelineView>, cx: &mut VisualTestContext, seq: u32| {
+            v.read_with(cx, |v, _| {
+                v.spans()
+                    .and_then(|s| s.items.iter().find(|p| p.seq == seq).copied())
+                    .map(|p| (p.end.0 / MS, p.error))
+            })
+        };
+        assert_eq!(
+            span(&v, cx, 0),
+            Some((1_000, false)),
+            "pending: to the latest time"
+        );
+        // The first fails at 400 ms and the second completes at 300 ms; more log lines arrive.
+        request(
+            &mut w,
+            run,
+            "GET",
+            "http://h/slow",
+            Some(500),
+            100,
+            Some(400),
+        );
+        request(
+            &mut w,
+            run,
+            "GET",
+            "http://h/other",
+            Some(200),
+            120,
+            Some(300),
+        );
+        for i in 0..5 {
+            w.push_log(log_at(run, 1_100 + i * 100, LogLevel::Info));
+        }
+        h.snaps.send(w.publish()).unwrap();
+        cx.run_until_parked();
+        assert_eq!(span(&v, cx, 0), Some((400, true)));
+        assert_eq!(span(&v, cx, 1), Some((300, false)));
+        // Nothing about the requests changes: no new fetch.
+        let jobs = v.read_with(cx, |v, _| v.spans_jobs());
+        w.push_log(log_at(run, 1_700, LogLevel::Info));
+        h.snaps.send(w.publish()).unwrap();
+        cx.run_until_parked();
+        assert_eq!(v.read_with(cx, |v, _| v.spans_jobs()), jobs);
     }
 
     #[gpui_kit::test]
