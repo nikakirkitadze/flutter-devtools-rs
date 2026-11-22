@@ -2,6 +2,8 @@
 //! watching device logs for the VM service line the engine prints at startup.
 
 pub mod marker;
+pub mod simulators;
+pub mod tools;
 
 /// The kind of device a candidate app runs on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
