@@ -11,7 +11,7 @@ use fdt_store::Snapshot;
 use fdt_store::clock::host_now_us;
 use fdt_store::net::{BodyKind, BodyLimits, BodyState};
 use fdt_store::time::RunId;
-use fdt_vm::discovery::{AppKey, DiscoveredApp};
+use fdt_vm::discovery::{AppKey, AppSource, DiscoveredApp};
 use fdt_vm::testing::ScriptedServer;
 use fdt_vm::uri::VmServiceUri;
 use serde_json::{Value, json};
@@ -213,6 +213,7 @@ fn disc(server: &ScriptedServer) -> DiscoveredApp {
         flutter_version: None,
         workspace: Some("/w".into()),
         pid: None,
+        source: AppSource::Dtd,
     }
 }
 

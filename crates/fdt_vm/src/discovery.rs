@@ -12,15 +12,19 @@ use tokio::time::Instant;
 use serde_json::Value;
 use tokio::sync::watch;
 
+use crate::devices::Candidate;
 use crate::dtd::{DtdClient, VmServiceEntry, parse_app_label};
 use crate::events::{StreamEvent, decode_notification};
 use crate::rpc::{ConnectOptions, connect};
 use crate::service::{Mode, VmService, detect_mode};
+use crate::uri::VmServiceUri;
 
 /// Default for `DiscoveryConfig::retry_after`.
 const RETRY_AFTER: Duration = Duration::from_secs(5);
 /// How long a probe waits for the `flutterVersion` service to be announced.
 const VERSION_WAIT: Duration = Duration::from_secs(1);
+/// Default for `DiscoveryConfig::candidate_grace`.
+const CANDIDATE_GRACE: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Os {
@@ -217,6 +221,28 @@ pub struct AppKey {
     pub workspace: String,
 }
 
+impl AppKey {
+    /// Whether two keys name the same app, launched by different means: package and device are
+    /// equal, and the workspaces are equal or either is unknown (empty).
+    pub fn same_app(&self, other: &AppKey) -> bool {
+        self.package == other.package
+            && self.device == other.device
+            && (self.workspace == other.workspace
+                || self.workspace.is_empty()
+                || other.workspace.is_empty())
+    }
+}
+
+/// How a discovered app was found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AppSource {
+    /// Listed by a Dart tooling daemon (the app runs under `flutter run` or similar).
+    #[default]
+    Dtd,
+    /// Found in a device log, with no tooling daemon involved.
+    Device,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiscoveredApp {
     pub key: AppKey,
@@ -228,6 +254,7 @@ pub struct DiscoveredApp {
     pub workspace: Option<String>,
     /// The app's own pid, from `getVM`.
     pub pid: Option<u32>,
+    pub source: AppSource,
 }
 
 #[derive(Clone, Debug)]
@@ -240,6 +267,11 @@ pub struct DiscoveryConfig {
     pub dart_cli: Option<PathBuf>,
     /// A failed probe, a failed DTD or a closed DTD is not retried for this long.
     pub retry_after: Duration,
+    /// Apps found in device logs, as published by `DeviceWatch`. `None` lists none.
+    pub candidates: Option<watch::Receiver<Arc<[Candidate]>>>,
+    /// A candidate is first contacted this long after it was first seen, so the Flutter tool's
+    /// own connection (and DTD listing) gets there first.
+    pub candidate_grace: Duration,
 }
 
 impl Default for DiscoveryConfig {
@@ -250,6 +282,8 @@ impl Default for DiscoveryConfig {
             registry_dir: None,
             dart_cli: None,
             retry_after: RETRY_AFTER,
+            candidates: None,
+            candidate_grace: CANDIDATE_GRACE,
         }
     }
 }
@@ -277,7 +311,11 @@ async fn probe(uri: &str, timeout: Duration) -> Result<ProbeInfo, String> {
 }
 
 async fn probe_inner(uri: &str) -> Result<ProbeInfo, String> {
-    let url = url::Url::parse(uri).map_err(|e| e.to_string())?;
+    // Candidates come as `http://` URLs; the socket needs the `ws://.../ws` form.
+    let url = match VmServiceUri::parse(uri) {
+        Ok(u) => u.ws_url().clone(),
+        Err(_) => url::Url::parse(uri).map_err(|e| e.to_string())?,
+    };
     let (client, mut notes) = connect(&url, ConnectOptions::default())
         .await
         .map_err(|e| e.to_string())?;
@@ -376,6 +414,10 @@ struct Scanner {
     backoff: HashMap<String, Instant>,
     probes: HashMap<String, ProbeState>,
     live: HashSet<String>,
+    /// The latest candidate set, read each tick.
+    candidates: Vec<Candidate>,
+    /// When each candidate's `vm_uri` was first seen in the current stretch of the set.
+    first_seen: HashMap<String, Instant>,
     cli_cache: (Option<Instant>, Vec<DtdEntry>),
     tasks: tokio::task::JoinSet<()>,
     events: tokio::sync::mpsc::UnboundedSender<Event>,
@@ -391,6 +433,8 @@ async fn run(config: DiscoveryConfig, tx: watch::Sender<Arc<[DiscoveredApp]>>) {
         backoff: HashMap::new(),
         probes: HashMap::new(),
         live: HashSet::new(),
+        candidates: Vec::new(),
+        first_seen: HashMap::new(),
         cli_cache: (None, Vec::new()),
         tasks: tokio::task::JoinSet::new(),
         events,
@@ -524,14 +568,44 @@ impl Scanner {
             self.spawn_list(&ws);
         }
 
-        // Forget probe results for VMs no DTD lists any more.
+        self.refresh_candidates();
+
+        // Forget probe results for VMs no DTD lists and no candidate offers any more.
         let seen: HashSet<&str> = self
             .clients
             .values()
             .flat_map(|d| d.services.iter().map(|s| s.uri.as_str()))
+            .chain(self.candidates.iter().map(|c| c.vm_uri.as_str()))
             .collect();
         self.probes.retain(|k, _| seen.contains(k.as_str()));
         self.spawn_probes();
+    }
+
+    /// Reads the latest candidate set, stamping new URIs and forgetting those that left (so one
+    /// that returns starts a fresh grace period).
+    fn refresh_candidates(&mut self) {
+        let now = Instant::now();
+        self.candidates = match &self.config.candidates {
+            Some(rx) => rx.borrow().to_vec(),
+            None => Vec::new(),
+        };
+        let current: HashSet<&str> = self.candidates.iter().map(|c| c.vm_uri.as_str()).collect();
+        self.first_seen.retain(|k, _| current.contains(k.as_str()));
+        for c in &self.candidates {
+            self.first_seen.entry(c.vm_uri.clone()).or_insert(now);
+        }
+    }
+
+    /// Whether a DTD-listed app with a finished probe has this candidate's pid and OS, meaning
+    /// the Flutter tool owns it.
+    fn claimed(&self, c: &Candidate) -> bool {
+        self.clients
+            .values()
+            .flat_map(|d| d.services.iter())
+            .any(|svc| {
+                matches!(self.probes.get(&svc.uri),
+                    Some(ProbeState::Done(i)) if i.pid == Some(c.pid) && i.os == c.platform.os())
+            })
     }
 
     fn spawn_list(&mut self, ws: &str) {
@@ -560,16 +634,28 @@ impl Scanner {
     fn spawn_probes(&mut self) {
         let now = Instant::now();
         let mut todo: Vec<String> = Vec::new();
-        for d in self.clients.values() {
-            for svc in &d.services {
-                let needs = match self.probes.get(&svc.uri) {
-                    None => true,
-                    Some(ProbeState::Running | ProbeState::Done(_)) => false,
-                    Some(ProbeState::Failed(until)) => *until <= now,
-                };
-                if needs && !todo.contains(&svc.uri) {
-                    todo.push(svc.uri.clone());
-                }
+        let mut offered: Vec<&str> = self
+            .clients
+            .values()
+            .flat_map(|d| d.services.iter().map(|s| s.uri.as_str()))
+            .collect();
+        for c in &self.candidates {
+            let due = self
+                .first_seen
+                .get(&c.vm_uri)
+                .is_some_and(|t| now >= *t + self.config.candidate_grace);
+            if due && !self.claimed(c) {
+                offered.push(&c.vm_uri);
+            }
+        }
+        for uri in offered {
+            let needs = match self.probes.get(uri) {
+                None => true,
+                Some(ProbeState::Running | ProbeState::Done(_)) => false,
+                Some(ProbeState::Failed(until)) => *until <= now,
+            };
+            if needs && !todo.iter().any(|u| u == uri) {
+                todo.push(uri.to_string());
             }
         }
         for uri in todo {
@@ -664,8 +750,36 @@ impl Scanner {
                     flutter_version: info.flutter_version.clone(),
                     workspace: d.entry.workspace_root.clone(),
                     pid: info.pid,
+                    source: AppSource::Dtd,
                 });
             }
+        }
+        for c in &self.candidates {
+            let Some(ProbeState::Done(info)) = self.probes.get(&c.vm_uri) else {
+                continue;
+            };
+            if self.claimed(c) {
+                continue;
+            }
+            let name = info
+                .package
+                .clone()
+                .unwrap_or_else(|| "Dart app".to_string());
+            apps.push(DiscoveredApp {
+                key: AppKey {
+                    package: name.clone(),
+                    device: c.device_name.clone(),
+                    workspace: String::new(),
+                },
+                vm_uri: c.vm_uri.clone(),
+                name,
+                device: c.device_name.clone(),
+                mode: Some(info.mode),
+                flutter_version: info.flutter_version.clone(),
+                workspace: None,
+                pid: Some(c.pid),
+                source: AppSource::Device,
+            });
         }
         apps.sort_by(|a, b| (&a.name, &a.device, &a.vm_uri).cmp(&(&b.name, &b.device, &b.vm_uri)));
         apps.dedup_by(|a, b| a.vm_uri == b.vm_uri);
@@ -676,6 +790,7 @@ impl Scanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::devices::Platform;
     use crate::testing::ScriptedServer;
     use serde_json::{Value, json};
     use std::collections::HashMap;
@@ -786,13 +901,23 @@ mod tests {
 
     /// A VM whose first `fail_first` `getVM` calls fail.
     fn vm_server_with(package: &'static str, fail_first: usize) -> Arc<ScriptedServer> {
+        vm_server_with_identity(package, fail_first, 4242, "macos")
+    }
+
+    /// Like `vm_server_with`, with the pid and operating system `getVM` reports.
+    fn vm_server_with_identity(
+        package: &'static str,
+        fail_first: usize,
+        pid: u32,
+        os: &'static str,
+    ) -> Arc<ScriptedServer> {
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let server = Arc::new(ScriptedServer::start(move |method, _| match method {
             "getVM" => {
                 if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < fail_first {
                     return Err((-32000, "not ready".into()));
                 }
-                Ok(json!({"pid": 4242, "operatingSystem": "macos",
+                Ok(json!({"pid": pid, "operatingSystem": os,
                     "isolates": [{"id": "isolates/1", "name": "main", "isSystemIsolate": false}]}))
             }
             "getIsolate" => Ok(json!({"id": "isolates/1", "name": "main",
@@ -857,6 +982,8 @@ mod tests {
             registry_dir: Some(dir.to_path_buf()),
             dart_cli: None,
             retry_after: Duration::from_secs(5),
+            candidates: None,
+            candidate_grace: Duration::from_millis(300),
         }
     }
 
@@ -1072,5 +1199,118 @@ mod tests {
         let (_disc, _rx) = Discovery::spawn(&tokio::runtime::Handle::current(), cfg);
         wait_until("a retry", || count(&dtd, "ConnectedApp.getVmServices") >= 2).await;
         assert!(started.elapsed() >= Duration::from_millis(600));
+    }
+
+    fn candidate(platform: Platform, pid: u32, vm: &ScriptedServer) -> Candidate {
+        Candidate {
+            platform,
+            device_id: "dev-1".into(),
+            device_name: "iPhone 17".into(),
+            pid,
+            vm_uri: vm.ws_uri().to_string(),
+        }
+    }
+
+    fn publish(tx: &watch::Sender<Arc<[Candidate]>>, v: Vec<Candidate>) {
+        tx.send_replace(Arc::from(v));
+    }
+
+    #[tokio::test]
+    async fn device_candidate_is_listed_after_the_grace_period() {
+        let vm = vm_server_with_identity("shop", 0, 77, "ios");
+        let dir = tempfile::tempdir().unwrap();
+        let (_tx, crx) = watch::channel::<Arc<[Candidate]>>(Arc::from(vec![candidate(
+            Platform::IosSimulator,
+            77,
+            &vm,
+        )]));
+        let mut cfg = config(dir.path());
+        cfg.candidates = Some(crx);
+        let (_disc, mut rx) = Discovery::spawn(&tokio::runtime::Handle::current(), cfg);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(rx.borrow().is_empty());
+        assert_eq!(count(&vm, "getVM"), 0);
+        let apps = wait_for(&mut rx, 1500, "candidate listed", |a| a.len() == 1).await;
+        let a = &apps[0];
+        assert_eq!(a.source, AppSource::Device);
+        assert_eq!(a.name, "shop");
+        assert_eq!(a.device, "iPhone 17");
+        assert_eq!(a.workspace, None);
+        assert_eq!(a.key.workspace, "");
+        assert_eq!(a.pid, Some(77));
+    }
+
+    #[tokio::test]
+    async fn candidate_claimed_by_a_dtd_app_is_never_contacted() {
+        let dtd_vm = vm_server_with_identity("shop", 0, 77, "ios");
+        let dtd = dtd_server(&dtd_vm);
+        let cand_vm = vm_server_with_identity("shop", 0, 77, "ios");
+        let dir = tempfile::tempdir().unwrap();
+        write_entry(dir.path(), &dtd.ws_uri());
+        let (_tx, crx) = watch::channel::<Arc<[Candidate]>>(Arc::from(vec![candidate(
+            Platform::IosSimulator,
+            77,
+            &cand_vm,
+        )]));
+        let mut cfg = config(dir.path());
+        cfg.candidates = Some(crx);
+        cfg.candidate_grace = Duration::from_millis(800);
+        let (_disc, mut rx) = Discovery::spawn(&tokio::runtime::Handle::current(), cfg);
+        wait_for(&mut rx, 1500, "dtd app", |a| a.len() == 1).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let apps = rx.borrow().clone();
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].source, AppSource::Dtd);
+        assert_eq!(count(&cand_vm, "getVM"), 0);
+    }
+
+    #[tokio::test]
+    async fn same_pid_on_another_os_is_not_claimed() {
+        let dtd_vm = vm_server_with_identity("shop", 0, 77, "ios");
+        let dtd = dtd_server(&dtd_vm);
+        let cand_vm = vm_server_with_identity("other", 0, 77, "android");
+        let dir = tempfile::tempdir().unwrap();
+        write_entry(dir.path(), &dtd.ws_uri());
+        let (_tx, crx) = watch::channel::<Arc<[Candidate]>>(Arc::from(vec![candidate(
+            Platform::Android,
+            77,
+            &cand_vm,
+        )]));
+        let mut cfg = config(dir.path());
+        cfg.candidates = Some(crx);
+        let (_disc, mut rx) = Discovery::spawn(&tokio::runtime::Handle::current(), cfg);
+        let apps = wait_for(&mut rx, 1500, "both listed", |a| a.len() == 2).await;
+        assert!(apps.iter().any(|a| a.source == AppSource::Dtd));
+        assert!(apps.iter().any(|a| a.source == AppSource::Device));
+    }
+
+    #[tokio::test]
+    async fn candidate_leaves_when_its_set_drops_it() {
+        let vm = vm_server_with_identity("shop", 0, 77, "ios");
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, crx) = watch::channel::<Arc<[Candidate]>>(Arc::from(vec![candidate(
+            Platform::IosSimulator,
+            77,
+            &vm,
+        )]));
+        let mut cfg = config(dir.path());
+        cfg.candidates = Some(crx);
+        let (_disc, mut rx) = Discovery::spawn(&tokio::runtime::Handle::current(), cfg);
+        wait_for(&mut rx, 1500, "candidate listed", |a| a.len() == 1).await;
+        publish(&tx, Vec::new());
+        wait_for(&mut rx, 1500, "candidate gone", |a| a.is_empty()).await;
+    }
+
+    #[test]
+    fn same_app_matches_across_launch_methods() {
+        let k = |p: &str, d: &str, w: &str| AppKey {
+            package: p.into(),
+            device: d.into(),
+            workspace: w.into(),
+        };
+        assert!(k("shop", "iPhone 17", "/w").same_app(&k("shop", "iPhone 17", "")));
+        assert!(k("shop", "iPhone 17", "/w").same_app(&k("shop", "iPhone 17", "/w")));
+        assert!(!k("shop", "iPhone 17", "/w").same_app(&k("shop", "iPhone 17", "/x")));
+        assert!(!k("shop", "iPhone 17", "").same_app(&k("shop", "Pixel", "")));
     }
 }

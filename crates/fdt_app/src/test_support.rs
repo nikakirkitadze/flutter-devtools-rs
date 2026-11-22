@@ -9,7 +9,7 @@ use fdt_store::Snapshot;
 use fdt_store::net::{BodyKind, BodyLimits};
 use fdt_store::run::{AppInfo, Mode};
 use fdt_store::time::{EntryId, RunId};
-use fdt_vm::discovery::{AppKey, DiscoveredApp};
+use fdt_vm::discovery::{AppKey, AppSource, DiscoveredApp};
 use fdt_vm::service::Mode as VmMode;
 use gpui_kit::base::Root;
 use gpui_kit::test::TestWindowExt as _;
@@ -109,6 +109,7 @@ pub fn discovered(name: &str, device: &str, mode: Option<VmMode>) -> DiscoveredA
         flutter_version: Some("3.47.9".to_string()),
         workspace: Some(format!("/home/dev/projects/{name}")),
         pid: None,
+        source: AppSource::Dtd,
     }
 }
 
