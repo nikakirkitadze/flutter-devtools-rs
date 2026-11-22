@@ -182,4 +182,40 @@ mod tests {
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].udid, "BBBB");
     }
+    #[test]
+    fn scan_skips_files_whose_mtime_and_size_are_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "AAAA", "iPhone A", 3);
+        let file = tmp.path().join("AAAA").join("device.plist");
+        let mut scan = SimulatorScan::new(tmp.path().to_path_buf());
+        assert_eq!(scan.booted().len(), 1);
+        let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+
+        // Same length, state 3 -> 1, original mtime restored: the cache must be used.
+        std::fs::write(&file, plist("AAAA", "iPhone A", 1)).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        assert_eq!(scan.booted().len(), 1, "unchanged file was re-read");
+
+        // A newer mtime makes the scan read it again.
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(mtime + std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(scan.booted().is_empty());
+    }
+
+    #[test]
+    fn entities_in_names_are_unescaped_once() {
+        let sim = parse_device_plist(&plist("U", "Tom &amp; Jerry&apos;s", 3)).unwrap();
+        assert_eq!(sim.name, "Tom & Jerry's");
+        let sim = parse_device_plist(&plist("U", "&amp;lt;", 3)).unwrap();
+        assert_eq!(sim.name, "&lt;");
+    }
 }
