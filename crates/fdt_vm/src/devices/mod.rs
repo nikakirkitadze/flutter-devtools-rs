@@ -1,6 +1,7 @@
 //! Finding Flutter apps opened on iOS simulators and Android devices without `flutter run`, by
 //! watching device logs for the VM service line the engine prints at startup.
 
+pub mod follow;
 pub mod marker;
 pub mod simulators;
 pub mod tools;
