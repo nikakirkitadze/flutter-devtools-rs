@@ -783,7 +783,7 @@ esac
             std::fs::write(dir.path().join("silent"), "").unwrap();
             let adb = fake_adb(dir.path(), &format!("echo \"{LINE}\""));
             let (out, status) = channels();
-            let mut rx = out.subscribe();
+            let rx = out.subscribe();
             let watch = AndroidWatch::spawn(&Handle::current(), adb, timing(), out.clone(), status);
 
             assert!(until(|| removed_has(dir.path(), closed), 3).await);
