@@ -10,6 +10,7 @@ pub mod tools;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::runtime::Handle;
@@ -119,11 +120,12 @@ impl DeviceWatchConfig {
 /// it stops both, removes their forwards, and publishes an empty set and the default status.
 pub struct DeviceWatch {
     merge: JoinHandle<()>,
-    // Dropped after `merge` is aborted, in field order, each emptying its own set.
+    // Stopped by their own `Drop`, after ours has published the final empty values.
     _simulator: Option<SimulatorWatch>,
     _android: Option<AndroidWatch>,
     candidates: Arc<watch::Sender<Arc<[Candidate]>>>,
     status: Arc<watch::Sender<WatchStatus>>,
+    closed: Arc<AtomicBool>,
 }
 
 impl DeviceWatch {
@@ -152,10 +154,14 @@ impl DeviceWatch {
                 (st, Some(w))
             }
             _ if Os::current() != Os::MacOs => (new_state(PlatformState::Off), None),
-            _ => (
-                new_state(PlatformState::Unavailable("xcrun not found".into())),
-                None,
-            ),
+            (xcrun, _) => {
+                let why = if xcrun.is_some() {
+                    "simulator folder not found"
+                } else {
+                    "xcrun not found"
+                };
+                (new_state(PlatformState::Unavailable(why.into())), None)
+            }
         };
         let (and_state, android) = match config.adb {
             Some(adb) => {
@@ -170,7 +176,9 @@ impl DeviceWatch {
             ),
         };
 
+        let closed = Arc::new(AtomicBool::new(false));
         let merge = {
+            let closed = closed.clone();
             let (candidates, status) = (candidates.clone(), status.clone());
             let (mut sim_rx, mut and_rx) = (sim_out.subscribe(), and_out.subscribe());
             let (mut sim_st, mut and_st) = (sim_state.subscribe(), and_state.subscribe());
@@ -186,7 +194,8 @@ impl DeviceWatch {
                         .collect();
                     all.sort_by(|a, b| a.vm_uri.cmp(&b.vm_uri));
                     candidates.send_if_modified(|cur| {
-                        if cur[..] == all[..] {
+                        // A merge already running when `Drop` fires must not undo its empty set.
+                        if closed.load(Ordering::SeqCst) || cur[..] == all[..] {
                             false
                         } else {
                             *cur = Arc::from(all);
@@ -198,7 +207,7 @@ impl DeviceWatch {
                         android: and_st.borrow_and_update().clone(),
                     };
                     status.send_if_modified(|cur| {
-                        if *cur == now {
+                        if closed.load(Ordering::SeqCst) || *cur == now {
                             false
                         } else {
                             *cur = now;
@@ -220,15 +229,17 @@ impl DeviceWatch {
             _android: android,
             candidates,
             status,
+            closed,
         }
     }
 }
 
 impl Drop for DeviceWatch {
     fn drop(&mut self) {
+        self.closed.store(true, Ordering::SeqCst);
         self.merge.abort();
-        // The watchers drop after this, stopping their processes; the final values are sent here
-        // so no merge can race them.
+        // The watchers drop after this and stop their processes. With `closed` set, no merge
+        // write can land after these final values.
         self.candidates.send_replace(Arc::from(Vec::new()));
         self.status.send_replace(WatchStatus::default());
     }
@@ -313,7 +324,9 @@ mod tests {
         } else {
             "exec sleep 30".to_string()
         };
-        let show = show_pid.map_or("true".to_string(), |p| format!("echo '{}'", marker(p)));
+        let show = show_pid.map_or("true".to_string(), |p| {
+            format!("echo '{}'; touch \"$DIR/show_ran\"", marker(p))
+        });
         let xcrun = fake_xcrun(dir.path(), &stream, &show);
         let out = Arc::new(watch::channel(Arc::<[Candidate]>::from(Vec::new())).0);
         let status = Arc::new(watch::channel(WatchStatus::default()).0);
@@ -366,16 +379,13 @@ mod tests {
 
     #[tokio::test]
     async fn stale_backfill_line_is_skipped() {
-        let r = rig(false, Some(999_999));
-        let st = r.status.clone();
-        assert!(
-            until(
-                || st.borrow().simulator == PlatformState::Watching { devices: 1 },
-                3
-            )
-            .await
-        );
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        let mut c = Command::new("true").spawn().unwrap();
+        let dead = c.id();
+        c.wait().unwrap();
+        let r = rig(false, Some(dead));
+        let ran = r._dir.path().join("show_ran");
+        assert!(until(|| ran.exists(), 3).await, "backfill ran");
+        tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(r.out.borrow().is_empty());
     }
 
@@ -410,6 +420,60 @@ mod tests {
             .await
         );
         assert!(until(|| !crate::discovery::pid_alive(pid), 3).await);
+    }
+
+    #[tokio::test]
+    async fn device_watch_merges_simulator_and_android_sets() {
+        use tokio::net::TcpListener;
+        let r = rig(true, None);
+        let dir = r._dir.path().to_path_buf();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _holder = tokio::spawn(async move {
+            let mut keep = Vec::new();
+            while let Ok((s, _)) = listener.accept().await {
+                keep.push(s);
+            }
+        });
+        let script = format!(
+            "#!/bin/sh\ncase \"$*\" in\n  \"track-devices\") printf '0015emulator-5554\\tdevice\\n'; exec sleep 30;;\n  \"devices -l\") echo 'emulator-5554 device model:Pixel_8';;\n  *\"logcat -d\"*) true;;\n  *\"logcat -v brief -T 1\"*) echo 'I/flutter ( 4242): The Dart VM service is listening on http://127.0.0.1:40421/tok=/'; exec sleep 30;;\n  *\"forward tcp:0 tcp:\"*) echo {port};;\nesac\n"
+        );
+        let tmp = dir.join("adb.tmp");
+        std::fs::write(&tmp, script).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let adb = dir.join("adb");
+        std::fs::rename(&tmp, &adb).unwrap();
+
+        let out = Arc::new(watch::channel(Arc::<[Candidate]>::from(Vec::new())).0);
+        let status = Arc::new(watch::channel(WatchStatus::default()).0);
+        let _both = DeviceWatch::spawn(
+            &Handle::current(),
+            DeviceWatchConfig {
+                adb: Some(adb),
+                xcrun: Some(dir.join("xcrun")),
+                simulator_dir: Some(r.sims.clone()),
+                timing: timing(),
+            },
+            out.clone(),
+            status,
+        );
+        assert!(until(|| out.borrow().len() == 2, 3).await);
+        {
+            let cur = out.borrow();
+            let mut sorted: Vec<_> = cur.iter().map(|c| c.vm_uri.clone()).collect();
+            sorted.sort();
+            assert_eq!(
+                sorted,
+                cur.iter().map(|c| c.vm_uri.clone()).collect::<Vec<_>>()
+            );
+            assert!(cur.iter().any(|c| c.platform == Platform::IosSimulator));
+            assert!(cur.iter().any(|c| c.platform == Platform::Android
+                && c.vm_uri == format!("http://127.0.0.1:{port}/tok=/")));
+        }
+        let mut rx = out.subscribe();
+        rx.borrow_and_update();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!rx.has_changed().unwrap(), "no wake while nothing changes");
     }
 
     #[tokio::test]

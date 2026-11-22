@@ -822,6 +822,9 @@ esac
             );
             assert_eq!(*status.borrow(), PlatformState::Watching { devices: 0 });
             assert!(watch.held.lock().unwrap().is_empty());
+            // adb drops a detached device's forwards itself: no remove must be run for it.
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            assert!(!removed_has(dir.path(), port), "forward --remove was run");
             // The logcat follower for that device is gone (`kill -0` fails for a dead process).
             let dead = || {
                 !std::process::Command::new("kill")

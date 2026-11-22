@@ -108,8 +108,16 @@ impl Watcher {
 
     fn on_scan(&mut self, tx: &mpsc::UnboundedSender<Line>) {
         let booted = self.scan.booted();
-        self.status.send_replace(PlatformState::Watching {
+        let now = PlatformState::Watching {
             devices: booted.len(),
+        };
+        self.status.send_if_modified(|cur| {
+            if *cur == now {
+                false
+            } else {
+                *cur = now;
+                true
+            }
         });
         let gone: Vec<String> = self
             .sims
@@ -358,18 +366,22 @@ esac
         assert!(until(|| out.borrow().is_empty(), 3).await);
     }
 
+    /// The pid of a process that has exited and been reaped.
+    fn dead_pid() -> u32 {
+        let mut c = Command::new("true").spawn().unwrap();
+        let pid = c.id();
+        c.wait().unwrap();
+        pid
+    }
+
     #[tokio::test]
     async fn stale_backfill_line_is_skipped() {
-        let (_d, xcrun, sims) = setup("exec sleep 30", &format!("echo '{}'", marker(999_999)));
-        let (_w, (out, status)) = start(xcrun, sims);
-        assert!(
-            until(
-                || *status.borrow() == PlatformState::Watching { devices: 1 },
-                3
-            )
-            .await
-        );
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        let show = format!("echo '{}'; touch \"$DIR/show_ran\"", marker(dead_pid()));
+        let (d, xcrun, sims) = setup("exec sleep 30", &show);
+        let (_w, (out, _)) = start(xcrun, sims);
+        let ran = d.path().join("show_ran");
+        assert!(until(|| ran.exists(), 3).await, "backfill ran");
+        tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(out.borrow().is_empty());
     }
 
