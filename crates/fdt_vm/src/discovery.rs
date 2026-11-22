@@ -1313,4 +1313,53 @@ mod tests {
         assert!(!k("shop", "iPhone 17", "/w").same_app(&k("shop", "iPhone 17", "/x")));
         assert!(!k("shop", "iPhone 17", "").same_app(&k("shop", "Pixel", "")));
     }
+
+    #[tokio::test]
+    async fn candidate_claimed_after_listing_is_dropped() {
+        let cand_vm = vm_server_with_identity("shop", 0, 77, "ios");
+        let dtd_vm = vm_server_with_identity("shop", 0, 77, "ios");
+        let dtd = dtd_server(&dtd_vm);
+        let dir = tempfile::tempdir().unwrap();
+        let (_tx, crx) = watch::channel::<Arc<[Candidate]>>(Arc::from(vec![candidate(
+            Platform::IosSimulator,
+            77,
+            &cand_vm,
+        )]));
+        let mut cfg = config(dir.path());
+        cfg.candidates = Some(crx);
+        let (_disc, mut rx) = Discovery::spawn(&tokio::runtime::Handle::current(), cfg);
+        let apps = wait_for(&mut rx, 1500, "candidate listed", |a| a.len() == 1).await;
+        assert_eq!(apps[0].source, AppSource::Device);
+        write_entry(dir.path(), &dtd.ws_uri());
+        let apps = wait_for(&mut rx, 2000, "only the dtd app", |a| {
+            a.len() == 1 && a[0].source == AppSource::Dtd
+        })
+        .await;
+        assert_eq!(apps.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn http_candidate_url_is_probed_end_to_end() {
+        let vm = vm_server_with_identity("shop", 0, 77, "ios");
+        let ws = vm.ws_uri();
+        let http = format!(
+            "http://{}:{}/tok3n/",
+            ws.host_str().unwrap(),
+            ws.port().unwrap()
+        );
+        assert_eq!(
+            VmServiceUri::parse(&http).unwrap().ws_url().host_str(),
+            ws.host_str()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = candidate(Platform::IosSimulator, 77, &vm);
+        c.vm_uri = http;
+        let (_tx, crx) = watch::channel::<Arc<[Candidate]>>(Arc::from(vec![c]));
+        let mut cfg = config(dir.path());
+        cfg.candidates = Some(crx);
+        let (_disc, mut rx) = Discovery::spawn(&tokio::runtime::Handle::current(), cfg);
+        let apps = wait_for(&mut rx, 1500, "http candidate listed", |a| a.len() == 1).await;
+        assert_eq!(apps[0].source, AppSource::Device);
+        assert!(count(&vm, "getVM") >= 1);
+    }
 }
