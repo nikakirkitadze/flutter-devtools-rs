@@ -28,6 +28,8 @@ pub struct Settings {
     pub trace_widget_builds: bool,
     /// App addresses used recently, newest first.
     pub recent_urls: Vec<String>,
+    /// Look for apps opened on booted simulators and Android devices, not only under `flutter run`.
+    pub find_device_apps: bool,
 }
 
 impl Default for Settings {
@@ -40,6 +42,7 @@ impl Default for Settings {
             body_budget_mib: 200,
             trace_widget_builds: false,
             recent_urls: Vec::new(),
+            find_device_apps: true,
         }
     }
 }
@@ -88,6 +91,7 @@ impl Settings {
         field(map, "body_budget_mib", &mut s.body_budget_mib);
         field(map, "trace_widget_builds", &mut s.trace_widget_builds);
         field(map, "recent_urls", &mut s.recent_urls);
+        field(map, "find_device_apps", &mut s.find_device_apps);
         s.recent_urls.truncate(RECENT_URLS_MAX);
         s
     }
@@ -272,9 +276,23 @@ mod tests {
             body_budget_mib: 10,
             trace_widget_builds: true,
             recent_urls: vec!["ws://x/ws".into()],
+            find_device_apps: false,
         };
         SettingsStore::write(&path, &s).unwrap();
         assert_eq!(SettingsStore::load(path).get(), &s);
+    }
+
+    #[test]
+    fn find_device_apps_defaults_on_and_round_trips() {
+        assert!(Settings::default().find_device_apps);
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_in(dir.path());
+        let s = Settings {
+            find_device_apps: false,
+            ..Settings::default()
+        };
+        SettingsStore::write(&path, &s).unwrap();
+        assert!(!SettingsStore::load(path).get().find_device_apps);
     }
 
     #[test]

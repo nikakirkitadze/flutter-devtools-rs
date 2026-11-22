@@ -104,6 +104,8 @@ pub struct MainWindow {
     /// The Timeline page, kept for the life of the window.
     timeline: Entity<TimelineView>,
     _host_wait: Option<gpui_kit::Subscription>,
+    /// Redraws the window when the device watch's status changes (the Settings page shows it).
+    _device_status_task: Option<gpui_kit::Task<()>>,
     _host_failed_wait: Option<gpui_kit::Subscription>,
     /// Whether the last status seen was `Connected`, so only a new connection leaves Start.
     was_connected: bool,
@@ -241,6 +243,7 @@ impl MainWindow {
             performance,
             timeline,
             _host_wait: host_wait,
+            _device_status_task: None,
             _host_failed_wait: host_failed_wait,
             was_connected,
             session_id,
@@ -279,6 +282,7 @@ impl MainWindow {
 
     /// Creates the start page from the host's discovery, once the host exists.
     fn apps_from_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.watch_device_status(cx);
         if self.start.is_some() {
             return;
         }
@@ -291,6 +295,22 @@ impl MainWindow {
             let (_, apps) = watch::channel::<Arc<[DiscoveredApp]>>(Arc::from(Vec::new()));
             self.set_apps_source(apps, window, cx);
         }
+    }
+
+    /// Redraws on every change of the host's device-watch status, once the host exists.
+    fn watch_device_status(&mut self, cx: &mut Context<Self>) {
+        if self._device_status_task.is_some() || !cx.has_global::<CaptureHost>() {
+            return;
+        }
+        let mut rx = cx.global::<CaptureHost>().device_status();
+        self._device_status_task = Some(cx.spawn(async move |this, cx| {
+            while rx.changed().await.is_ok() {
+                rx.borrow_and_update();
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        }));
     }
 
     /// Creates the start page over `apps` (a no-op if it exists).
@@ -818,8 +838,15 @@ impl Render for MainWindow {
             }
             Page::Settings => {
                 let free = settings(cx).free_app_http_memory;
+                let device_status = if cx.has_global::<CaptureHost>() {
+                    cx.global::<CaptureHost>().device_status().borrow().clone()
+                } else {
+                    Default::default()
+                };
                 settings_page::render(
                     settings(cx).theme,
+                    settings(cx).find_device_apps,
+                    &device_status,
                     free,
                     settings(cx).trace_widget_builds,
                     cx.weak_entity(),

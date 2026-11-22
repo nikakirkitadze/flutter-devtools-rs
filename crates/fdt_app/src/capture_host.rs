@@ -7,6 +7,7 @@ use fdt_capture::{Capture, CaptureConfig, CaptureRuntime, ConnStatus, Target};
 use fdt_store::Snapshot;
 use fdt_store::net::{BodyKind, BodyLimits};
 use fdt_store::time::EntryId;
+use fdt_vm::devices::{Candidate, DeviceWatch, DeviceWatchConfig, WatchStatus};
 use fdt_vm::discovery::{DiscoveredApp, Discovery, DiscoveryConfig};
 use gpui_kit::{App, Global};
 use std::path::{Path, PathBuf};
@@ -81,6 +82,14 @@ impl CaptureControl for Capture {
 pub struct CaptureHost {
     // Declared first so the scan stops before the runtime goes away.
     _discovery: Discovery,
+    /// Watches simulators and devices for apps started without the Flutter tool. Dropping it
+    /// stops its processes and empties `candidates`.
+    device_watch: Option<DeviceWatch>,
+    /// Whether a watch may be started at all: tests that stand in for the host say no, so they
+    /// never touch a real simulator or adb.
+    can_watch: bool,
+    candidates: Arc<watch::Sender<Arc<[Candidate]>>>,
+    device_status: Arc<watch::Sender<WatchStatus>>,
     runtime: CaptureRuntime,
     apps: watch::Receiver<Arc<[DiscoveredApp]>>,
 }
@@ -102,12 +111,35 @@ impl CaptureHost {
             dart_cli: find_dart(std::env::var_os("PATH").as_deref()),
             ..DiscoveryConfig::default()
         };
-        Self::install_with(cx, config);
+        Self::install_inner(cx, config, empty_candidates(), true);
+        if crate::settings::settings(cx).find_device_apps && cx.has_global::<CaptureHost>() {
+            cx.global_mut::<CaptureHost>().set_find_device_apps(true);
+        }
     }
 
     /// Like [`install`](Self::install), with an explicit discovery config. Tests pass an empty
     /// temporary registry directory and no `dart`, so they never touch the real tooling daemon.
     pub fn install_with(cx: &mut App, config: DiscoveryConfig) {
+        Self::install_inner(cx, config, empty_candidates(), false);
+    }
+
+    /// Like [`install_with`](Self::install_with), publishing device candidates through
+    /// `candidates`, which the test holds. No watch is ever started.
+    #[cfg(test)]
+    pub fn install_with_candidates(
+        cx: &mut App,
+        config: DiscoveryConfig,
+        candidates: Arc<watch::Sender<Arc<[Candidate]>>>,
+    ) {
+        Self::install_inner(cx, config, candidates, false);
+    }
+
+    fn install_inner(
+        cx: &mut App,
+        mut config: DiscoveryConfig,
+        candidates: Arc<watch::Sender<Arc<[Candidate]>>>,
+        can_watch: bool,
+    ) {
         if cx.has_global::<CaptureHost>() {
             return;
         }
@@ -119,9 +151,14 @@ impl CaptureHost {
                 return;
             }
         };
+        config.candidates = Some(candidates.subscribe());
         let (discovery, apps) = Discovery::spawn(&runtime.handle(), config);
         cx.set_global(CaptureHost {
             _discovery: discovery,
+            device_watch: None,
+            can_watch,
+            candidates,
+            device_status: Arc::new(watch::channel(WatchStatus::default()).0),
             runtime,
             apps,
         });
@@ -136,10 +173,38 @@ impl CaptureHost {
         ))
     }
 
+    /// Starts or stops looking for apps opened on simulators and devices. Off drops the watch
+    /// and publishes an empty set and the default status, so its rows leave the Connect page.
+    pub fn set_find_device_apps(&mut self, on: bool) {
+        if on {
+            if self.can_watch && self.device_watch.is_none() {
+                self.device_watch = Some(DeviceWatch::spawn(
+                    &self.runtime.handle(),
+                    DeviceWatchConfig::detect(),
+                    self.candidates.clone(),
+                    self.device_status.clone(),
+                ));
+            }
+        } else {
+            self.device_watch = None;
+            self.candidates.send_replace(Arc::from(Vec::new()));
+            self.device_status.send_replace(WatchStatus::default());
+        }
+    }
+
+    /// What the simulator and Android watchers are doing.
+    pub fn device_status(&self) -> watch::Receiver<WatchStatus> {
+        self.device_status.subscribe()
+    }
+
     /// The running apps discovery currently sees.
     pub fn apps(&self) -> watch::Receiver<Arc<[DiscoveredApp]>> {
         self.apps.clone()
     }
+}
+
+fn empty_candidates() -> Arc<watch::Sender<Arc<[Candidate]>>> {
+    Arc::new(watch::channel::<Arc<[Candidate]>>(Arc::from(Vec::new())).0)
 }
 
 /// The capture settings the user's preferences describe.

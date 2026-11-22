@@ -8,7 +8,7 @@ use crate::settings::{record_recent_url, settings, update_settings};
 use fdt_capture::{ConnStatus, Target};
 use fdt_ui::theme::TokensExt as _;
 use fdt_ui::tokens::{alpha, font, layout, motion, radius, row, space};
-use fdt_vm::discovery::DiscoveredApp;
+use fdt_vm::discovery::{AppSource, DiscoveredApp};
 use fdt_vm::service::Mode;
 use fdt_vm::uri::VmServiceUri;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -26,7 +26,13 @@ use tokio::sync::watch;
 /// How long the page says it is looking before it gives up waiting for the first scan.
 const SCAN_WAIT: Duration = Duration::from_secs(2); // token-check: allow: first-scan grace period
 
-const EMPTY_COPY: &str = "No running Flutter apps found. Start one with `flutter run`, or paste its VM service URL below.";
+const EMPTY_COPY: &str = "No running Flutter apps found. Start one with `flutter run`, or open a debug or profile build on a simulator or a connected device. Release builds can't be connected. Or paste a VM service URL below.";
+
+const IPHONE_COPY: &str =
+    "Apps on a connected iPhone appear only when started with `flutter run` or `flutter attach`.";
+
+/// Where the row's folder column says an app opened from a device log lives.
+const DEVICE_FOLDER: &str = "opened on device";
 
 /// What the user asked to connect to, so the right row shows the spinner.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -269,12 +275,16 @@ fn row_label(app: &DiscoveredApp) -> String {
     let mut parts = vec![app.name.clone(), app.device.clone()];
     parts.extend(app.mode.map(|m| mode_text(m).to_string()));
     parts.extend(app.flutter_version.as_ref().map(|v| format!("Flutter {v}")));
-    parts.extend(
-        app.workspace
-            .as_deref()
-            .map(short_path)
-            .filter(|p| !p.is_empty()),
-    );
+    if app.source == AppSource::Device {
+        parts.push(DEVICE_FOLDER.to_string());
+    } else {
+        parts.extend(
+            app.workspace
+                .as_deref()
+                .map(short_path)
+                .filter(|p| !p.is_empty()),
+        );
+    }
     parts.join(" · ")
 }
 
@@ -338,11 +348,20 @@ impl StartPage {
             );
         }
         el = el.child(div().flex_1());
-        if let Some(path) = app.workspace.as_deref().map(short_path)
-            && !path.is_empty()
-        {
+        let folder = if app.source == AppSource::Device {
+            Some(DEVICE_FOLDER.to_string())
+        } else {
+            app.workspace
+                .as_deref()
+                .map(short_path)
+                .filter(|path| !path.is_empty())
+        };
+        if let Some(path) = folder {
             el = el.child(
                 div()
+                    .id(SharedString::from(format!("start-app-{ix}-folder")))
+                    .test_support()
+                    .aria_label(SharedString::from(path.clone()))
                     .text_size(font::DENSE)
                     .font_family(font::MONO)
                     .text_color(Hsla::from(t.text_faint))
@@ -376,7 +395,11 @@ impl StartPage {
                 .map(|(ix, app)| self.app_row(ix, app, cx))
                 .collect()
         } else if self.scanned || self.scan_waited {
-            vec![note("start-empty", EMPTY_COPY)]
+            let mut lines = vec![note("start-empty", EMPTY_COPY)];
+            if cfg!(target_os = "macos") {
+                lines.push(note("start-empty-iphone", IPHONE_COPY));
+            }
+            lines
         } else {
             vec![note("start-looking", "Looking for running apps…")]
         };
@@ -805,9 +828,28 @@ mod tests {
         let (_shell, cx, _fake, _tx) = open_start(cx, Some(Vec::new()));
         assert_eq!(
             label(cx, "start-empty").unwrap(),
-            "No running Flutter apps found. Start one with `flutter run`, or paste its VM service URL below."
+            "No running Flutter apps found. Start one with `flutter run`, or open a debug or profile build on a simulator or a connected device. Release builds can't be connected. Or paste a VM service URL below."
         );
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                label(cx, "start-empty-iphone").unwrap(),
+                "Apps on a connected iPhone appear only when started with `flutter run` or `flutter attach`."
+            );
+        } else {
+            assert!(!exists(cx, "start-empty-iphone"));
+        }
         assert!(!exists(cx, "start-looking"));
+    }
+
+    #[gpui_kit::test]
+    fn device_rows_say_opened_on_device(cx: &mut TestAppContext) {
+        let mut device = discovered("found", "iPhone 15", Some(VmMode::Debug));
+        device.workspace = None;
+        device.source = fdt_vm::discovery::AppSource::Device;
+        let (_shell, cx, _fake, _tx) =
+            open_start(cx, Some(vec![device, discovered("shop", "macOS", None)]));
+        assert_eq!(label(cx, "start-app-0-folder").unwrap(), "opened on device");
+        assert_eq!(label(cx, "start-app-1-folder").unwrap(), "projects/shop");
     }
 
     #[gpui_kit::test]
