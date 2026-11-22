@@ -81,9 +81,25 @@ async fn run_child(program: &Path, args: &[String], lines: &UnboundedSender<Stri
         return true;
     };
     if let Some(stdout) = child.stdout.take() {
-        let mut reader = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            if lines.send(line).is_err() {
+        let mut reader = BufReader::new(stdout);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            // Raw bytes: logs can hold truncated multibyte characters, which must not end us.
+            match reader.read_until(b'\n', &mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            if buf.ends_with(b"\n") {
+                buf.pop();
+                if buf.ends_with(b"\r") {
+                    buf.pop();
+                }
+            }
+            if lines
+                .send(String::from_utf8_lossy(&buf).into_owned())
+                .is_err()
+            {
                 return false;
             }
         }
@@ -113,9 +129,11 @@ pub async fn run_once(program: &Path, args: &[&str], timeout: Duration) -> Optio
     }
     String::from_utf8(out.stdout).ok()
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::discovery::pid_alive;
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -146,6 +164,29 @@ mod tests {
                 .unwrap();
             assert_eq!(got.as_deref(), Some(want));
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn follower_survives_invalid_utf8() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (p, a) = sh("printf 'a\\377b\\nok\\n'; sleep 5");
+        let _f = follow(
+            &tokio::runtime::Handle::current(),
+            p,
+            a,
+            Backoff::default(),
+            tx,
+        );
+        let first = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first.starts_with('a') && first.ends_with('b'), "{first:?}");
+        let second = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap();
+        assert_eq!(second.as_deref(), Some("ok"));
     }
 
     #[cfg(unix)]
