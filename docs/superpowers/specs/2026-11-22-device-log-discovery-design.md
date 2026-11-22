@@ -86,9 +86,20 @@ Verified on the author's machine on 2026-11-22 (Flutter 3.47.9, macOS 27.2, Xcod
     works as is.
   - A pasted copy of that URL connected `fdt` and recorded frames and logs.
 - **F2. Booted simulators.** `xcrun simctl list devices booted -j` lists them with name and udid.
-- **F3. Android.** `adb` is at `~/Library/Android/sdk/platform-tools/adb` and `/opt/homebrew/bin/adb`.
-  `adb devices -l` lists the emulator with its model. (The exact logcat line format and
-  `adb forward tcp:0 tcp:<port>` are confirmed in spike S2.)
+- **F3. Android (spike S2, emulator `sdk_gphone64_arm64`, API 36).** `adb` is at
+  `~/Library/Android/sdk/platform-tools/adb` and `/opt/homebrew/bin/adb`. With a debug `jank_lab`
+  installed and started from its launcher activity (no Flutter tool):
+  - `adb logcat -v brief flutter:I *:S` shows
+    `I/flutter ( 9677): The Dart VM service is listening on http://127.0.0.1:40421/<token>/`. The pid
+    is space-padded inside the brackets, and is the app's pid (`pidof` and `getVM` agree).
+  - `adb forward tcp:0 tcp:40421` prints the local port (`54918`). `getVM` through
+    `ws://127.0.0.1:54918/<token>/ws` answers.
+  - A TCP connection to the forwarded port stays open (400 ms) while the app runs, and is closed by
+    adb after 3 ms once the app is killed (`am force-stop`).
+  - `adb logcat -v brief -T 1 flutter:I *:S` follows new lines: the relaunched app's line (new pid)
+    arrived.
+  - `adb shell monkey -p <package> -c android.intent.category.LAUNCHER 1` did not start the app on
+    this emulator; `am start -n <package>/.MainActivity` did (test scripts only).
 - **F4. iPhone.** The Flutter SDK ships `idevicesyslog` and `iproxy` in
   `<flutter>/bin/cache/artifacts/{libimobiledevice,usbmuxd}`. With `DYLD_LIBRARY_PATH` set to the
   sibling artifact folders, `idevicesyslog -u <udid>` streamed Nika's iPhone (about 35 lines a
@@ -115,14 +126,25 @@ Verified on the author's machine on 2026-11-22 (Flutter 3.47.9, macOS 27.2, Xcod
   attached. Polling both every 2 s would cost about 9 % of a core, so device lists must come from
   change notifications (§6.2).
 
-Believed but not verified (spike S3):
-
-- **F9. DDS.** When the Flutter tool runs an app, DDS takes over its VM service and the raw URL in the
-  device log stops accepting other clients. DDS also refuses to start while another client is
-  connected to the VM service ("Existing VM service clients prevent DDS from taking control"). So:
-  - if `fdt` is connected directly to an app, a later `flutter attach` to it can fail;
-  - if `fdt` probes an app at the moment `flutter run` starts DDS for it, `flutter run` can fail.
-    §6.4 is designed around this.
+- **F9. DDS (spike S3, 2026-11-22, iPhone 18 Pro simulator, iOS 27).** `flutter run` of `jank_lab`
+  while a script connected to the raw VM service URL 60 ms after its log line and held the socket:
+  - The script's `getVM` answered (pid 20182, the same as the log line's pid). About 590 ms after the
+    log line, when DDS connected, the VM service **closed the script's socket** (close code 1005).
+    `flutter run` went on normally (`app.started`). So a direct client does not stop DDS: DDS ends
+    it. An early probe cannot break `flutter run`.
+  - The DTD registry file appeared 607 ms after the log line.
+  - With DDS attached, a new direct client to the raw URL is refused (WebSocket error, close 1006).
+    So the log line of an app the Flutter tool is running never yields a working candidate.
+  - Consequence: if `fdt` is connected directly to an app and the user then runs `flutter attach`,
+    `fdt`'s connection is closed, and it reconnects through the DTD entry (§6.6).
+- **F12. Device-list sources (spike S4).**
+  - Simulators: each `~/Library/Developer/CoreSimulator/Devices/<udid>/device.plist` has `name` and
+    `state` (3 booted, 1 shut down), and its modification time changes when the state does. Reading
+    these files needs no `simctl` call.
+  - Android: `adb track-devices` printed `0015emulator-5554\tdevice` (a 4-digit hex length, then the
+    `adb devices` lines) and stays open, printing again on every change.
+  - iPhone: a `Listen` request on `/var/run/usbmuxd` (plist protocol, version 1, message type 8)
+    answered `Result 0`, then pushed `Attached` for Nika's iPhone (`ConnectionType USB`).
 
 ## 5. Approaches
 
@@ -156,13 +178,12 @@ watcher takes the URL after it and the pid before it, forwards the port if neede
 candidate.
 
 **Device lists are not polled** (F11). Each watcher learns about devices from a source that pushes
-changes, and runs a listing command only when something changed. Spike S4 confirms the sources
-below; the builder may pick others that meet the budget.
+changes (F12), and runs a listing command only when something changed.
 
 **iOS simulator (macOS only)**
-- Devices: watch the CoreSimulator device folder (`~/Library/Developer/CoreSimulator/Devices`,
-  where each device's `device.plist` records its state) with file-system events, and run
-  `xcrun simctl list devices booted -j` when it changes.
+- Devices: watch the CoreSimulator device folder (`~/Library/Developer/CoreSimulator/Devices`) and
+  its `*/device.plist` files with file-system events, and read `name` and `state` from the plists
+  (F12). No `simctl` call is needed to list them.
 - Follower: `xcrun simctl spawn <udid> log stream --style ndjson --predicate 'eventMessage CONTAINS "Dart VM service is listening"'`.
   The predicate filters inside the log daemon, so `fdt` sees only matching lines.
 - Apps already running: when a simulator is first seen, run the same predicate with `log show` over
@@ -209,16 +230,18 @@ Each platform turns itself off quietly when its tool is missing.
 ### 6.4 Staying out of the Flutter tool's way, and leaving the list
 
 The same app can be found both ways: `flutter run` prints the log line too, and reads it at about
-the same moment `fdt` does. Then it starts DDS, which refuses to start if another client (such as
-an `fdt` probe) is connected (F9). Protecting `flutter run` matters more than listing fast, because
-`flutter run` is how the author usually works.
+the same moment `fdt` does. An early probe cannot break `flutter run` (F9: DDS closes it), but
+without care the app would flash up as a log row and then be replaced by its DTD row, and `fdt`
+would contact an app the Flutter tool is about to own. `flutter run` is how the author usually works,
+so its rows must look exactly as they do today.
 
 - **Identity:** device plus the app's pid. A candidate's pid comes from its log line (F10), so it is
   known without touching the app. A DTD-listed app's pid comes from its probe's `getVM`, as today.
 - **Grace period.** A candidate is not probed until 3 s after its log line. If, by then, a DTD-listed
   app on the same device has the same pid, the candidate is dropped without ever being contacted.
-  Otherwise it is probed and listed. 3 s covers DDS start-up in a normal `flutter run`; S3 measures
-  how long that actually takes and sets the final value.
+  Otherwise it is probed and listed. In S3 the registry file appeared 0.6 s after the log line; the
+  DTD app's pid is known once its own probe finishes, which can take up to about 1.5 s more. 3 s
+  covers both with room on a loaded machine.
 - **The DTD row wins** at any later point too: if the Flutter tool attaches to an app after it was
   listed from a log (`flutter attach`), the log row is removed.
 - **Repeated lines** (the app restarted, the log replayed) are deduplicated by URL.
@@ -287,7 +310,8 @@ each platform shows whether it is watching or why not, for example "Android: adb
 
 ## 7. Spikes before planning
 
-Each is a throwaway check whose result goes into §4 as a fact.
+Each is a throwaway check whose result goes into §4 as a fact. S2, S3 and S4 ran on 2026-11-22 (F3,
+F9, F12). S1 needs the author's iPhone and is still open; the iPhone watcher is built only after it.
 
 - **S1. iPhone (decides whether the iPhone watcher is in).** On Nika's iPhone (iOS 27.2, USB):
   1. Open a **profile** build of `jank_lab` from the home screen, and separately run a **debug** build
