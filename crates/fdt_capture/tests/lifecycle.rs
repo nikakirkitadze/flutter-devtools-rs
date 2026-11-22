@@ -900,6 +900,30 @@ fn stop_waiting_cancels_an_in_flight_url_retry() {
 }
 
 #[test]
+fn reconnects_to_the_same_app_opened_from_its_icon() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let one = fake(1, 100);
+        let (cap, apps) = start_discovered(&rt, cfg());
+        cap.connect(Target::Discovered(disc(&one.server)));
+        common::settle(&cap, Duration::from_millis(100), Duration::from_secs(5)).await;
+        drop(one);
+        wait_status(&cap, "waiting", is_waiting).await;
+        // Reopened from its icon: found in the device log, so no workspace.
+        let two = fake(2, 200);
+        let mut reopened = disc(&two.server);
+        reopened.key.workspace = String::new();
+        reopened.workspace = None;
+        reopened.source = AppSource::Device;
+        apps.send(Arc::from(vec![reopened])).unwrap();
+        wait_status(&cap, "reconnected", |s| {
+            matches!(s, ConnStatus::Connected { .. })
+        })
+        .await;
+    });
+}
+
+#[test]
 fn dropped_link_with_the_app_still_listed_reconnects() {
     let rt = CaptureRuntime::new().unwrap();
     rt.handle().block_on(async {

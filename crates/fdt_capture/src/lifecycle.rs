@@ -289,7 +289,7 @@ impl Session {
         let Some(key) = self.life.waiting_for.clone().filter(|_| waiting) else {
             return;
         };
-        if let Some(app) = apps.iter().find(|a| a.key == key) {
+        if let Some(app) = apps.iter().find(|a| a.key.same_app(&key)) {
             self.begin_connect(Target::Discovered(app.clone()), true);
         }
     }
