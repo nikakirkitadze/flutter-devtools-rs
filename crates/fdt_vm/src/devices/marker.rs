@@ -46,13 +46,16 @@ pub fn android_hit(brief_line: &str) -> Option<Hit> {
     Some(Hit { pid, url })
 }
 
-/// Whether `url` points at this machine (`127.0.0.1` or `localhost`).
+/// Whether `url` is a plain `http://` URL for this machine (`127.0.0.1` or `localhost`), with no
+/// userinfo that could make the real host differ from what it looks like.
 pub fn is_loopback_url(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("http://") else {
+    let Ok(parsed) = url::Url::parse(url) else {
         return false;
     };
-    let host = rest.split(['/', ':']).next().unwrap_or("");
-    host == "127.0.0.1" || host == "localhost"
+    parsed.scheme() == "http"
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && matches!(parsed.host_str(), Some("127.0.0.1" | "localhost"))
 }
 
 /// Cleans an adb `model:` value the way Flutter's `cleanAdbDeviceName` does, so names match the
@@ -133,6 +136,15 @@ mod tests {
         assert!(is_loopback_url("http://127.0.0.1:1/a=/"));
         assert!(is_loopback_url("http://localhost:1/a=/"));
         assert!(!is_loopback_url("http://192.168.1.5:1/a=/"));
+        assert!(!is_loopback_url("http://localhost:x@evil.com/"));
+        assert!(!is_loopback_url("http://127.0.0.1@evil.com:1/a=/"));
+        assert_eq!(
+            android_hit(
+                "I/flutter ( 1): The Dart VM service is listening on http://localhost:1/a=/"
+            )
+            .map(|h| h.url),
+            Some("http://localhost:1/a=/".to_string())
+        );
         let tail = "The Dart VM service is listening on http://192.168.1.5:1/a=/";
         assert_eq!(android_hit(&format!("I/flutter ( 1): {tail}")), None);
         let line = format!(r#"{{"processID":1,"eventMessage":"flutter: {tail}"}}"#);
