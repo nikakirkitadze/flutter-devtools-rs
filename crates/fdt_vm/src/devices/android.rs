@@ -1,9 +1,6 @@
 //! Watching Android devices through `adb`: `track-devices` for the device list, `logcat` for the
 //! VM service line, and `adb forward` to reach the VM service from this machine.
 
-// Used by the combined `DeviceWatch` that follows.
-#![allow(dead_code)]
-
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -267,10 +264,14 @@ impl Watcher {
                 .cloned()
                 .collect();
             for key in keys {
-                if let Some(f) = self.found.remove(&key) {
-                    self.remove_forward(&key.0, f.local_port).await;
-                }
+                self.found.remove(&key);
             }
+            // adb drops a detached device's forwards itself, and a `--remove` would fail with
+            // "device not found" and be retried every tick, so just forget them.
+            self.held
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|(s, _)| *s != serial);
         }
         for serial in live {
             if !self.devices.contains_key(&serial) {
@@ -819,7 +820,6 @@ esac
                 until(|| out.borrow().is_empty(), 3).await,
                 "candidate leaves"
             );
-            assert!(until(|| removed_has(dir.path(), port), 3).await);
             assert_eq!(*status.borrow(), PlatformState::Watching { devices: 0 });
             assert!(watch.held.lock().unwrap().is_empty());
             // The logcat follower for that device is gone (`kill -0` fails for a dead process).
