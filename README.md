@@ -19,6 +19,10 @@ Then:
 cargo run -p fdt_app
 ```
 
+On a Mac, `scripts/bundle-macos.sh --install` builds `fdt.app` with its icon and puts it in
+`/Applications`. Quit fdt before re-running it. The app is signed ad hoc, so it runs on the machine
+that built it.
+
 ## Command line
 
 - `fdt --version` prints the version.

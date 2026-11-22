@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="plate" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#0D0E11"/><stop offset="1" stop-color="#1A1C22"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.16"/>
+      <stop offset="0.12" stop-color="#FFFFFF" stop-opacity="0.03"/>
+      <stop offset="0.5" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="calm" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#8E9CFF"/><stop offset="1" stop-color="#4E60EF"/>
+    </linearGradient>
+    <linearGradient id="exhaust" gradientUnits="userSpaceOnUse" x1="150" y1="560" x2="470" y2="650">
+      <stop offset="0" stop-color="#4E60EF" stop-opacity="0"/><stop offset="0.45" stop-color="#7B8CFF" stop-opacity="0.85"/>
+      <stop offset="0.78" stop-color="#B07CFF"/><stop offset="0.92" stop-color="#E5534B"/><stop offset="1" stop-color="#E2A336"/>
+    </linearGradient>
+    <clipPath id="hullClip"><path d="M0 -220 C58 -184 84 -100 82 -10 L74 140 Q72 162 50 162 L-50 162 Q-72 162 -74 140 L-82 -10 C-84 -100 -58 -184 0 -220 Z"/></clipPath>
+    <linearGradient id="hullFill" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#FFFFFF"/><stop offset="0.45" stop-color="#E7E8EB"/><stop offset="1" stop-color="#A9AFC0"/>
+    </linearGradient>
+    <linearGradient id="fin" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8E9CFF"/><stop offset="1" stop-color="#3A4ACF"/>
+    </linearGradient>
+    <linearGradient id="nozzle" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#2B3040"/><stop offset="0.5" stop-color="#596180"/><stop offset="1" stop-color="#262A36"/>
+    </linearGradient>
+    <radialGradient id="window" cx="0.38" cy="0.32" r="0.75">
+      <stop offset="0" stop-color="#C3CBFF"/><stop offset="0.5" stop-color="#5566F2"/><stop offset="1" stop-color="#1B2250"/>
+    </radialGradient>
+    <linearGradient id="flame" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFD08A"/><stop offset="0.35" stop-color="#E2A336"/>
+      <stop offset="0.75" stop-color="#E5534B"/><stop offset="1" stop-color="#E5534B" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="star"><stop offset="0" stop-color="#FFFFFF"/><stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/></radialGradient>
+    <clipPath id="plateClip"><rect x="100" y="100" width="824" height="824" rx="185"/></clipPath>
+  </defs>
+<path d="M148.6 560.6 L155.8 577.4 L162.9 593.5 L170.0 609.0 L177.1 623.8 L184.2 637.8 L191.3 651.2 L198.5 663.9 L205.7 676.0 L212.9 687.3 L220.2 698.0 L227.6 708.0 L235.0 717.4 L242.6 726.1 L250.3 734.1 L258.1 741.5 L266.2 748.3 L274.4 754.4 L282.9 759.7 L291.6 764.4 L300.6 768.3 L309.8 771.4 L319.3 773.8 L329.0 775.2 L338.9 775.8 L349.0 775.4 L359.2 774.2 L369.4 772.1 L379.7 769.0 L389.9 765.2 L400.1 760.4 L410.3 754.9 L420.5 748.6 L430.6 741.5 L440.6 733.6 L450.7 725.0 L460.7 715.6 L470.7 705.5 L480.7 694.7 L490.6 683.1 L500.6 670.8 L439.4 629.2 L432.4 641.1 L425.4 652.4 L418.5 662.8 L411.7 672.6 L404.9 681.6 L398.3 689.8 L391.7 697.4 L385.1 704.2 L378.7 710.3 L372.4 715.8 L366.1 720.6 L359.9 724.8 L353.8 728.3 L347.7 731.3 L341.6 733.6 L335.5 735.4 L329.2 736.7 L322.8 737.3 L316.2 737.3 L309.4 736.7 L302.4 735.4 L295.2 733.3 L287.8 730.5 L280.2 726.9 L272.5 722.5 L264.6 717.3 L256.6 711.3 L248.6 704.4 L240.5 696.7 L232.3 688.2 L224.1 678.9 L215.9 668.8 L207.7 657.9 L199.6 646.2 L191.4 633.7 L183.3 620.4 L175.2 606.4 L167.2 591.5 L159.2 575.9 L151.4 559.4 Z" fill="url(#exhaust)" opacity="1.0"/>
+    <path d="M175.6 733.9 L181.3 740.9 L187.1 747.7 L193.0 754.3 L199.0 760.6 L205.1 766.7 L211.3 772.6 L217.7 778.3 L224.3 783.7 L231.0 788.8 L237.9 793.7 L245.1 798.3 L252.4 802.6 L259.9 806.5 L267.6 810.1 L275.5 813.4 L283.6 816.3 L291.8 818.7 L300.2 820.7 L308.8 822.3 L317.4 823.4 L326.1 824.0 L334.8 824.2 L343.5 823.8 L352.2 823.0 L360.8 821.7 L369.3 820.0 L377.7 817.8 L386.0 815.2 L394.1 812.3 L402.1 809.0 L409.9 805.3 L417.5 801.3 L425.0 797.0 L432.4 792.4 L439.6 787.6 L446.6 782.4 L453.6 777.0 L460.4 771.4 L467.1 765.5 L473.7 759.3 L462.4 748.0 L456.4 754.2 L450.3 760.1 L444.1 765.8 L437.8 771.2 L431.3 776.4 L424.8 781.4 L418.1 786.0 L411.2 790.4 L404.2 794.5 L397.1 798.3 L389.7 801.8 L382.3 804.9 L374.6 807.7 L366.8 810.1 L358.9 812.1 L350.9 813.7 L342.7 814.8 L334.5 815.5 L326.3 815.8 L318.0 815.5 L309.8 814.9 L301.6 813.7 L293.4 812.1 L285.4 810.1 L277.5 807.7 L269.8 804.8 L262.2 801.6 L254.8 798.1 L247.5 794.2 L240.4 789.9 L233.4 785.4 L226.6 780.6 L220.0 775.5 L213.5 770.1 L207.2 764.5 L200.9 758.6 L194.8 752.5 L188.8 746.1 L182.9 739.5 L177.2 732.6 Z" fill="#8E9CFF" opacity="0.45"/>
+</svg>
