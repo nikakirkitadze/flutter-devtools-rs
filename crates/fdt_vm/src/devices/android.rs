@@ -368,6 +368,10 @@ impl Watcher {
             return;
         }
         let spec = format!("tcp:{device_port}");
+        // A `forward tcp:0` that times out, is cancelled, or prints something unparsable may leave
+        // a forward we have no port for, so we cannot track or remove it. We accept leaking that
+        // one forward rather than listing `forward --list` and guessing, which could remove
+        // forwards other tools own.
         let Some(printed) = run_once(
             &self.adb,
             &["-s", serial, "forward", "tcp:0", &spec],
@@ -414,32 +418,55 @@ impl Watcher {
     }
 
     async fn check_liveness(&mut self) {
-        let mut dead = Vec::new();
-        for (key, f) in &self.found {
-            if !tcp_alive(f.local_port, self.cfg.alive_wait).await {
-                dead.push(key.clone());
-            }
-        }
+        let wait = self.cfg.alive_wait;
+        let checks = self
+            .found
+            .iter()
+            .map(|(key, f)| (key.clone(), f.local_port))
+            .map(|(key, port)| async move { (key, tcp_alive(port, wait).await) });
+        let dead: Vec<_> = futures_util::future::join_all(checks)
+            .await
+            .into_iter()
+            .filter(|(_, alive)| !alive)
+            .map(|(key, _)| key)
+            .collect();
         for key in dead {
             if let Some(f) = self.found.remove(&key) {
                 self.remove_forward(&key.0, f.local_port).await;
             }
         }
         self.publish();
+        // Forwards whose removal failed earlier stay in `held`; try them again.
+        let ports: HashSet<u16> = self.found.values().map(|f| f.local_port).collect();
+        let orphans: Vec<(String, u16)> = self
+            .held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(_, p)| !ports.contains(p))
+            .cloned()
+            .collect();
+        for (serial, port) in orphans {
+            self.remove_forward(&serial, port).await;
+        }
     }
 
     async fn remove_forward(&self, serial: &str, port: u16) {
-        self.held
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|(s, p)| !(s == serial && *p == port));
         let spec = format!("tcp:{port}");
-        run_once(
+        let removed = run_once(
             &self.adb,
             &["-s", serial, "forward", "--remove", &spec],
             REMOVE_TIMEOUT,
         )
         .await;
+        // `held` is the record of live forwards: it only forgets one once adb confirmed the
+        // removal, so a failed removal is retried on the next tick and at `Drop`.
+        if removed.is_some() {
+            self.held
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|(s, p)| !(s == serial && *p == port));
+        }
     }
 
     fn publish(&self) {
@@ -590,20 +617,34 @@ mod tests {
                 r#"#!/bin/sh
 DIR="{dir}"
 case "$*" in
-  "track-devices") printf '0015emulator-5554\tdevice\n'; exec sleep 30;;
+  "track-devices")
+    if [ -e "$DIR/flaky" ] && [ ! -e "$DIR/started" ]; then touch "$DIR/started"; exit 1; fi
+    printf '0015emulator-5554\tdevice\n'
+    while [ ! -e "$DIR/leave" ]; do sleep 0.1; done
+    printf '0000'
+    exec sleep 30;;
   "devices -l") echo "emulator-5554          device product:sdk_gphone64_arm64 model:sdk_gphone64_arm64 device:emu64a transport_id:1";;
   *"logcat -d"*) {backfill};;
-  *"logcat -v brief -T 1"*) echo "{LINE}"; exec sleep 30;;
+  *"logcat -v brief -T 1"*)
+    echo $$ > "$DIR/logcat_pid"
+    if [ ! -e "$DIR/silent" ]; then echo "{LINE}"; fi
+    if [ -e "$DIR/line2" ]; then sleep 1; cat "$DIR/line2"; fi
+    exec sleep 30;;
   *"forward --remove"*) echo "$@" >> "$DIR/removed";;
+  *"forward tcp:0 tcp:40422"*) cat "$DIR/port2";;
   *"forward tcp:0 tcp:"*) cat "$DIR/port";;
   "version") echo ok;;
 esac
 "#,
                 dir = dir.display()
             );
+            // Write under another name and rename, so no writer still holds the file open when it
+            // is executed (ETXTBSY on Linux).
+            let tmp = dir.join("adb.tmp");
+            std::fs::write(&tmp, script).unwrap();
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
             let path = dir.join("adb");
-            std::fs::write(&path, script).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::rename(&tmp, &path).unwrap();
             path
         }
 
@@ -712,6 +753,24 @@ esac
             held.abort();
         }
 
+        fn removed_has(dir: &Path, port: u16) -> bool {
+            std::fs::read_to_string(dir.join("removed"))
+                .is_ok_and(|t| t.contains(&format!("tcp:{port}")))
+        }
+
+        /// A listener that accepts and holds connections; aborting the task closes it.
+        async fn holder() -> (u16, tokio::task::JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let task = tokio::spawn(async move {
+                let mut keep = Vec::new();
+                while let Ok((s, _)) = listener.accept().await {
+                    keep.push(s);
+                }
+            });
+            (port, task)
+        }
+
         #[tokio::test]
         async fn dead_backfill_lines_leave_no_candidate_and_no_forward() {
             let dir = tempfile::tempdir().unwrap();
@@ -720,22 +779,116 @@ esac
                 l.local_addr().unwrap().port()
             };
             std::fs::write(dir.path().join("port"), format!("{closed}\n")).unwrap();
-            // The live follower sees the same line, so make it silent for this test.
+            // Only the backfill reports the line; the live follower stays silent.
+            std::fs::write(dir.path().join("silent"), "").unwrap();
             let adb = fake_adb(dir.path(), &format!("echo \"{LINE}\""));
             let (out, status) = channels();
-            let _watch =
-                AndroidWatch::spawn(&Handle::current(), adb, timing(), out.clone(), status);
+            let mut rx = out.subscribe();
+            let watch = AndroidWatch::spawn(&Handle::current(), adb, timing(), out.clone(), status);
 
-            let removed = dir.path().join("removed");
+            assert!(until(|| removed_has(dir.path(), closed), 3).await);
+            // Keep watching: nothing may ever be published, and nothing stays forwarded.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert!(!rx.has_changed().unwrap(), "a candidate was published");
+            assert!(out.borrow().is_empty());
+            assert!(watch.held.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn device_leaving_removes_its_candidates_and_forwards() {
+            let dir = tempfile::tempdir().unwrap();
+            let (port, _task) = holder().await;
+            std::fs::write(dir.path().join("port"), format!("{port}\n")).unwrap();
+            let adb = fake_adb(dir.path(), "true");
+            let (out, status) = channels();
+            let watch = AndroidWatch::spawn(
+                &Handle::current(),
+                adb,
+                timing(),
+                out.clone(),
+                status.clone(),
+            );
+            assert!(until(|| out.borrow().len() == 1, 3).await);
+            let pid = std::fs::read_to_string(dir.path().join("logcat_pid"))
+                .unwrap()
+                .trim()
+                .to_string();
+
+            std::fs::write(dir.path().join("leave"), "").unwrap();
+            assert!(
+                until(|| out.borrow().is_empty(), 3).await,
+                "candidate leaves"
+            );
+            assert!(until(|| removed_has(dir.path(), port), 3).await);
+            assert_eq!(*status.borrow(), PlatformState::Watching { devices: 0 });
+            assert!(watch.held.lock().unwrap().is_empty());
+            // The logcat follower for that device is gone (`kill -0` fails for a dead process).
+            let dead = || {
+                !std::process::Command::new("kill")
+                    .args(["-0", &pid])
+                    .stderr(Stdio::null())
+                    .status()
+                    .unwrap()
+                    .success()
+            };
+            assert!(until(dead, 3).await, "follower stopped");
+        }
+
+        #[tokio::test]
+        async fn new_url_for_the_same_pid_replaces_and_removes_the_old_forward() {
+            let dir = tempfile::tempdir().unwrap();
+            let (port1, _a) = holder().await;
+            let (port2, _b) = holder().await;
+            std::fs::write(dir.path().join("port"), format!("{port1}\n")).unwrap();
+            std::fs::write(dir.path().join("port2"), format!("{port2}\n")).unwrap();
+            let line2 = LINE.replace("40421/tok=", "40422/tok2=");
+            std::fs::write(dir.path().join("line2"), format!("{line2}\n")).unwrap();
+            let adb = fake_adb(dir.path(), "true");
+            let (out, status) = channels();
+            let watch = AndroidWatch::spawn(&Handle::current(), adb, timing(), out.clone(), status);
+
+            assert!(until(|| out.borrow().len() == 1, 3).await);
+            assert_eq!(
+                out.borrow()[0].vm_uri,
+                format!("http://127.0.0.1:{port1}/tok=/")
+            );
+            let replaced = || {
+                let cur = out.borrow();
+                cur.len() == 1 && cur[0].vm_uri == format!("http://127.0.0.1:{port2}/tok2=/")
+            };
+            assert!(until(replaced, 4).await, "candidate replaced");
+            assert!(until(|| removed_has(dir.path(), port1), 3).await);
+            assert!(!removed_has(dir.path(), port2));
+            assert_eq!(
+                *watch.held.lock().unwrap(),
+                vec![("emulator-5554".to_string(), port2)]
+            );
+        }
+
+        #[tokio::test]
+        async fn unavailable_recovers_to_watching() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("flaky"), "").unwrap();
+            std::fs::write(dir.path().join("silent"), "").unwrap();
+            let adb = fake_adb(dir.path(), "true");
+            let (out, status) = channels();
+            let _watch =
+                AndroidWatch::spawn(&Handle::current(), adb, timing(), out, status.clone());
             assert!(
                 until(
-                    || std::fs::read_to_string(&removed)
-                        .is_ok_and(|t| t.contains(&format!("tcp:{closed}"))),
+                    || matches!(*status.borrow(), PlatformState::Unavailable(_)),
                     3
                 )
                 .await
             );
-            assert!(out.borrow().is_empty());
+            assert!(
+                until(
+                    || *status.borrow() == PlatformState::Watching { devices: 1 },
+                    4
+                )
+                .await,
+                "recovers after the backoff"
+            );
         }
 
         #[tokio::test]
