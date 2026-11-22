@@ -28,8 +28,8 @@ pub fn simulator_hit(ndjson_line: &str) -> Option<Hit> {
     let value: serde_json::Value = serde_json::from_str(ndjson_line).ok()?;
     let pid = u32::try_from(value.get("processID")?.as_u64()?).ok()?;
     let message = value.get("eventMessage")?.as_str()?;
-    // The log tool's own invocation line quotes the marker inside its predicate.
-    let url = marker_url(message.strip_prefix("flutter: ")?)?;
+    // The log tool's own invocation line quotes the marker without a URL, so it never matches.
+    let url = marker_url(message)?;
     Some(Hit { pid, url })
 }
 
@@ -69,6 +69,18 @@ mod tests {
     #[test]
     fn simulator_reads_pid_and_url() {
         let line = r#"{"processID":62710,"processImagePath":"/…/Runner.app/Runner","eventMessage":"flutter: The Dart VM service is listening on http://127.0.0.1:61865/8JqAbc=/","timestamp":"2026-11-22 21:22:19.396005+0400"}"#;
+        assert_eq!(
+            simulator_hit(line),
+            Some(Hit {
+                pid: 62710,
+                url: "http://127.0.0.1:61865/8JqAbc=/".into()
+            })
+        );
+    }
+
+    #[test]
+    fn simulator_accepts_a_line_without_the_flutter_prefix() {
+        let line = r#"{"processID":62710,"eventMessage":"The Dart VM service is listening on http://127.0.0.1:61865/8JqAbc=/"}"#;
         assert_eq!(
             simulator_hit(line),
             Some(Hit {
