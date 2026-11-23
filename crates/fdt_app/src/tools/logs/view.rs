@@ -1891,7 +1891,10 @@ mod tests {
             Some("12 matches")
         );
         // Clearing the field brings every row back.
-        cx.simulate_keystrokes("cmd-a backspace");
+        cx.simulate_keystrokes(crate::keymap::platform(
+            "cmd-a backspace",
+            "ctrl-a backspace",
+        ));
         cx.run_until_parked();
         assert_eq!(view.read_with(cx, |v, _| v.filtered_len()), 40);
         assert!(!present(cx, "logs-match-count"));
