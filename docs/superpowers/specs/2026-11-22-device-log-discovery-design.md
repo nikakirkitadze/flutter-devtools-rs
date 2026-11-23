@@ -1,7 +1,8 @@
 # Finding apps opened on simulators and devices: design
 
 - **Date:** 2026-11-22
-- **Status:** Draft for the author's review.
+- **Status:** Approved and implemented for simulators and Android, 2026-11-23. The iPhone watcher
+  is not built yet (pending spike S1).
 - **Amends:** the main design, §5.1 ("Finding running apps") and §8.1 ("How apps are found",
   "Disconnects").
 
@@ -49,7 +50,8 @@ like any other app. One click (or Enter) connects. (The wait is deliberate; see 
   it does today, with its workspace folder. A device-log entry never replaces it.
 - **Connecting on its own.** Finding an app only lists it. `fdt` connects when the user asks, as now.
 - **Noise or cost when idle.** Watching must keep the §10 idle budget (≤ 1 % CPU when idle) with one
-  simulator and one phone attached, counting the processes `fdt` starts (F11). No dialogs,
+  simulator and one phone attached, counting the processes `fdt` starts (F11) and the ones they
+  start inside a simulator (F13). No dialogs,
   permission prompts, installs or `sudo`.
 - **Leaking tokens.** VM service URLs carry an auth token. They are never logged unredacted.
 
@@ -146,6 +148,25 @@ Verified on the author's machine on 2026-11-22 (Flutter 3.47.9, macOS 27.2, Xcod
   - iPhone: a `Listen` request on `/var/run/usbmuxd` (plist protocol, version 1, message type 8)
     answered `Result 0`, then pushed `Attached` for Nika's iPhone (`ConnectionType USB`).
 
+Verified on 2026-11-23 (iPhone 18 Pro simulator on iOS 27, emulator `sdk_gphone64_arm64`), after the
+first build:
+
+- **F13. In-simulator cost.** `xcrun simctl spawn <udid> log stream --predicate …` runs a `log`
+  process inside the simulator (its parent is `launchd_sim`, not `fdt`). It costs about 2 % of a core
+  per stream, steadily (26.25 s of CPU over 21 min 22 s). The predicate does not stop it reading the
+  whole log. A follower per booted simulator therefore breaks the idle budget on its own.
+- **F14. Signals.** SIGTERM to the `simctl spawn` client ends the `log` process it started inside the
+  simulator; SIGKILL (tokio's `kill_on_drop`) leaves it running. SIGTERM to the host `adb … logcat`
+  client ends the `logcat` on the device (SIGKILL does too).
+- **F15. Simulator apps are host processes.** A simulator app runs as a process on the Mac, at
+  `~/Library/Developer/CoreSimulator/Devices/<udid>/data/Containers/Bundle/Application/<uuid>/<Name>.app/<exe>`;
+  a Flutter app has `<Name>.app/Frameworks/Flutter.framework`. A one-shot
+  `xcrun simctl spawn <udid> log show --last 1m --style ndjson --predicate 'processID == <pid> AND eventMessage CONTAINS "Dart VM service is listening"'`
+  returned the line in 1.48 s of wall time and 0.08 s of host CPU. `--last` takes seconds
+  (`<n>s`), and the same query over an hour took about as long.
+- **F16. Android.** A filtered `adb logcat -v brief -T 1 flutter:I *:S` used no measurable CPU on the
+  emulator over 30 s, and 0.01 s on the host client.
+
 ## 5. Approaches
 
 | Approach | Trade-offs | Verdict |
@@ -172,22 +193,32 @@ device watcher ──► candidates (forwarded URLs) ───┘
 
 ### 6.2 The three watchers
 
-Each watcher keeps a list of its devices, starts one log follower per device, and stops it when the
-device goes away. When a line containing `The Dart VM service is listening on ` arrives, the
-watcher takes the URL after it and the pid before it, forwards the port if needed, and emits a
-candidate.
+Each watcher keeps a list of its devices and reads each new app's VM service line from the device
+log: the Android watcher follows one log per device, and the simulator watcher queries the log
+once per new app (a per-simulator follower costs too much, F13). When a line containing
+`The Dart VM service is listening on ` is found, the watcher takes the URL after it and the pid
+before it, forwards the port if needed, and emits a candidate.
 
 **Device lists are not polled** (F11). Each watcher learns about devices from a source that pushes
 changes (F12), and runs a listing command only when something changed.
 
 **iOS simulator (macOS only)**
-- Devices: watch the CoreSimulator device folder (`~/Library/Developer/CoreSimulator/Devices`) and
-  its `*/device.plist` files with file-system events, and read `name` and `state` from the plists
-  (F12). No `simctl` call is needed to list them.
-- Follower: `xcrun simctl spawn <udid> log stream --style ndjson --predicate 'eventMessage CONTAINS "Dart VM service is listening"'`.
-  The predicate filters inside the log daemon, so `fdt` sees only matching lines.
-- Apps already running: when a simulator is first seen, run the same predicate with `log show` over
-  the last hour. Stale URLs are dropped by the probe.
+- Devices: every 2 s, `stat` the `*/device.plist` files in the CoreSimulator device folder
+  (`~/Library/Developer/CoreSimulator/Devices`) and re-read `name` and `state` from those whose
+  modification time or size changed (F12). No `simctl` call is needed to list them.
+- Apps: in the same 2 s scan, while a simulator is booted, list the host's processes in-process
+  (`proc_listallpids` and `proc_pidpath` on macOS; no child process) and read each new pid's
+  executable once. A process whose executable is an app bundle on a booted simulator with
+  `Frameworks/Flutter.framework` (F15) is a new Flutter app.
+- Line: for each new Flutter app, one query, run off the watcher loop with a 10 s timeout:
+  `xcrun simctl spawn <udid> log show --last <n>s --style ndjson --predicate 'processID == <pid> AND eventMessage CONTAINS "Dart VM service is listening"'`.
+  The window reaches back to a minute before the process started, at most an hour. The line may not
+  be logged yet, so the query runs again 1, 2, 4, 8 and 16 s after the app was first seen (never two
+  at once), and gives up 30 s after. If found, the URL is the candidate as logged.
+- Apps already running when `fdt` starts (or the simulator is first seen): found by the same scan.
+  An app older than 30 s gets one query and no retries; one that started more than an hour ago is not
+  found.
+- No simulator process runs while no new app starts.
 - Forwarding: none (F1).
 
 **Android (every OS)**
@@ -219,13 +250,18 @@ Each platform turns itself off quietly when its tool is missing.
 
 - `xcrun`: `/usr/bin/xcrun` (macOS).
 - `adb`, the first that exists: `PATH`; `$ANDROID_HOME/platform-tools`;
-  `$ANDROID_SDK_ROOT/platform-tools`; the default SDK folder (`~/Library/Android/sdk` on macOS,
-  `%LOCALAPPDATA%\Android\Sdk` on Windows, `~/Android/Sdk` on Linux).
+  `$ANDROID_SDK_ROOT/platform-tools`; on macOS `/opt/homebrew/bin` and `/usr/local/bin` (Homebrew;
+  an app started from Finder has neither on `PATH`, F6); the default SDK folder
+  (`~/Library/Android/sdk` on macOS, `%LOCALAPPDATA%\Android\Sdk` on Windows, `~/Android/Sdk` on
+  Linux).
+- The simulator folder must exist (it does once Xcode has made a simulator); otherwise Settings says
+  "iOS simulators: simulator folder not found".
 - The Flutter SDK (for `idevicesyslog` and `iproxy`), the first that exists: `$FLUTTER_ROOT`; the
   `flutter` on `PATH` with symlinks resolved; the `flutterRoot` in
   `<workspace>/.dart_tool/package_config.json` of any workspace a DTD entry has reported;
   `~/development/flutter`, `~/flutter`, `~/fvm/default`.
-- Settings can override the `adb` path and the Flutter SDK path.
+- Settings can override the `adb` path and the Flutter SDK path. **Not built yet** (R17): the
+  Homebrew folders above cover the common Finder case for `adb`.
 
 ### 6.4 Staying out of the Flutter tool's way, and leaving the list
 
@@ -244,12 +280,19 @@ so its rows must look exactly as they do today.
   covers both with room on a loaded machine.
 - **The DTD row wins** at any later point too: if the Flutter tool attaches to an app after it was
   listed from a log (`flutter attach`), the log row is removed.
-- **Repeated lines** (the app restarted, the log replayed) are deduplicated by URL.
+- **Repeated lines** (the app restarted, the log replayed) are deduplicated by URL. The Android
+  backfill keeps only the newest line of each pid.
+- **Timing.** A candidate is probed as soon as its grace period ends (Discovery wakes for it, not
+  on its 1 s tick), and its probe does not wait for the `flutterVersion` service, which only the
+  Flutter tool registers. On the simulator the grace period counts from when the watcher found the
+  line, so an app is listed about 4 s after its line (the live test measured 3.6 to 4.1 s; about
+  6 s after `simctl launch`).
 
 **Leaving the list.** A log-found row disappears within about 5 s of its app quitting:
 - Simulator: the app's host pid (F10) is checked with `kill(pid, 0)`, every 2 s, at no cost.
 - Android and iPhone: every 2 s, a plain TCP connection to the forwarded port. If the forwarder
-  closes it at once, the app has gone. This is not a VM service client, so it can't get in the way of
+  closes it at once, the app has gone; two failed checks in a row take the row off, so one slow
+  connect does not cut a live app. This is not a VM service client, so it can't get in the way of
   DDS (S1 and S2 confirm that the forwarders behave this way).
 - When a row goes, its port forward goes too, unless a window is connected through it.
 
@@ -264,9 +307,13 @@ The rows look as they do today. The last column, which shows the workspace folde
 ```
 Connect to a running app
   jank_lab   iPhone 17           debug    Flutter 3.47.9   fixtures/jank_lab
-  crocobet   iPhone 18 Pro       debug    Flutter 3.47.9   opened on device
-  crocobet   Nika's iPhone       profile  Flutter 3.47.9   opened on device
+  crocobet   iPhone 18 Pro       debug                     opened on device
+  crocobet   Nika's iPhone       profile                   opened on device
 ```
+
+Rows found in a device log show no Flutter version: only the Flutter tool registers the
+`flutterVersion` service, and their probe does not wait for it (§6.4). A connected capture still
+reads the version if the service appears.
 
 **Empty state**, replacing today's copy:
 
@@ -296,17 +343,29 @@ each platform shows whether it is watching or why not, for example "Android: adb
 
 ### 6.7 Cost and safety
 
-- One follower process per booted simulator and per connected device, plus one `iproxy` per iPhone
-  candidate, plus the long-lived device-list sources (§6.2). Device lists are not polled; the only
-  2 s timers are the liveness checks in §6.4, which are a `kill(pid, 0)` or one local TCP connect.
-- The idle CPU budget (≤ 1 % of one core, `fdt` plus its child processes added together) is measured
-  with `fdt` open, one simulator booted and one phone attached. The unfiltered iPhone stream is the
-  risk; S1 measures it.
+- Simulators: no long-lived process. The 2 s scan reads file metadata and the host's process list
+  in-process; a `log show` query runs only when a new Flutter app starts (F15: about 0.1 s of host
+  CPU each).
+- Android: one `logcat` follower per connected device (F16) and one `adb track-devices`. Device
+  lists are not polled; the only 2 s timers are the liveness checks in §6.4, which are a
+  `kill(pid, 0)` or one local TCP connect.
+- iPhone (not built): one `idevicesyslog` per phone and one `iproxy` per candidate.
+- The idle CPU budget (≤ 1 % of one core) counts `fdt`, its child processes, and any process they
+  start inside a simulator (F13), added together, with `fdt` open, one simulator booted and one
+  phone or emulator attached. The unfiltered iPhone stream is the risk; S1 measures it.
 - Candidate URLs are always loopback (directly, or through a forward). `fdt` never connects to a
   non-loopback address found in a log.
 - URLs are logged with `VmServiceUri::redacted()` only.
-- All child processes are killed when `fdt` quits, including on a crash path where possible
-  (process group on Unix, job object on Windows).
+- Child processes and forwards go when `fdt` quits. GPUI never drops its globals, so the capture
+  host stops the watch from its quit hook, and from a task that handles SIGTERM, SIGINT and SIGHUP
+  before exiting. Stopping sends SIGTERM to every child (SIGKILL would leave a simulator's `log`
+  process running, F14), waits for them to exit, then removes the adb forwards in parallel, all
+  within 1.5 s.
+- After a crash or SIGKILL: the held forwards are recorded in `<config dir>/fdt/forwards-<pid>.json`,
+  and the next start removes those recorded by `fdt` processes that are gone. It also sends SIGTERM
+  to orphaned processes (parent pid 1) whose arguments are exactly a watcher command
+  (`<adb> track-devices`, `<adb> -s <serial> logcat -v brief -T 1 flutter:I *:S`). Forwards no record
+  lists are never touched.
 
 ## 7. Spikes before planning
 
@@ -341,8 +400,10 @@ F9, F12). S1 needs the author's iPhone and is still open; the iPhone watcher is 
 - **Budget test:** idle CPU of `fdt` plus its children with one simulator booted and one phone
   attached, recorded like the M2 and M3 idle measurements.
 - **Live test (simulator):** like `scripts/jank-lab-it.sh`, install `jank_lab` on a booted simulator,
-  launch it with `xcrun simctl launch` (no Flutter tool), and assert it is listed and connectable
-  within 3 s. Ignored unless an environment variable is set, like the existing live test.
+  launch it with `xcrun simctl launch` (no Flutter tool), and assert it is listed within 8 s of the
+  launch and gone within 7 s of `simctl terminate`. It prints when the line was logged and when the
+  app was found, listed and gone. Ignored unless `FDT_DEVICE_IT=1`
+  (`crates/fdt_vm/tests/device_watch_live.rs`).
 - **Manual:** Android emulator and the iPhone, recorded in the milestone review.
 
 ## 9. Changes to the main design
@@ -361,8 +422,12 @@ F9, F12). S1 needs the author's iPhone and is still open; the iPhone watcher is 
   same mechanism at low cost and an emulator is set up on the author's machine.
 - The iPhone watcher depends on spike S1 and is cut from this work if S1 fails.
 - The switch in Settings is on by default.
-- Apps already running when `fdt` starts are found on simulators and Android (log history), not on
-  iPhones.
+- Apps already running when `fdt` starts are found on simulators (started within the last hour) and
+  Android (log history), not on iPhones.
+- Simulators are watched through the host's process list and one log query per new app, not a log
+  stream per simulator, which costs about 2 % of a core (F13, R16). A line logged more than 30 s after
+  its app started is missed (reopen the app).
+- The Settings override for the `adb` path is deferred (R17).
 - Protecting `flutter run` comes before speed: log-found apps wait 3 s before being contacted, so they
   appear in about 4 s rather than 2 (§6.4).
 - The idle CPU budget counts `fdt`'s child processes, so device lists come from change

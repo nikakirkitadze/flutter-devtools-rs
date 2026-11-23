@@ -23,7 +23,7 @@ fn marker_url(message: &str) -> Option<String> {
     is_loopback_url(url).then(|| url.to_string())
 }
 
-/// Parses one line of `log stream --style ndjson`, taking the process id and the announced URL.
+/// Parses one line of `log show --style ndjson`, taking the process id and the announced URL.
 pub fn simulator_hit(ndjson_line: &str) -> Option<Hit> {
     let value: serde_json::Value = serde_json::from_str(ndjson_line).ok()?;
     let pid = u32::try_from(value.get("processID")?.as_u64()?).ok()?;
