@@ -177,7 +177,14 @@ fn set_find_device_apps(on: bool, shell: &WeakEntity<MainWindow>, cx: &mut App) 
 fn state_line(name: &str, state: &PlatformState, unit: &str) -> String {
     match state {
         PlatformState::Off => format!("{name}: off"),
-        PlatformState::Watching { devices } => format!("{name}: watching {devices} {unit}"),
+        PlatformState::Watching { devices } => {
+            let unit = if unit == "devices" && *devices == 1 {
+                "device"
+            } else {
+                unit
+            };
+            format!("{name}: watching {devices} {unit}")
+        }
         PlatformState::Unavailable(reason) => format!("{name}: {reason}"),
     }
 }
@@ -387,6 +394,19 @@ mod tests {
         }
         let off = status_lines(&WatchStatus::default());
         assert_eq!(off.last().unwrap().1, "Android: off");
+        let android = |n| {
+            status_lines(&WatchStatus {
+                simulator: PlatformState::Off,
+                android: PlatformState::Watching { devices: n },
+            })
+            .last()
+            .unwrap()
+            .1
+            .clone()
+        };
+        assert_eq!(android(1), "Android: watching 1 device");
+        assert_eq!(android(0), "Android: watching 0 devices");
+        assert_eq!(android(3), "Android: watching 3 devices");
     }
 
     #[gpui_kit::test]
