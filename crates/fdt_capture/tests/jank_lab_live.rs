@@ -167,7 +167,12 @@ async fn attributed(
             sentence.get_or_insert(e.sentence);
         } else {
             let kind = match &e.cause {
-                Cause::HotFunction { function, .. } => format!("HotFunction({function})"),
+                Cause::HotFunction { function, .. } => {
+                    format!(
+                        "HotFunction({function}) {}",
+                        function_origin(&snap, function)
+                    )
+                }
                 c => format!("{c:?}").chars().take(40).collect(),
             };
             *misses.entry(format!("{kind} cpu={:?}", e.cpu)).or_default() += 1;
@@ -179,12 +184,43 @@ async fn attributed(
         100.0 * good as f64 / judged.max(1) as f64,
         sentence.as_deref().unwrap_or("-")
     );
+    println!(
+        "{what}: libraries that are not Dart URIs: {:?}",
+        non_uri_libraries(&snap)
+    );
     assert!(judged >= 5, "{what}: only {judged} judged frames");
     assert!(
         good * 5 >= judged * 4,
         "{what}: {good}/{judged} attributed; misses {misses:?}"
     );
     format!("{good}/{judged}")
+}
+
+/// The library and kind recorded for the first function with this name.
+fn function_origin(snap: &Snapshot, name: &str) -> String {
+    (0..snap.cpu.function_count())
+        .map(|i| snap.cpu.function(fdt_store::cpu::FunctionId(i as u32)))
+        .find(|f| &*f.name == name)
+        .map(|f| format!("lib={:?} kind={:?}", f.library, f.kind))
+        .unwrap_or_default()
+}
+
+/// Up to five distinct libraries without a URI scheme (Dart libraries always have one).
+fn non_uri_libraries(snap: &Snapshot) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for i in 0..snap.cpu.function_count() {
+        let f = snap.cpu.function(fdt_store::cpu::FunctionId(i as u32));
+        if let Some(l) = &f.library
+            && !l.contains(':')
+            && !out.iter().any(|o| o == &**l)
+        {
+            out.push(l.to_string());
+            if out.len() == 5 {
+                break;
+            }
+        }
+    }
+    out
 }
 
 fn frames_len(cap: &Capture) -> usize {
