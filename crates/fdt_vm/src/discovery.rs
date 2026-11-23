@@ -21,7 +21,8 @@ use crate::uri::VmServiceUri;
 
 /// Default for `DiscoveryConfig::retry_after`.
 const RETRY_AFTER: Duration = Duration::from_secs(5);
-/// How long a probe waits for the `flutterVersion` service to be announced.
+/// How long a probe of a DTD-listed app waits for the `flutterVersion` service to be announced.
+/// Only the Flutter tool registers it, so a device-log candidate's probe does not wait.
 const VERSION_WAIT: Duration = Duration::from_secs(1);
 /// Default for `DiscoveryConfig::candidate_grace`.
 const CANDIDATE_GRACE: Duration = Duration::from_secs(3);
@@ -303,14 +304,15 @@ fn package_of(root_lib_uri: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
-/// Connects once, reads what identifies the app, and drops the connection.
-async fn probe(uri: &str, timeout: Duration) -> Result<ProbeInfo, String> {
-    tokio::time::timeout(timeout, probe_inner(uri))
+/// Connects once, reads what identifies the app, and drops the connection. With
+/// `version_wait`, waits up to [`VERSION_WAIT`] for the Flutter tool's `flutterVersion` service.
+async fn probe(uri: &str, timeout: Duration, version_wait: bool) -> Result<ProbeInfo, String> {
+    tokio::time::timeout(timeout, probe_inner(uri, version_wait))
         .await
         .map_err(|_| "probe timed out".to_string())?
 }
 
-async fn probe_inner(uri: &str) -> Result<ProbeInfo, String> {
+async fn probe_inner(uri: &str, version_wait: bool) -> Result<ProbeInfo, String> {
     // Candidates come as `http://` URLs; the socket needs the `ws://.../ws` form.
     let url = match VmServiceUri::parse(uri) {
         Ok(u) => u.ws_url().clone(),
@@ -327,6 +329,26 @@ async fn probe_inner(uri: &str) -> Result<ProbeInfo, String> {
         .find(|i| i.name == "main" && !i.is_system_isolate)
         .ok_or("no main isolate yet")?;
     let isolate = vm.get_isolate(&main.id).await.map_err(|e| e.to_string())?;
+    let flutter_version = if version_wait {
+        flutter_version(&vm, &mut notes, &main.id).await?
+    } else {
+        None
+    };
+    Ok(ProbeInfo {
+        pid: info.pid,
+        os: info.operating_system.clone(),
+        mode: detect_mode(&isolate),
+        package: isolate.root_lib.as_ref().and_then(|l| package_of(&l.uri)),
+        flutter_version,
+    })
+}
+
+/// Waits up to [`VERSION_WAIT`] for the `flutterVersion` service and asks it.
+async fn flutter_version(
+    vm: &VmService,
+    notes: &mut crate::rpc::NotificationRx,
+    isolate: &str,
+) -> Result<Option<String>, String> {
     vm.stream_listen("Service")
         .await
         .map_err(|e| e.to_string())?;
@@ -343,20 +365,13 @@ async fn probe_inner(uri: &str) -> Result<ProbeInfo, String> {
     .await
     .ok()
     .flatten();
-    let flutter_version = match method {
+    Ok(match method {
         Some(m) => vm
-            .flutter_version(&m, &main.id)
+            .flutter_version(&m, isolate)
             .await
             .ok()
             .and_then(|v| v.flutter_version.or(v.framework_version)),
         None => None,
-    };
-    Ok(ProbeInfo {
-        pid: info.pid,
-        os: info.operating_system.clone(),
-        mode: detect_mode(&isolate),
-        package: isolate.root_lib.as_ref().and_then(|l| package_of(&l.uri)),
-        flutter_version,
     })
 }
 
@@ -426,6 +441,8 @@ struct Scanner {
 async fn run(config: DiscoveryConfig, tx: watch::Sender<Arc<[DiscoveredApp]>>) {
     let (events, mut inbox) = tokio::sync::mpsc::unbounded_channel();
     let interval = config.interval;
+    // Its own copy, to wake on changes; `refresh_candidates` reads the config's.
+    let mut candidates_changed = config.candidates.clone();
     let mut s = Scanner {
         config,
         clients: HashMap::new(),
@@ -444,10 +461,24 @@ async fn run(config: DiscoveryConfig, tx: watch::Sender<Arc<[DiscoveredApp]>>) {
     let started = Instant::now();
     let mut first_published = false;
     loop {
+        let grace_due = s.next_grace_deadline();
+        let mut candidates_gone = false;
         tokio::select! {
             _ = ticker.tick() => s.tick().await,
             Some(ev) = inbox.recv() => s.apply(ev),
             _ = s.any_closed() => {}
+            // A candidate is stamped as soon as it appears, not at the next tick...
+            alive = changed(&mut candidates_changed) => {
+                candidates_gone = !alive;
+                s.refresh_candidates();
+                s.spawn_probes();
+            }
+            // ...and probed as soon as its grace period ends.
+            _ = sleep_until(grace_due) => s.spawn_probes(),
+        }
+        if candidates_gone {
+            // The sender is gone: stop waking on it (`changed` would return at once forever).
+            candidates_changed = None;
         }
         while s.tasks.try_join_next().is_some() {}
         s.prune_closed();
@@ -472,7 +503,34 @@ async fn run(config: DiscoveryConfig, tx: watch::Sender<Arc<[DiscoveredApp]>>) {
     }
 }
 
+/// Waits for the next change of the candidate set; false once its sender is gone. Never
+/// resolves without a receiver.
+async fn changed(rx: &mut Option<watch::Receiver<Arc<[Candidate]>>>) -> bool {
+    match rx {
+        Some(rx) => rx.changed().await.is_ok(),
+        None => std::future::pending().await,
+    }
+}
+
+/// Sleeps until `at`; never resolves for `None`.
+async fn sleep_until(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
 impl Scanner {
+    /// The earliest moment a candidate's grace period ends that is still ahead.
+    fn next_grace_deadline(&self) -> Option<Instant> {
+        let now = Instant::now();
+        self.first_seen
+            .values()
+            .map(|t| *t + self.config.candidate_grace)
+            .filter(|due| *due > now)
+            .min()
+    }
+
     /// Resolves when any DTD connection closes. Owns clones, so it does not borrow `self`.
     fn any_closed(&self) -> impl std::future::Future<Output = ()> + use<> {
         let clients: Vec<DtdClient> = self.clients.values().map(|d| d.client.clone()).collect();
@@ -633,11 +691,12 @@ impl Scanner {
 
     fn spawn_probes(&mut self) {
         let now = Instant::now();
-        let mut todo: Vec<String> = Vec::new();
-        let mut offered: Vec<&str> = self
+        let mut todo: Vec<(String, bool)> = Vec::new();
+        // DTD-listed services wait for the Flutter version; device-log candidates do not.
+        let mut offered: Vec<(&str, bool)> = self
             .clients
             .values()
-            .flat_map(|d| d.services.iter().map(|s| s.uri.as_str()))
+            .flat_map(|d| d.services.iter().map(|s| (s.uri.as_str(), true)))
             .collect();
         for c in &self.candidates {
             let due = self
@@ -645,24 +704,24 @@ impl Scanner {
                 .get(&c.vm_uri)
                 .is_some_and(|t| now >= *t + self.config.candidate_grace);
             if due && !self.claimed(c) {
-                offered.push(&c.vm_uri);
+                offered.push((&c.vm_uri, false));
             }
         }
-        for uri in offered {
+        for (uri, version_wait) in offered {
             let needs = match self.probes.get(uri) {
                 None => true,
                 Some(ProbeState::Running | ProbeState::Done(_)) => false,
                 Some(ProbeState::Failed(until)) => *until <= now,
             };
-            if needs && !todo.iter().any(|u| u == uri) {
-                todo.push(uri.to_string());
+            if needs && !todo.iter().any(|(u, _)| u == uri) {
+                todo.push((uri.to_string(), version_wait));
             }
         }
-        for uri in todo {
+        for (uri, version_wait) in todo {
             self.probes.insert(uri.clone(), ProbeState::Running);
             let (timeout, events) = (self.config.probe_timeout, self.events.clone());
             self.tasks.spawn(async move {
-                let r = probe(&uri, timeout).await;
+                let r = probe(&uri, timeout, version_wait).await;
                 let _ = events.send(Event::Probed(uri, r));
             });
         }
@@ -911,22 +970,7 @@ mod tests {
         pid: u32,
         os: &'static str,
     ) -> Arc<ScriptedServer> {
-        let calls = std::sync::atomic::AtomicUsize::new(0);
-        let server = Arc::new(ScriptedServer::start(move |method, _| match method {
-            "getVM" => {
-                if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < fail_first {
-                    return Err((-32000, "not ready".into()));
-                }
-                Ok(json!({"pid": pid, "operatingSystem": os,
-                    "isolates": [{"id": "isolates/1", "name": "main", "isSystemIsolate": false}]}))
-            }
-            "getIsolate" => Ok(json!({"id": "isolates/1", "name": "main",
-                "extensionRPCs": ["ext.flutter.reassemble"],
-                "rootLib": {"uri": format!("package:{package}/main.dart")}})),
-            "streamListen" => Ok(json!({"type": "Success"})),
-            "s1.flutterVersion" => Ok(json!({"flutterVersion": "3.47.9"})),
-            _ => Err((-32601, "nope".into())),
-        }));
+        let server = vm_server_silent(package, fail_first, pid, os);
         let s = server.clone();
         tokio::spawn(async move {
             loop {
@@ -942,6 +986,32 @@ mod tests {
             }
         });
         server
+    }
+
+    /// A VM that never announces the `flutterVersion` service, as one the Flutter tool did not
+    /// start.
+    fn vm_server_silent(
+        package: &'static str,
+        fail_first: usize,
+        pid: u32,
+        os: &'static str,
+    ) -> Arc<ScriptedServer> {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        Arc::new(ScriptedServer::start(move |method, _| match method {
+            "getVM" => {
+                if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < fail_first {
+                    return Err((-32000, "not ready".into()));
+                }
+                Ok(json!({"pid": pid, "operatingSystem": os,
+                    "isolates": [{"id": "isolates/1", "name": "main", "isSystemIsolate": false}]}))
+            }
+            "getIsolate" => Ok(json!({"id": "isolates/1", "name": "main",
+                "extensionRPCs": ["ext.flutter.reassemble"],
+                "rootLib": {"uri": format!("package:{package}/main.dart")}})),
+            "streamListen" => Ok(json!({"type": "Success"})),
+            "s1.flutterVersion" => Ok(json!({"flutterVersion": "3.47.9"})),
+            _ => Err((-32601, "nope".into())),
+        }))
     }
 
     fn dtd_server(vm: &ScriptedServer) -> ScriptedServer {
@@ -1361,5 +1431,55 @@ mod tests {
         let apps = wait_for(&mut rx, 1500, "http candidate listed", |a| a.len() == 1).await;
         assert_eq!(apps[0].source, AppSource::Device);
         assert!(count(&vm, "getVM") >= 1);
+    }
+
+    // Real time. Waiting for `flutterVersion` would take at least VERSION_WAIT (1 s) after the
+    // grace period, so the app cannot be listed this early with the wait; it could only fail
+    // spuriously on a machine too loaded to answer a local probe in 0.9 s.
+    #[tokio::test]
+    async fn candidate_probe_does_not_wait_for_the_flutter_version() {
+        let vm = vm_server_silent("shop", 0, 77, "ios");
+        let dir = tempfile::tempdir().unwrap();
+        let (_tx, crx) = watch::channel::<Arc<[Candidate]>>(Arc::from(vec![candidate(
+            Platform::IosSimulator,
+            77,
+            &vm,
+        )]));
+        let mut cfg = config(dir.path());
+        cfg.candidates = Some(crx);
+        let grace = cfg.candidate_grace;
+        let started = std::time::Instant::now();
+        let (_disc, mut rx) = Discovery::spawn(&tokio::runtime::Handle::current(), cfg);
+        let apps = wait_for(&mut rx, 3000, "candidate listed", |a| a.len() == 1).await;
+        let took = started.elapsed();
+        assert!(
+            took < grace + Duration::from_millis(900),
+            "listed {took:?} after start"
+        );
+        assert_eq!(apps[0].flutter_version, None);
+    }
+
+    // Real time. The tick is 30 s, so only a wake on the candidate set and on the grace
+    // deadline can list the app in time.
+    #[tokio::test]
+    async fn candidate_is_probed_at_its_grace_deadline_between_ticks() {
+        let vm = vm_server_with_identity("shop", 0, 77, "ios");
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, crx) = watch::channel::<Arc<[Candidate]>>(Arc::from(Vec::new()));
+        let mut cfg = config(dir.path());
+        cfg.interval = Duration::from_secs(30);
+        cfg.candidates = Some(crx);
+        let (_disc, mut rx) = Discovery::spawn(&tokio::runtime::Handle::current(), cfg);
+        // The first scan (at start) sees no candidate.
+        assert!(next(&mut rx, 2000).await.is_empty());
+        let published = std::time::Instant::now();
+        publish(&tx, vec![candidate(Platform::IosSimulator, 77, &vm)]);
+        wait_for(&mut rx, 5000, "candidate listed", |a| a.len() == 1).await;
+        let took = published.elapsed();
+        assert!(
+            took >= Duration::from_millis(300),
+            "{took:?}: before the grace period"
+        );
+        assert!(took < Duration::from_secs(5));
     }
 }
