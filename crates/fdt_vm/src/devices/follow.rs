@@ -279,15 +279,13 @@ pub async fn run_once(
     String::from_utf8(out.stdout).ok()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    #[cfg(unix)]
     use crate::discovery::pid_alive;
     use std::time::Duration;
     use tokio::sync::mpsc;
 
-    #[cfg(unix)]
     fn sh(script: &str) -> (PathBuf, Vec<String>) {
         (
             PathBuf::from("/bin/sh"),
@@ -295,7 +293,6 @@ mod tests {
         )
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn follower_sends_each_line() {
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -316,7 +313,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn follower_survives_invalid_utf8() {
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -340,7 +336,6 @@ mod tests {
         assert_eq!(second.as_deref(), Some("ok"));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn follower_restarts_with_backoff_and_stops_on_drop() {
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -371,7 +366,6 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn dropping_the_follower_kills_the_child() {
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -398,7 +392,6 @@ mod tests {
         assert!(!pid_alive(pid));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn run_once_returns_stdout_and_times_out() {
         let sh = Path::new("/bin/sh");
@@ -417,7 +410,6 @@ mod tests {
         assert!(c.pids().is_empty(), "finished children are forgotten");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn terminate_sends_sigterm_and_stops_restarts() {
         let dir = tempfile::tempdir().unwrap();
@@ -462,7 +454,6 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn nothing_starts_after_terminate() {
         let dir = tempfile::tempdir().unwrap();
@@ -482,7 +473,6 @@ mod tests {
         assert!(children.pids().is_empty());
     }
 
-    #[cfg(unix)]
     #[test]
     fn has_exited_sees_an_exit_without_reaping_it() {
         use std::os::unix::process::ExitStatusExt;

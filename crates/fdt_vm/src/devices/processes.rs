@@ -238,7 +238,7 @@ mod mac {
 }
 
 /// A fixed process list for tests; counts how often an executable is read.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[derive(Debug, Default)]
 pub(crate) struct FakeProcesses {
     pub(crate) list: std::sync::Mutex<Vec<(u32, ExeInfo)>>,
@@ -246,14 +246,14 @@ pub(crate) struct FakeProcesses {
     pub(crate) orphans: std::sync::Mutex<Vec<(u32, Vec<String>)>>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl FakeProcesses {
     pub(crate) fn set(&self, list: Vec<(u32, ExeInfo)>) {
         *self.list.lock().unwrap() = list;
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Processes for FakeProcesses {
     fn pids(&self) -> Vec<u32> {
         self.list.lock().unwrap().iter().map(|(p, _)| *p).collect()
