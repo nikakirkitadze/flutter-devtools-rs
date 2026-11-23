@@ -34,6 +34,9 @@ that built it.
 - `fdt bench-ui <scenario>` replays a scripted interaction over a stress session and prints draw
   time, frame interval and latency as JSON (see `docs/milestones/m3-review.md`).
 - `fdt --connect <vm-service-url>` opens a window and connects it.
+- Apps opened on a booted iOS simulator or an Android device appear on the Connect page without
+  `flutter run`; apps on a connected iPhone appear only when started with `flutter run` or
+  `flutter attach`. Settings has a switch for this.
 - `FDT_LOG=info|debug|trace` raises the log level (the default shows warnings and errors on stderr).
 
 ## Tools

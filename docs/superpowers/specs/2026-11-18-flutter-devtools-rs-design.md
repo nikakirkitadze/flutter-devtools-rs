@@ -93,7 +93,7 @@ The Dart VM service is JSON-RPC over WebSocket, exposed by debug and profile bui
 | HTTP | `ext.dart.io.httpEnableTimelineLogging`, `ext.dart.io.getHttpProfile` (with `updatedSince`), `getHttpProfileRequest`, `clearHttpProfile` | debug, profile |
 | Sockets, WebSockets | `ext.dart.io` socket profiling extensions (the builder verifies the exact names) | debug, profile |
 | Logs and errors | `Logging` stream (`dart:developer log`), `Stdout`/`Stderr`, `Flutter.Error` (structured errors), `Flutter.Navigation` (route changes) | debug, profile |
-| Finding running apps | **Step 1, find the DTD instances.** Each running Dart Tooling Daemon (DTD) writes a registry file named after its pid into the Dart support directory. On macOS that is `~/Library/Application Support/Dart/dtd/<pid>`, a JSON file with `wsUri`, `epoch`, `pid`, `dartVersion` and `workspaceRoot`. `dart tooling-daemon --list --machine` prints the same list. **Step 2, find the apps.** Call `ConnectedApp.getVmServices` on each DTD. Flutter apps register automatically in debug and profile mode unless run with `--no-dds`. | — |
+| Finding running apps | **Step 1, find the DTD instances.** Each running Dart Tooling Daemon (DTD) writes a registry file named after its pid into the Dart support directory. On macOS that is `~/Library/Application Support/Dart/dtd/<pid>`, a JSON file with `wsUri`, `epoch`, `pid`, `dartVersion` and `workspaceRoot`. `dart tooling-daemon --list --machine` prints the same list. **Step 2, find the apps.** Call `ConnectedApp.getVmServices` on each DTD. Flutter apps register automatically in debug and profile mode unless run with `--no-dds`. **Step 3, apps the Flutter tool did not start.** A Flutter app in debug or profile mode logs `The Dart VM service is listening on <url>` when it starts. `fdt` follows the logs of booted iOS simulators (`xcrun simctl spawn <udid> log stream`) and Android devices (`adb logcat`, with `adb forward` for the port), and lists those apps too. iPhones are not covered: their logs are not readable this way, so those apps appear only through DTD. See the device-log discovery design. | — |
 
 ### 5.2 Consequences that shape the design
 
@@ -160,7 +160,7 @@ The user chose **B**. Plain B loses your place when you switch tools, which is o
 ### 8.1 Connecting
 
 - **Start screen.** It lists running Flutter apps with no setup.
-  - **How apps are found.** `fdt` watches the DTD registry directory (§5.1) and connects to each DTD listed there. Registry entries whose pid is no longer running are ignored. It then lists every app each DTD knows about: app name, device, mode (debug or profile), Flutter version and workspace folder. The list updates live as apps start and stop.
+  - **How apps are found.** `fdt` watches the DTD registry directory (§5.1) and connects to each DTD listed there. Registry entries whose pid is no longer running are ignored. It then lists every app each DTD knows about: app name, device, mode (debug or profile), Flutter version and workspace folder. The list updates live as apps start and stop. Apps opened on a simulator or Android device without the Flutter tool come from a device watcher that reads their logs. A log-found app is first contacted 3 s after it is seen, so the Flutter tool's own connection and its DTD listing arrive first; if DTD lists the same app, the DTD row wins. Rows found in logs leave within about 5 s of the app quitting (a pid check on simulators, a TCP check on Android). Only addresses from discovery or pasted by the user are used, and log-found ones only if they are loopback.
   - **Locations on each OS.** The builder confirms the registry directory on Windows and Linux (the Dart support directory under `%APPDATA%` and the XDG locations). If a location can't be determined, `fdt` falls back to running `dart tooling-daemon --list --machine` with the `dart` found on `PATH` or in a configured SDK.
   - **Connecting.** Press Enter on an app to connect.
   - **Manual options.** A field accepts a pasted VM service URL in either the `http://…/token=/` or `ws://…/ws` form, which covers `--no-dds` and remote cases. Recent session files are listed too.
@@ -171,7 +171,7 @@ The user chose **B**. Plain B loses your place when you switch tools, which is o
   3. Starts recording frames, logs, GC and memory samples.
   4. Detects the mode and the probe version.
 - **Mode banner.** In debug mode, the Performance tool shows a persistent, non-blocking banner saying debug timings are not representative, with a one-line hint on running in profile mode. In profile mode, the Widget tree tool explains that it needs debug mode.
-- **Disconnects** (app restarted, device unplugged) keep all recorded data. A banner offers automatic reconnection to the same app. "Same app" means the same app id, device and workspace, found again through DTD.
+- **Disconnects** (app restarted, device unplugged) keep all recorded data. A banner offers automatic reconnection to the same app. "Same app" means the same app id, device and workspace, found again through DTD or a device log. When one side has no workspace (a log-found app has none), the same app is the same package on the same device.
 - **Runs within a session.**
   - **Hot reload and hot restart** continue the current run.
   - **A full restart or a reconnect** to a new process continues the same session as a new **run**.
