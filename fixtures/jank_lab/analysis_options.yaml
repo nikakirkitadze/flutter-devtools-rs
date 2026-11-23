@@ -1,6 +1,11 @@
 include: package:flutter_lints/flutter.yaml
 
 analyzer:
+  errors:
+    # Flutter 3.47 deprecated package:flutter/material.dart in favour of package:material_ui.
+    # jank_lab still supports Flutter 3.41, which has no material_ui, so it keeps the old import.
+    # Remove this once the oldest Flutter in CI is 3.47 or later.
+    deprecated_member_use: ignore
   exclude:
     - build/**
     - android/**
