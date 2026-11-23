@@ -653,7 +653,7 @@ esac
             WatchTiming {
                 liveness: Duration::from_millis(200),
                 alive_wait: Duration::from_millis(100),
-                sim_scan: Duration::from_secs(2),
+                ..WatchTiming::default()
             }
         }
 

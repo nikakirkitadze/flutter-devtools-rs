@@ -4,6 +4,7 @@
 pub mod android;
 pub mod follow;
 pub mod marker;
+pub mod processes;
 pub mod simulator_watch;
 pub mod simulators;
 pub mod tools;
@@ -19,6 +20,7 @@ use tokio::task::JoinHandle;
 
 use crate::discovery::Os;
 use android::AndroidWatch;
+use processes::{HostProcesses, Processes};
 use simulator_watch::SimulatorWatch;
 
 /// How often the watchers check things, so tests can run them fast.
@@ -28,8 +30,13 @@ pub struct WatchTiming {
     pub liveness: Duration,
     /// How long a connection to a forwarded port must stay open to count as alive.
     pub alive_wait: Duration,
-    /// Interval between simulator device-file scans.
+    /// Interval between simulator scans (device files and host processes).
     pub sim_scan: Duration,
+    /// When a new simulator app's VM service line is first looked for again; each later try
+    /// waits twice as long.
+    pub lookup_retry: Duration,
+    /// How long after a simulator app was first seen its line is looked for.
+    pub lookup_give_up: Duration,
 }
 
 impl Default for WatchTiming {
@@ -38,6 +45,8 @@ impl Default for WatchTiming {
             liveness: Duration::from_secs(2),
             alive_wait: Duration::from_millis(400),
             sim_scan: Duration::from_secs(2),
+            lookup_retry: Duration::from_secs(1),
+            lookup_give_up: Duration::from_secs(30),
         }
     }
 }
@@ -94,6 +103,8 @@ pub struct DeviceWatchConfig {
     pub adb: Option<PathBuf>,
     pub xcrun: Option<PathBuf>,
     pub simulator_dir: Option<PathBuf>,
+    /// The host's processes, where simulator apps run.
+    pub processes: Arc<dyn Processes>,
     pub timing: WatchTiming,
 }
 
@@ -111,6 +122,7 @@ impl DeviceWatchConfig {
             ),
             xcrun: tools::find_xcrun(&exists),
             simulator_dir: simulators::simulator_devices_dir(home),
+            processes: Arc::new(HostProcesses),
             timing: WatchTiming::default(),
         }
     }
@@ -147,6 +159,7 @@ impl DeviceWatch {
                     handle,
                     xcrun,
                     dir,
+                    config.processes,
                     config.timing,
                     sim_out.clone(),
                     st.clone(),
@@ -248,6 +261,7 @@ impl Drop for DeviceWatch {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use processes::{ExeInfo, FakeProcesses};
     use std::os::unix::fs::PermissionsExt;
     use std::process::{Command, Stdio};
     use std::time::Instant;
@@ -264,15 +278,11 @@ mod tests {
         )
     }
 
-    fn fake_xcrun(dir: &std::path::Path, stream: &str, show: &str) -> PathBuf {
-        let script = format!(
-            "#!/bin/sh\nDIR=\"{}\"\ncase \"$*\" in\n  *\"log stream\"*) echo $$ > \"$DIR/stream_pid\"; {stream};;\n  *\"log show --last 1h\"*) {show};;\nesac\n",
-            dir.display()
-        );
-        let tmp = dir.join("xcrun.tmp");
-        std::fs::write(&tmp, script).unwrap();
+    fn write_script(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
+        let tmp = dir.join(format!("{name}.tmp"));
+        std::fs::write(&tmp, body).unwrap();
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let path = dir.join("xcrun");
+        let path = dir.join(name);
         std::fs::rename(&tmp, &path).unwrap();
         path
     }
@@ -282,6 +292,8 @@ mod tests {
             liveness: Duration::from_millis(200),
             alive_wait: Duration::from_millis(100),
             sim_scan: Duration::from_millis(100),
+            lookup_retry: Duration::from_millis(200),
+            lookup_give_up: Duration::from_secs(30),
         }
     }
 
@@ -296,16 +308,18 @@ mod tests {
         f()
     }
 
+    /// A booted simulator `U1` running one Flutter app (a `sleep` child), whose `log show`
+    /// query prints its VM service line.
     struct Rig {
-        _dir: tempfile::TempDir,
-        sims: PathBuf,
+        dir: tempfile::TempDir,
         out: Arc<watch::Sender<Arc<[Candidate]>>>,
         status: Arc<watch::Sender<WatchStatus>>,
         child: std::process::Child,
+        config: DeviceWatchConfig,
         watch: Option<DeviceWatch>,
     }
 
-    fn rig(stream_hit: bool, show_pid: Option<u32>) -> Rig {
+    fn rig() -> Rig {
         let child = Command::new("sleep")
             .arg("30")
             .stdout(Stdio::null())
@@ -319,41 +333,52 @@ mod tests {
             plist("U1", "iPhone 18 Pro", 3),
         )
         .unwrap();
-        let stream = if stream_hit {
-            format!("echo '{}'; exec sleep 30", marker(child.id()))
-        } else {
-            "exec sleep 30".to_string()
+        let bundle = sims.join("U1/data/Containers/Bundle/Application/A1/Runner.app");
+        std::fs::create_dir_all(bundle.join("Frameworks/Flutter.framework")).unwrap();
+        let procs = FakeProcesses::default();
+        procs.set(vec![(
+            child.id(),
+            ExeInfo {
+                path: bundle.join("Runner"),
+                started: Some(std::time::SystemTime::now()),
+            },
+        )]);
+        let xcrun = write_script(
+            dir.path(),
+            "xcrun",
+            &format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *\"log show\"*) echo '{}';;\nesac\n",
+                marker(child.id())
+            ),
+        );
+        let config = DeviceWatchConfig {
+            adb: None,
+            xcrun: Some(xcrun),
+            simulator_dir: Some(sims),
+            processes: Arc::new(procs),
+            timing: timing(),
         };
-        let show = show_pid.map_or("true".to_string(), |p| {
-            format!("echo '{}'; touch \"$DIR/show_ran\"", marker(p))
-        });
-        let xcrun = fake_xcrun(dir.path(), &stream, &show);
         let out = Arc::new(watch::channel(Arc::<[Candidate]>::from(Vec::new())).0);
         let status = Arc::new(watch::channel(WatchStatus::default()).0);
         let watch = DeviceWatch::spawn(
             &Handle::current(),
-            DeviceWatchConfig {
-                adb: None,
-                xcrun: Some(xcrun),
-                simulator_dir: Some(sims.clone()),
-                timing: timing(),
-            },
+            config.clone(),
             out.clone(),
             status.clone(),
         );
         Rig {
-            _dir: dir,
-            sims,
+            dir,
             out,
             status,
             child,
+            config,
             watch: Some(watch),
         }
     }
 
     #[tokio::test]
     async fn fake_simulator_end_to_end() {
-        let mut r = rig(true, None);
+        let mut r = rig();
         assert!(until(|| r.out.borrow().len() == 1, 3).await);
         assert_eq!(
             r.out.borrow()[0],
@@ -378,55 +403,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_backfill_line_is_skipped() {
-        let mut c = Command::new("true").spawn().unwrap();
-        let dead = c.id();
-        c.wait().unwrap();
-        let r = rig(false, Some(dead));
-        let ran = r._dir.path().join("show_ran");
-        assert!(until(|| ran.exists(), 3).await, "backfill ran");
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        assert!(r.out.borrow().is_empty());
-    }
-
-    #[tokio::test]
-    async fn shutting_down_a_simulator_stops_its_follower() {
-        let r = rig(false, None);
-        let st = r.status.clone();
-        assert!(
-            until(
-                || st.borrow().simulator == PlatformState::Watching { devices: 1 },
-                3
-            )
-            .await
-        );
-        let pid_file = r._dir.path().join("stream_pid");
-        assert!(until(|| pid_file.exists(), 3).await);
-        let pid: u32 = std::fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        std::fs::write(
-            r.sims.join("U1/device.plist"),
-            plist("U1", "iPhone 18 Pro", 1),
-        )
-        .unwrap();
-        assert!(
-            until(
-                || st.borrow().simulator == PlatformState::Watching { devices: 0 },
-                3
-            )
-            .await
-        );
-        assert!(until(|| !crate::discovery::pid_alive(pid), 3).await);
-    }
-
-    #[tokio::test]
     async fn device_watch_merges_simulator_and_android_sets() {
         use tokio::net::TcpListener;
-        let r = rig(true, None);
-        let dir = r._dir.path().to_path_buf();
+        let r = rig();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let _holder = tokio::spawn(async move {
@@ -435,14 +414,13 @@ mod tests {
                 keep.push(s);
             }
         });
-        let script = format!(
-            "#!/bin/sh\ncase \"$*\" in\n  \"track-devices\") printf '0015emulator-5554\\tdevice\\n'; exec sleep 30;;\n  \"devices -l\") echo 'emulator-5554 device model:Pixel_8';;\n  *\"logcat -d\"*) true;;\n  *\"logcat -v brief -T 1\"*) echo 'I/flutter ( 4242): The Dart VM service is listening on http://127.0.0.1:40421/tok=/'; exec sleep 30;;\n  *\"forward tcp:0 tcp:\"*) echo {port};;\nesac\n"
+        let adb = write_script(
+            r.dir.path(),
+            "adb",
+            &format!(
+                "#!/bin/sh\ncase \"$*\" in\n  \"track-devices\") printf '0015emulator-5554\\tdevice\\n'; exec sleep 30;;\n  \"devices -l\") echo 'emulator-5554 device model:Pixel_8';;\n  *\"logcat -d\"*) true;;\n  *\"logcat -v brief -T 1\"*) echo 'I/flutter ( 4242): The Dart VM service is listening on http://127.0.0.1:40421/tok=/'; exec sleep 30;;\n  *\"forward tcp:0 tcp:\"*) echo {port};;\nesac\n"
+            ),
         );
-        let tmp = dir.join("adb.tmp");
-        std::fs::write(&tmp, script).unwrap();
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let adb = dir.join("adb");
-        std::fs::rename(&tmp, &adb).unwrap();
 
         let out = Arc::new(watch::channel(Arc::<[Candidate]>::from(Vec::new())).0);
         let status = Arc::new(watch::channel(WatchStatus::default()).0);
@@ -450,9 +428,7 @@ mod tests {
             &Handle::current(),
             DeviceWatchConfig {
                 adb: Some(adb),
-                xcrun: Some(dir.join("xcrun")),
-                simulator_dir: Some(r.sims.clone()),
-                timing: timing(),
+                ..r.config.clone()
             },
             out.clone(),
             status,
@@ -478,7 +454,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_device_watch_empties_the_set() {
-        let mut r = rig(true, None);
+        let mut r = rig();
         assert!(until(|| r.out.borrow().len() == 1, 3).await);
         drop(r.watch.take());
         assert!(r.out.borrow().is_empty());
