@@ -129,7 +129,7 @@ impl DeviceWatchConfig {
                 &exists,
             ),
             xcrun: tools::find_xcrun(&exists),
-            simulator_dir: simulators::simulator_devices_dir(home),
+            simulator_dir: simulators::simulator_devices_dir(home, &exists),
             processes: Arc::new(HostProcesses),
             state_dir: dirs::config_dir().map(|d| d.join("fdt")),
             timing: WatchTiming::default(),

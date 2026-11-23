@@ -22,6 +22,11 @@ use crate::discovery::pid_alive;
 const ADB_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOVE_TIMEOUT: Duration = Duration::from_secs(2);
 const STABLE_RUN: Duration = Duration::from_secs(30);
+/// Liveness checks that must fail in a row before an app is taken off the list, so one slow
+/// connect does not cut a live app (and a window connected through its forward).
+const LIVENESS_MISSES: u8 = 2;
+/// Failed `forward --remove` runs after which a forward is forgotten instead of retried.
+const MAX_REMOVE_ATTEMPTS: u32 = 5;
 
 /// Drains complete `adb track-devices` frames (4 hex digits of length, then that many bytes of
 /// `serial\tstate\n` lines) from `buf`. A partial frame stays in `buf`.
@@ -322,6 +327,7 @@ impl AndroidWatch {
                 found: HashMap::new(),
                 devices: HashMap::new(),
                 names: HashMap::new(),
+                failed_removals: HashMap::new(),
             }
             .run(),
         );
@@ -420,6 +426,8 @@ struct Found {
     /// The device-side URL the hit named, to ignore the same line seen twice.
     device_url: String,
     local_port: u16,
+    /// Liveness checks failed in a row.
+    misses: u8,
 }
 
 struct AbortOnDrop(JoinHandle<()>);
@@ -443,6 +451,8 @@ struct Watcher {
     found: HashMap<(String, u32), Found>,
     devices: HashMap<String, DeviceTasks>,
     names: HashMap<String, String>,
+    /// Failed removal attempts per held forward.
+    failed_removals: HashMap<(String, u16), u32>,
 }
 
 impl Watcher {
@@ -508,6 +518,7 @@ impl Watcher {
             // adb drops a detached device's forwards itself, and a `--remove` would fail with
             // "device not found" and be retried every tick, so just forget them.
             self.held.retain(|(s, _)| *s != serial);
+            self.failed_removals.retain(|(s, _), _| *s != serial);
         }
         for serial in live {
             if !self.devices.contains_key(&serial) {
@@ -559,7 +570,9 @@ impl Watcher {
                 let Some(text) = run_once(&adb, &cmd, ADB_TIMEOUT, &children).await else {
                     return;
                 };
-                for line in text.lines() {
+                // An app's older lines name URLs that are gone; forwarding each would cost an
+                // adb run, a connect and a removal.
+                for line in newest_per_pid(&text) {
                     let ev = Ev::Line {
                         serial: serial.clone(),
                         line: line.to_string(),
@@ -636,6 +649,7 @@ impl Watcher {
                 candidate,
                 device_url: hit.url,
                 local_port: local,
+                misses: 0,
             },
         );
         if let Some(old) = old {
@@ -651,12 +665,16 @@ impl Watcher {
             .iter()
             .map(|(key, f)| (key.clone(), f.local_port))
             .map(|(key, port)| async move { (key, tcp_alive(port, wait).await) });
-        let dead: Vec<_> = futures_util::future::join_all(checks)
-            .await
-            .into_iter()
-            .filter(|(_, alive)| !alive)
-            .map(|(key, _)| key)
-            .collect();
+        let mut dead = Vec::new();
+        for (key, alive) in futures_util::future::join_all(checks).await {
+            let Some(f) = self.found.get_mut(&key) else {
+                continue;
+            };
+            f.misses = if alive { 0 } else { f.misses + 1 };
+            if f.misses >= LIVENESS_MISSES {
+                dead.push(key);
+            }
+        }
         for key in dead {
             if let Some(f) = self.found.remove(&key) {
                 self.remove_forward(&key.0, f.local_port).await;
@@ -676,7 +694,7 @@ impl Watcher {
         }
     }
 
-    async fn remove_forward(&self, serial: &str, port: u16) {
+    async fn remove_forward(&mut self, serial: &str, port: u16) {
         let spec = format!("tcp:{port}");
         let removed = run_once(
             &self.adb,
@@ -686,9 +704,22 @@ impl Watcher {
         )
         .await;
         // `held` is the record of live forwards: it only forgets one once adb confirmed the
-        // removal, so a failed removal is retried on the next tick and at `Drop`.
+        // removal, so a failed removal is retried on the next tick and at `Drop`, up to
+        // `MAX_REMOVE_ATTEMPTS` times in all.
+        let key = (serial.to_string(), port);
         if removed.is_some() {
+            self.failed_removals.remove(&key);
             self.held.remove(serial, port);
+            return;
+        }
+        let attempts = self.failed_removals.entry(key.clone()).or_insert(0);
+        *attempts += 1;
+        if *attempts >= MAX_REMOVE_ATTEMPTS {
+            self.failed_removals.remove(&key);
+            self.held.remove(serial, port);
+            log::warn!(
+                "gave up removing the adb forward from local port {port} after {MAX_REMOVE_ATTEMPTS} attempts"
+            );
         }
     }
 
@@ -704,6 +735,20 @@ impl Watcher {
             }
         });
     }
+}
+
+/// The VM service lines in `text`, keeping only the newest one of each pid, in log order.
+fn newest_per_pid(text: &str) -> Vec<&str> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut newest: HashMap<u32, usize> = HashMap::new();
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(hit) = android_hit(line) {
+            newest.insert(hit.pid, i);
+        }
+    }
+    let mut keep: Vec<usize> = newest.into_values().collect();
+    keep.sort_unstable();
+    keep.into_iter().map(|i| lines[i]).collect()
 }
 
 fn args(a: &[&str]) -> Vec<String> {
@@ -878,6 +923,27 @@ mod tests {
     }
 
     #[test]
+    fn backfill_keeps_the_newest_line_per_pid() {
+        let line = |pid: u32, port: u16| {
+            format!(
+                "I/flutter ({pid:>5}): The Dart VM service is listening on http://127.0.0.1:{port}/t=/"
+            )
+        };
+        let text = [
+            line(4242, 40421),
+            "I/flutter ( 4242): hello".to_string(),
+            line(4343, 40423),
+            line(4242, 40422),
+        ]
+        .join("\n");
+        assert_eq!(
+            newest_per_pid(&text),
+            vec![line(4343, 40423), line(4242, 40422)]
+        );
+        assert!(newest_per_pid("").is_empty());
+    }
+
+    #[test]
     fn held_forwards_are_recorded_and_the_record_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let path = record_path(dir.path(), 4242);
@@ -934,10 +1000,14 @@ case "$*" in
     if [ -e "$DIR/line2" ]; then sleep 1; cat "$DIR/line2"; fi
     exec sleep 30;;
   *"forward --remove"*)
-    if [ -e "$DIR/remove_fails" ]; then exit 1; fi
+    if [ -e "$DIR/remove_fails" ]; then echo "$@" >> "$DIR/failed_removals"; exit 1; fi
     echo "$@" >> "$DIR/removed";;
-  *"forward tcp:0 tcp:40422"*) cat "$DIR/port2";;
-  *"forward tcp:0 tcp:"*) cat "$DIR/port";;
+  *"forward tcp:0 tcp:"*)
+    echo "$@" >> "$DIR/forwards"
+    case "$*" in
+      *"tcp:40422") cat "$DIR/port2";;
+      *) cat "$DIR/port";;
+    esac;;
   "version") echo ok;;
 esac
 "#,
@@ -1404,6 +1474,127 @@ esac
             std::fs::remove_file(dir.path().join("remove_fails")).unwrap();
             drop(watch);
             assert!(!record.exists(), "removed at drop, and the record with it");
+        }
+
+        fn lines(dir: &Path, name: &str) -> Vec<String> {
+            std::fs::read_to_string(dir.join(name))
+                .map(|t| t.lines().map(String::from).collect())
+                .unwrap_or_default()
+        }
+
+        #[tokio::test]
+        async fn backfill_forwards_only_the_newest_line_of_each_app() {
+            let dir = tempfile::tempdir().unwrap();
+            let closed = {
+                let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                l.local_addr().unwrap().port()
+            };
+            std::fs::write(dir.path().join("port"), format!("{closed}\n")).unwrap();
+            std::fs::write(dir.path().join("port2"), format!("{closed}\n")).unwrap();
+            std::fs::write(dir.path().join("silent"), "").unwrap();
+            let old = LINE;
+            let new = LINE.replace("40421/tok=", "40422/tok2=");
+            let other = LINE.replace("( 4242)", "( 4343)").replace("40421", "40423");
+            let adb = fake_adb(
+                dir.path(),
+                &format!("printf '%s\\n' \"{old}\" \"{other}\" \"{new}\""),
+            );
+            let (out, status) = channels();
+            let _watch = AndroidWatch::spawn(
+                &Handle::current(),
+                adb,
+                timing(),
+                out,
+                status,
+                Children::default(),
+                None,
+            );
+            assert!(until(|| lines(dir.path(), "forwards").len() == 2, 3).await);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let forwards = lines(dir.path(), "forwards");
+            assert_eq!(forwards.len(), 2, "{forwards:?}");
+            assert!(forwards.iter().any(|f| f.ends_with("tcp:40422")));
+            assert!(forwards.iter().any(|f| f.ends_with("tcp:40423")));
+            assert!(!forwards.iter().any(|f| f.ends_with("tcp:40421")));
+        }
+
+        /// A listener that closes the `drop_nth` connection it accepts (1-based) at once and
+        /// holds every other one; aborting the task closes them all.
+        async fn flaky_holder(drop_nth: usize) -> (u16, tokio::task::JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let task = tokio::spawn(async move {
+                let mut keep = Vec::new();
+                let mut n = 0;
+                while let Ok((s, _)) = listener.accept().await {
+                    n += 1;
+                    if n == drop_nth {
+                        drop(s);
+                    } else {
+                        keep.push(s);
+                    }
+                }
+            });
+            (port, task)
+        }
+
+        #[tokio::test]
+        async fn one_failed_liveness_check_keeps_the_app() {
+            let dir = tempfile::tempdir().unwrap();
+            // Connection 1 is the check when the line arrives; 2 is the first liveness check.
+            let (port, task) = flaky_holder(2).await;
+            std::fs::write(dir.path().join("port"), format!("{port}\n")).unwrap();
+            let adb = fake_adb(dir.path(), "true");
+            let (out, status) = channels();
+            let watch = AndroidWatch::spawn(
+                &Handle::current(),
+                adb,
+                timing(),
+                out.clone(),
+                status,
+                Children::default(),
+                None,
+            );
+            assert!(until(|| out.borrow().len() == 1, 3).await);
+            // Several liveness ticks (200 ms), one of which failed.
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            assert_eq!(out.borrow().len(), 1, "one missed check removed the app");
+            assert!(!removed_has(dir.path(), port));
+            assert_eq!(watch.held.snapshot().len(), 1);
+            // Two misses in a row: it goes.
+            task.abort();
+            assert!(until(|| out.borrow().is_empty(), 3).await);
+            assert!(until(|| removed_has(dir.path(), port), 3).await);
+        }
+
+        #[tokio::test]
+        async fn a_forward_whose_removal_keeps_failing_is_forgotten_after_five_attempts() {
+            let dir = tempfile::tempdir().unwrap();
+            let (port, task) = holder().await;
+            std::fs::write(dir.path().join("port"), format!("{port}\n")).unwrap();
+            let adb = fake_adb(dir.path(), "true");
+            let (out, status) = channels();
+            let watch = AndroidWatch::spawn(
+                &Handle::current(),
+                adb,
+                timing(),
+                out.clone(),
+                status,
+                Children::default(),
+                None,
+            );
+            assert!(until(|| out.borrow().len() == 1, 3).await);
+            std::fs::write(dir.path().join("remove_fails"), "").unwrap();
+            task.abort();
+            assert!(until(|| out.borrow().is_empty(), 3).await);
+            assert!(
+                until(|| watch.held.snapshot().is_empty(), 5).await,
+                "forgotten"
+            );
+            assert_eq!(lines(dir.path(), "failed_removals").len(), 5);
+            // The device is still listed, but nothing retries it any more.
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            assert_eq!(lines(dir.path(), "failed_removals").len(), 5);
         }
     }
 }

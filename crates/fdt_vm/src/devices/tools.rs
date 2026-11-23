@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use crate::discovery::Os;
 
 /// Finds `adb`: each `PATH` entry, then `$ANDROID_HOME` and `$ANDROID_SDK_ROOT`
-/// (`platform-tools`), then the default SDK location for the OS. Empty variables are ignored.
+/// (`platform-tools`), then on macOS Homebrew's `/opt/homebrew/bin` and `/usr/local/bin` (an
+/// app started from Finder has neither on `PATH`), then the default SDK location for the OS.
+/// Empty variables are ignored.
 pub fn find_adb(
     os: Os,
     env: &dyn Fn(&str) -> Option<String>,
@@ -27,6 +29,8 @@ pub fn find_adb(
     }
     match os {
         Os::MacOs => {
+            dirs.push(PathBuf::from("/opt/homebrew/bin"));
+            dirs.push(PathBuf::from("/usr/local/bin"));
             if let Some(h) = &home {
                 dirs.push(h.join("Library/Android/sdk/platform-tools"));
             }
@@ -111,6 +115,46 @@ mod tests {
             find_adb(Os::Linux, &env_of(&[("ANDROID_HOME", "")]), None, &|_| true),
             None
         );
+    }
+
+    #[test]
+    fn homebrew_adb_is_found_on_macos_after_the_env_and_before_the_sdk() {
+        let home = Some(PathBuf::from("/Users/u"));
+        // Started from Finder: PATH has no Homebrew folder.
+        let finder = env_of(&[("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")]);
+        let sdk = PathBuf::from("/Users/u/Library/Android/sdk/platform-tools/adb");
+        for brew in ["/opt/homebrew/bin/adb", "/usr/local/bin/adb"] {
+            let brew = PathBuf::from(brew);
+            assert_eq!(
+                find_adb(Os::MacOs, &finder, home.clone(), &|p| p == brew),
+                Some(brew.clone())
+            );
+            assert_eq!(
+                find_adb(Os::MacOs, &finder, home.clone(), &|p| p == brew || p == sdk),
+                Some(brew.clone()),
+                "before the default SDK"
+            );
+            let env_sdk = PathBuf::from("/sdk/platform-tools/adb");
+            assert_eq!(
+                find_adb(
+                    Os::MacOs,
+                    &env_of(&[("ANDROID_HOME", "/sdk")]),
+                    home.clone(),
+                    &|p| p == brew || p == env_sdk
+                ),
+                Some(env_sdk),
+                "after $ANDROID_HOME"
+            );
+        }
+        let apple = PathBuf::from("/opt/homebrew/bin/adb");
+        let intel = PathBuf::from("/usr/local/bin/adb");
+        assert_eq!(
+            find_adb(Os::MacOs, &finder, home.clone(), &|p| p == apple
+                || p == intel),
+            Some(apple)
+        );
+        // Only on macOS.
+        assert_eq!(find_adb(Os::Linux, &finder, home, &|p| p == intel), None);
     }
 
     #[test]

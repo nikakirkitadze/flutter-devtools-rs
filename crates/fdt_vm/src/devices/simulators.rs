@@ -10,12 +10,16 @@ use regex::Regex;
 
 use crate::discovery::Os;
 
-/// `~/Library/Developer/CoreSimulator/Devices` on macOS.
-pub fn simulator_devices_dir(home: Option<PathBuf>) -> Option<PathBuf> {
+/// `~/Library/Developer/CoreSimulator/Devices` on macOS, when it exists (Xcode made it).
+pub fn simulator_devices_dir(
+    home: Option<PathBuf>,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
     if Os::current() != Os::MacOs {
         return None;
     }
-    Some(home?.join("Library/Developer/CoreSimulator/Devices"))
+    let dir = home?.join("Library/Developer/CoreSimulator/Devices");
+    exists(&dir).then_some(dir)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -134,6 +138,17 @@ mod tests {
 </plist>
 "#
         )
+    }
+
+    #[test]
+    fn devices_dir_must_exist() {
+        let home = Some(PathBuf::from("/Users/u"));
+        let dir = PathBuf::from("/Users/u/Library/Developer/CoreSimulator/Devices");
+        let want = (Os::current() == Os::MacOs).then(|| dir.clone());
+        assert_eq!(simulator_devices_dir(home.clone(), &|p| p == dir), want);
+        // No Xcode: no folder, so the simulator watcher says why instead of "watching 0".
+        assert_eq!(simulator_devices_dir(home, &|_| false), None);
+        assert_eq!(simulator_devices_dir(None, &|_| true), None);
     }
 
     #[test]
