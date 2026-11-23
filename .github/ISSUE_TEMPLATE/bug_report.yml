@@ -1,0 +1,51 @@
+name: Bug report
+description: Something in fdt doesn't work as it should.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Run the app with `flutter run --profile`
+        2. Connect fdt and open Performance
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: macOS 26.1, Windows 11, Ubuntu 24.04 ...
+    validations:
+      required: true
+  - type: input
+    id: fdt
+    attributes:
+      label: fdt version or commit
+      description: The output of `fdt --version`, or the commit you built from.
+    validations:
+      required: true
+  - type: input
+    id: flutter
+    attributes:
+      label: Flutter version and mode
+      placeholder: Flutter 3.38.1, debug / profile
+  - type: input
+    id: target
+    attributes:
+      label: Where the Flutter app runs
+      placeholder: iOS simulator, Android emulator, physical iPhone, macOS desktop ...
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: Run fdt with `FDT_LOG=debug` and paste what it prints around the problem.
+      render: text
