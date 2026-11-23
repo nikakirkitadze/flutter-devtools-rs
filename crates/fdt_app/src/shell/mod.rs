@@ -971,6 +971,9 @@ impl Render for MainWindow {
             .on_action(cx.listener(|this, _: &ConnectToApp, w, cx| {
                 let to = this.current().with_page(Page::Start);
                 this.navigate(to, w, cx);
+                // Already on Connect, `navigate` changes nothing, and the palette that ran this
+                // returned focus to the shell: put it back on the list so Return connects.
+                this.focus_start_if_current(w, cx);
             }))
             .on_action(cx.listener(|this, _: &UseSystemTheme, w, cx| {
                 this.set_theme(ThemePreference::System, w, cx)

@@ -962,6 +962,30 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn enter_on_a_fresh_window_connects_the_first_app(cx: &mut TestAppContext) {
+        let (_shell, cx, fake, _tx) = open_start(cx, Some(two_apps()));
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let targets = fake.targets.borrow();
+        assert_eq!(targets.len(), 1);
+        assert!(matches!(&targets[0], Target::Discovered(a) if a.name == "jank_lab"));
+    }
+
+    #[gpui_kit::test]
+    fn connect_to_app_while_on_connect_focuses_the_list(cx: &mut TestAppContext) {
+        let (_shell, cx, fake, _tx) = open_start(cx, Some(two_apps()));
+        // The palette closes back onto the shell; "Connect to an App..." then runs from there.
+        cx.dispatch_action(crate::actions::OpenPalette);
+        cx.run_until_parked();
+        cx.simulate_input("Connect to an App");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(fake.targets.borrow().len(), 1);
+    }
+
+    #[gpui_kit::test]
     fn a_missing_capture_shows_a_plain_message(cx: &mut TestAppContext) {
         let (shell, cx) = crate::test_support::open_shell(cx);
         let (_tx, rx) = tokio::sync::watch::channel::<
