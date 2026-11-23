@@ -16,7 +16,8 @@ fdt_store = { path = "../fdt_store" }
 fdt_analysis = { path = "../fdt_analysis" }
 fdt_capture = { path = "../fdt_capture" }
 fdt_vm = { path = "../fdt_vm" }
-tokio = { workspace = true }
+# `signal`: SIGTERM, SIGINT and SIGHUP stop the device watchers before exiting.
+tokio = { workspace = true, features = ["signal"] }
 gpui_kit.workspace = true
 anyhow.workspace = true
 serde.workspace = true

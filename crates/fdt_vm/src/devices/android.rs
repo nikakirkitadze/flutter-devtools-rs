@@ -13,9 +13,11 @@ use tokio::runtime::Handle;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
-use super::follow::{Backoff, Follower, follow, run_once};
+use super::follow::{Backoff, Children, Follower, follow, run_once, sigterm, spawn_tracked};
 use super::marker::{android_hit, clean_adb_device_name};
-use super::{Candidate, Platform, PlatformState, WatchTiming};
+use super::processes::Processes;
+use super::{Candidate, Platform, PlatformState, SHUTDOWN_CAP, WatchTiming};
+use crate::discovery::pid_alive;
 
 const ADB_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOVE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -97,23 +99,216 @@ enum Ev {
     Line { serial: String, line: String },
 }
 
+/// The arguments of the long-lived `logcat` follower for one device.
+fn follow_args(serial: &str) -> Vec<String> {
+    args(&[
+        "-s",
+        serial,
+        "logcat",
+        "-v",
+        "brief",
+        "-T",
+        "1",
+        "flutter:I",
+        "*:S",
+    ])
+}
+
+/// Whether `argv` is exactly one of the long-lived commands this watcher runs:
+/// `<adb> track-devices`, or `<adb> -s <serial> logcat -v brief -T 1 flutter:I *:S`.
+pub(crate) fn is_watcher_argv(argv: &[String]) -> bool {
+    let Some((exe, rest)) = argv.split_first() else {
+        return false;
+    };
+    if Path::new(exe).file_name().is_none_or(|n| n != "adb") {
+        return false;
+    }
+    match rest {
+        [only] => only == "track-devices",
+        [flag, serial, ..] => flag == "-s" && !serial.is_empty() && rest == follow_args(serial),
+        _ => false,
+    }
+}
+
+/// Sends SIGTERM to watcher processes an earlier fdt left behind when it died without stopping
+/// them: orphans (parent pid 1) whose argv is exactly a watcher command. Returns their pids.
+pub(crate) fn sweep_orphans(processes: &dyn Processes) -> Vec<u32> {
+    let pids: Vec<u32> = processes
+        .orphans("adb")
+        .into_iter()
+        .filter(|(_, argv)| is_watcher_argv(argv))
+        .map(|(pid, _)| pid)
+        .collect();
+    for pid in &pids {
+        sigterm(*pid);
+    }
+    if !pids.is_empty() {
+        log::info!(
+            "stopped {} adb watcher process(es) an earlier run left behind",
+            pids.len()
+        );
+    }
+    pids
+}
+
+/// The adb forwards the watcher holds. With a record file, every change is written to it, so
+/// a later run can remove the forwards if this one dies without doing so.
+pub(crate) struct Held {
+    list: Mutex<Vec<(String, u16)>>,
+    record: Option<PathBuf>,
+}
+
+impl Held {
+    pub(crate) fn new(record: Option<PathBuf>) -> Held {
+        Held {
+            list: Mutex::new(Vec::new()),
+            record,
+        }
+    }
+
+    /// Applies `change`, and rewrites the record if the list changed.
+    fn update<R>(&self, change: impl FnOnce(&mut Vec<(String, u16)>) -> R) -> R {
+        let mut list = self.list.lock().unwrap_or_else(|e| e.into_inner());
+        let before = list.clone();
+        let r = change(&mut list);
+        if *list != before
+            && let Some(path) = &self.record
+        {
+            save_record(path, &list);
+        }
+        r
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<(String, u16)> {
+        self.list.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn push(&self, serial: &str, port: u16) {
+        self.update(|l| l.push((serial.to_string(), port)));
+    }
+
+    fn remove(&self, serial: &str, port: u16) {
+        self.update(|l| l.retain(|(s, p)| !(s == serial && *p == port)));
+    }
+
+    fn retain(&self, keep: impl FnMut(&(String, u16)) -> bool) {
+        self.update(|l| l.retain(keep));
+    }
+
+    fn replace(&self, new: Vec<(String, u16)>) {
+        self.update(|l| *l = new);
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RecordedForward {
+    serial: String,
+    port: u16,
+}
+
+/// `forwards-<pid>.json` in `dir`: the forwards process `pid` holds.
+pub(crate) fn record_path(dir: &Path, pid: u32) -> PathBuf {
+    dir.join(format!("forwards-{pid}.json"))
+}
+
+/// Writes `list` to `path` (through a temporary file), or deletes `path` when `list` is empty.
+fn save_record(path: &Path, list: &[(String, u16)]) {
+    if list.is_empty() {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    let entries: Vec<RecordedForward> = list
+        .iter()
+        .map(|(serial, port)| RecordedForward {
+            serial: serial.clone(),
+            port: *port,
+        })
+        .collect();
+    let Ok(text) = serde_json::to_string(&entries) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+pub(crate) fn read_record(path: &Path) -> Option<Vec<(String, u16)>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let entries: Vec<RecordedForward> = serde_json::from_str(&text).ok()?;
+    Some(entries.into_iter().map(|e| (e.serial, e.port)).collect())
+}
+
+/// Removes the forwards recorded by fdt processes that are no longer running, then deletes
+/// their records. Forwards no record lists are never touched.
+async fn sweep_records(adb: &Path, dir: &Path, children: &Children) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let me = std::process::id();
+    let dead: Vec<PathBuf> = rd
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let pid: u32 = name
+                .to_str()?
+                .strip_prefix("forwards-")?
+                .strip_suffix(".json")?
+                .parse()
+                .ok()?;
+            (pid != me && !pid_alive(pid)).then(|| e.path())
+        })
+        .collect();
+    for path in dead {
+        let forwards = read_record(&path).unwrap_or_default();
+        let removals = forwards.iter().map(|(serial, port)| async move {
+            let spec = format!("tcp:{port}");
+            run_once(
+                adb,
+                &["-s", serial, "forward", "--remove", &spec],
+                REMOVE_TIMEOUT,
+                children,
+            )
+            .await
+        });
+        futures_util::future::join_all(removals).await;
+        if !forwards.is_empty() {
+            log::info!(
+                "removed {} adb forward(s) an earlier run left behind",
+                forwards.len()
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 /// Handle to the Android watcher. Dropping it stops everything and removes its forwards.
 pub(crate) struct AndroidWatch {
     task: JoinHandle<()>,
     adb: PathBuf,
-    held: Arc<Mutex<Vec<(String, u16)>>>,
+    held: Arc<Held>,
     out: Arc<watch::Sender<Arc<[Candidate]>>>,
 }
 
 impl AndroidWatch {
+    /// With a `state_dir`, the held forwards are recorded in it, and forwards recorded there by
+    /// fdt processes that died are removed before watching starts.
     pub(crate) fn spawn(
         handle: &Handle,
         adb: PathBuf,
         cfg: WatchTiming,
         out: Arc<watch::Sender<Arc<[Candidate]>>>,
         status: Arc<watch::Sender<PlatformState>>,
+        children: Children,
+        state_dir: Option<PathBuf>,
     ) -> AndroidWatch {
-        let held = Arc::new(Mutex::new(Vec::new()));
+        let record = state_dir
+            .as_deref()
+            .map(|d| record_path(d, std::process::id()));
+        let held = Arc::new(Held::new(record));
         let task = handle.spawn(
             Watcher {
                 handle: handle.clone(),
@@ -122,6 +317,8 @@ impl AndroidWatch {
                 out: out.clone(),
                 status,
                 held: held.clone(),
+                children,
+                state_dir,
                 found: HashMap::new(),
                 devices: HashMap::new(),
                 names: HashMap::new(),
@@ -135,40 +332,73 @@ impl AndroidWatch {
             out,
         }
     }
-}
 
-impl Drop for AndroidWatch {
-    fn drop(&mut self) {
+    /// Stops the watcher, removes its forwards in parallel until `deadline`, and empties its
+    /// set. A forward whose removal failed or ran out of time stays in the record, for the next
+    /// run to remove. Safe to call more than once.
+    pub(crate) fn shutdown(&self, deadline: std::time::Instant) {
         // Aborting drops the followers and the track child (all `kill_on_drop`).
         self.task.abort();
-        let held = std::mem::take(&mut *self.held.lock().unwrap_or_else(|e| e.into_inner()));
-        for (serial, port) in held {
-            remove_forward_blocking(&self.adb, &serial, port);
+        let held = self.held.snapshot();
+        if !held.is_empty() {
+            let failed = remove_forwards_blocking(&self.adb, &held, deadline);
+            self.held.replace(failed);
         }
         self.out.send_replace(Arc::from(Vec::new()));
     }
 }
 
-fn remove_forward_blocking(adb: &Path, serial: &str, port: u16) {
-    let spawned = std::process::Command::new(adb)
-        .args(["-s", serial, "forward", "--remove", &format!("tcp:{port}")])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    let Ok(mut child) = spawned else { return };
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
-            Ok(None) if start.elapsed() >= REMOVE_TIMEOUT => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+impl Drop for AndroidWatch {
+    fn drop(&mut self) {
+        self.shutdown(std::time::Instant::now() + SHUTDOWN_CAP);
+    }
+}
+
+/// Runs `adb forward --remove` for every forward at once and waits until all finished or
+/// `deadline` passed. Returns the forwards not confirmed removed.
+fn remove_forwards_blocking(
+    adb: &Path,
+    forwards: &[(String, u16)],
+    deadline: std::time::Instant,
+) -> Vec<(String, u16)> {
+    let mut failed = Vec::new();
+    let mut running = Vec::new();
+    for (serial, port) in forwards {
+        let spawned = std::process::Command::new(adb)
+            .args(["-s", serial, "forward", "--remove", &format!("tcp:{port}")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        match spawned {
+            Ok(child) => running.push(((serial.clone(), *port), child)),
+            Err(_) => failed.push((serial.clone(), *port)),
         }
     }
+    while !running.is_empty() && std::time::Instant::now() < deadline {
+        running.retain_mut(|(forward, child)| match child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(status)) => {
+                if !status.success() {
+                    failed.push(forward.clone());
+                }
+                false
+            }
+            Err(_) => {
+                failed.push(forward.clone());
+                false
+            }
+        });
+        if !running.is_empty() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    for (forward, mut child) in running {
+        let _ = child.kill();
+        let _ = child.wait();
+        failed.push(forward);
+    }
+    failed
 }
 
 /// Per-device log followers, stopped when the device goes away.
@@ -206,7 +436,10 @@ struct Watcher {
     cfg: WatchTiming,
     out: Arc<watch::Sender<Arc<[Candidate]>>>,
     status: Arc<watch::Sender<PlatformState>>,
-    held: Arc<Mutex<Vec<(String, u16)>>>,
+    held: Arc<Held>,
+    children: Children,
+    /// Where forwards are recorded; earlier runs' records there are swept first.
+    state_dir: Option<PathBuf>,
     found: HashMap<(String, u32), Found>,
     devices: HashMap<String, DeviceTasks>,
     names: HashMap<String, String>,
@@ -214,11 +447,15 @@ struct Watcher {
 
 impl Watcher {
     async fn run(mut self) {
+        if let Some(dir) = &self.state_dir {
+            sweep_records(&self.adb, dir, &self.children).await;
+        }
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let _track = AbortOnDrop(
-            self.handle
-                .spawn(track_devices(self.adb.clone(), tx.clone())),
-        );
+        let _track = AbortOnDrop(self.handle.spawn(track_devices(
+            self.adb.clone(),
+            tx.clone(),
+            self.children.clone(),
+        )));
         let mut tick = tokio::time::interval(self.cfg.liveness);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -246,7 +483,9 @@ impl Watcher {
         self.status.send_replace(PlatformState::Watching {
             devices: live.len(),
         });
-        if let Some(text) = run_once(&self.adb, &["devices", "-l"], ADB_TIMEOUT).await {
+        if let Some(text) =
+            run_once(&self.adb, &["devices", "-l"], ADB_TIMEOUT, &self.children).await
+        {
             self.names.extend(parse_devices_l(&text));
         }
         let gone: Vec<String> = self
@@ -268,10 +507,7 @@ impl Watcher {
             }
             // adb drops a detached device's forwards itself, and a `--remove` would fail with
             // "device not found" and be retried every tick, so just forget them.
-            self.held
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .retain(|(s, _)| *s != serial);
+            self.held.retain(|(s, _)| *s != serial);
         }
         for serial in live {
             if !self.devices.contains_key(&serial) {
@@ -287,19 +523,10 @@ impl Watcher {
         let follower = follow(
             &self.handle,
             self.adb.clone(),
-            args(&[
-                "-s",
-                serial,
-                "logcat",
-                "-v",
-                "brief",
-                "-T",
-                "1",
-                "flutter:I",
-                "*:S",
-            ]),
+            follow_args(serial),
             Backoff::default(),
             line_tx,
+            self.children.clone(),
         );
         let pump = {
             let (tx, serial) = (tx.clone(), serial.to_string());
@@ -317,6 +544,7 @@ impl Watcher {
         };
         let backfill = {
             let (tx, serial, adb) = (tx.clone(), serial.to_string(), self.adb.clone());
+            let children = self.children.clone();
             self.handle.spawn(async move {
                 let cmd = [
                     "-s",
@@ -328,7 +556,7 @@ impl Watcher {
                     "flutter:I",
                     "*:S",
                 ];
-                let Some(text) = run_once(&adb, &cmd, ADB_TIMEOUT).await else {
+                let Some(text) = run_once(&adb, &cmd, ADB_TIMEOUT, &children).await else {
                     return;
                 };
                 for line in text.lines() {
@@ -377,6 +605,7 @@ impl Watcher {
             &self.adb,
             &["-s", serial, "forward", "tcp:0", &spec],
             ADB_TIMEOUT,
+            &self.children,
         )
         .await
         else {
@@ -385,10 +614,7 @@ impl Watcher {
         let Ok(local) = printed.trim().parse::<u16>() else {
             return;
         };
-        self.held
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((serial.to_string(), local));
+        self.held.push(serial, local);
         if !tcp_alive(local, self.cfg.alive_wait).await {
             self.remove_forward(serial, local).await;
             return;
@@ -441,11 +667,9 @@ impl Watcher {
         let ports: HashSet<u16> = self.found.values().map(|f| f.local_port).collect();
         let orphans: Vec<(String, u16)> = self
             .held
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
+            .snapshot()
+            .into_iter()
             .filter(|(_, p)| !ports.contains(p))
-            .cloned()
             .collect();
         for (serial, port) in orphans {
             self.remove_forward(&serial, port).await;
@@ -458,15 +682,13 @@ impl Watcher {
             &self.adb,
             &["-s", serial, "forward", "--remove", &spec],
             REMOVE_TIMEOUT,
+            &self.children,
         )
         .await;
         // `held` is the record of live forwards: it only forgets one once adb confirmed the
         // removal, so a failed removal is retried on the next tick and at `Drop`.
         if removed.is_some() {
-            self.held
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .retain(|(s, p)| !(s == serial && *p == port));
+            self.held.remove(serial, port);
         }
     }
 
@@ -489,14 +711,14 @@ fn args(a: &[&str]) -> Vec<String> {
 }
 
 /// Runs `adb track-devices`, sending each frame's device list. Restarts with backoff, and tells
-/// the watcher when the child could not start or ended.
-async fn track_devices(adb: PathBuf, tx: mpsc::UnboundedSender<Ev>) {
+/// the watcher when the child could not start or ended. Stops once `children` was terminated.
+async fn track_devices(adb: PathBuf, tx: mpsc::UnboundedSender<Ev>, children: Children) {
     let backoff = Backoff::default();
     let mut delay = backoff.first;
     loop {
         let started = Instant::now();
-        let why = track_once(&adb, &tx).await;
-        if tx.send(Ev::TrackDown(why)).is_err() {
+        let why = track_once(&adb, &tx, &children).await;
+        if children.is_stopped() || tx.send(Ev::TrackDown(why)).is_err() {
             return;
         }
         if started.elapsed() >= STABLE_RUN {
@@ -507,16 +729,16 @@ async fn track_devices(adb: PathBuf, tx: mpsc::UnboundedSender<Ev>) {
     }
 }
 
-async fn track_once(adb: &Path, tx: &mpsc::UnboundedSender<Ev>) -> String {
-    let spawned = tokio::process::Command::new(adb)
-        .arg("track-devices")
+async fn track_once(adb: &Path, tx: &mpsc::UnboundedSender<Ev>, children: &Children) -> String {
+    let mut cmd = tokio::process::Command::new(adb);
+    cmd.arg("track-devices")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn();
-    let mut child = match spawned {
-        Ok(c) => c,
+        .kill_on_drop(true);
+    let (mut child, _tracked) = match spawn_tracked(&mut cmd, children).await {
+        Ok(Some(started)) => started,
+        Ok(None) => return "stopping".to_string(),
         Err(e) => return format!("could not start adb ({e})"),
     };
     let Some(mut stdout) = child.stdout.take() else {
@@ -605,6 +827,86 @@ mod tests {
         assert!(!tcp_alive(unused, wait).await);
     }
 
+    #[test]
+    fn watcher_argv_must_match_exactly() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let logcat = [
+            "-s",
+            "emulator-5554",
+            "logcat",
+            "-v",
+            "brief",
+            "-T",
+            "1",
+            "flutter:I",
+            "*:S",
+        ];
+        let with = |exe: &str, rest: &[&str]| {
+            let mut a = vec![exe];
+            a.extend_from_slice(rest);
+            v(&a)
+        };
+        assert!(is_watcher_argv(&v(&[
+            "/opt/homebrew/bin/adb",
+            "track-devices"
+        ])));
+        assert!(is_watcher_argv(&v(&["adb", "track-devices"])));
+        assert!(is_watcher_argv(&with("/sdk/platform-tools/adb", &logcat)));
+        // Another program, extra or missing arguments, or a one-shot command: never.
+        assert!(!is_watcher_argv(&v(&["/usr/bin/fakeadb", "track-devices"])));
+        assert!(!is_watcher_argv(&v(&["adb", "track-devices", "-l"])));
+        assert!(!is_watcher_argv(&with("adb", &logcat[..8])));
+        assert!(!is_watcher_argv(&with(
+            "adb",
+            &[&logcat[..], &["-d"]].concat()
+        )));
+        assert!(!is_watcher_argv(&v(&[
+            "adb",
+            "-s",
+            "emulator-5554",
+            "logcat",
+            "-d",
+            "-v",
+            "brief",
+            "flutter:I",
+            "*:S"
+        ])));
+        assert!(!is_watcher_argv(&v(&["adb", "-s", "", "logcat"])));
+        assert!(!is_watcher_argv(&v(&["adb", "logcat"])));
+        assert!(!is_watcher_argv(&v(&["adb"])));
+        assert!(!is_watcher_argv(&[]));
+    }
+
+    #[test]
+    fn held_forwards_are_recorded_and_the_record_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = record_path(dir.path(), 4242);
+        assert_eq!(path, dir.path().join("forwards-4242.json"));
+        let held = Held::new(Some(path.clone()));
+        held.push("emulator-5554", 50001);
+        held.push("R5CT", 50002);
+        assert_eq!(
+            read_record(&path),
+            Some(vec![
+                ("emulator-5554".to_string(), 50001),
+                ("R5CT".to_string(), 50002)
+            ])
+        );
+        held.remove("R5CT", 50002);
+        assert_eq!(
+            read_record(&path),
+            Some(vec![("emulator-5554".to_string(), 50001)])
+        );
+        held.retain(|(s, _)| s != "emulator-5554");
+        assert!(!path.exists(), "an empty record is deleted");
+        held.replace(vec![("X".to_string(), 1)]);
+        assert_eq!(read_record(&path), Some(vec![("X".to_string(), 1)]));
+        // Without a record path nothing is written.
+        let unrecorded = Held::new(None);
+        unrecorded.push("Y", 2);
+        assert_eq!(unrecorded.snapshot(), vec![("Y".to_string(), 2)]);
+    }
+
     #[cfg(unix)]
     mod fake {
         use super::*;
@@ -631,7 +933,9 @@ case "$*" in
     if [ ! -e "$DIR/silent" ]; then echo "{LINE}"; fi
     if [ -e "$DIR/line2" ]; then sleep 1; cat "$DIR/line2"; fi
     exec sleep 30;;
-  *"forward --remove"*) echo "$@" >> "$DIR/removed";;
+  *"forward --remove"*)
+    if [ -e "$DIR/remove_fails" ]; then exit 1; fi
+    echo "$@" >> "$DIR/removed";;
   *"forward tcp:0 tcp:40422"*) cat "$DIR/port2";;
   *"forward tcp:0 tcp:"*) cat "$DIR/port";;
   "version") echo ok;;
@@ -700,6 +1004,8 @@ esac
                 timing(),
                 out.clone(),
                 status.clone(),
+                Children::default(),
+                None,
             );
 
             assert!(
@@ -744,7 +1050,15 @@ esac
             });
             let adb = fake_adb(dir.path(), "true");
             let (out, status) = channels();
-            let watch = AndroidWatch::spawn(&Handle::current(), adb, timing(), out.clone(), status);
+            let watch = AndroidWatch::spawn(
+                &Handle::current(),
+                adb,
+                timing(),
+                out.clone(),
+                status,
+                Children::default(),
+                None,
+            );
             assert!(until(|| out.borrow().len() == 1, 3).await);
             drop(watch);
             assert!(out.borrow().is_empty());
@@ -785,14 +1099,22 @@ esac
             let adb = fake_adb(dir.path(), &format!("echo \"{LINE}\""));
             let (out, status) = channels();
             let rx = out.subscribe();
-            let watch = AndroidWatch::spawn(&Handle::current(), adb, timing(), out.clone(), status);
+            let watch = AndroidWatch::spawn(
+                &Handle::current(),
+                adb,
+                timing(),
+                out.clone(),
+                status,
+                Children::default(),
+                None,
+            );
 
             assert!(until(|| removed_has(dir.path(), closed), 3).await);
             // Keep watching: nothing may ever be published, and nothing stays forwarded.
             tokio::time::sleep(Duration::from_secs(1)).await;
             assert!(!rx.has_changed().unwrap(), "a candidate was published");
             assert!(out.borrow().is_empty());
-            assert!(watch.held.lock().unwrap().is_empty());
+            assert!(watch.held.snapshot().is_empty());
         }
 
         #[tokio::test]
@@ -808,6 +1130,8 @@ esac
                 timing(),
                 out.clone(),
                 status.clone(),
+                Children::default(),
+                None,
             );
             assert!(until(|| out.borrow().len() == 1, 3).await);
             let pid = std::fs::read_to_string(dir.path().join("logcat_pid"))
@@ -821,7 +1145,7 @@ esac
                 "candidate leaves"
             );
             assert_eq!(*status.borrow(), PlatformState::Watching { devices: 0 });
-            assert!(watch.held.lock().unwrap().is_empty());
+            assert!(watch.held.snapshot().is_empty());
             // adb drops a detached device's forwards itself: no remove must be run for it.
             tokio::time::sleep(Duration::from_millis(600)).await;
             assert!(!removed_has(dir.path(), port), "forward --remove was run");
@@ -848,7 +1172,15 @@ esac
             std::fs::write(dir.path().join("line2"), format!("{line2}\n")).unwrap();
             let adb = fake_adb(dir.path(), "true");
             let (out, status) = channels();
-            let watch = AndroidWatch::spawn(&Handle::current(), adb, timing(), out.clone(), status);
+            let watch = AndroidWatch::spawn(
+                &Handle::current(),
+                adb,
+                timing(),
+                out.clone(),
+                status,
+                Children::default(),
+                None,
+            );
 
             assert!(until(|| out.borrow().len() == 1, 3).await);
             assert_eq!(
@@ -863,7 +1195,7 @@ esac
             assert!(until(|| removed_has(dir.path(), port1), 3).await);
             assert!(!removed_has(dir.path(), port2));
             assert_eq!(
-                *watch.held.lock().unwrap(),
+                watch.held.snapshot(),
                 vec![("emulator-5554".to_string(), port2)]
             );
         }
@@ -875,8 +1207,15 @@ esac
             std::fs::write(dir.path().join("silent"), "").unwrap();
             let adb = fake_adb(dir.path(), "true");
             let (out, status) = channels();
-            let _watch =
-                AndroidWatch::spawn(&Handle::current(), adb, timing(), out, status.clone());
+            let _watch = AndroidWatch::spawn(
+                &Handle::current(),
+                adb,
+                timing(),
+                out,
+                status.clone(),
+                Children::default(),
+                None,
+            );
             assert!(
                 until(
                     || matches!(*status.borrow(), PlatformState::Unavailable(_)),
@@ -903,6 +1242,8 @@ esac
                 timing(),
                 out.clone(),
                 status.clone(),
+                Children::default(),
+                None,
             );
             assert!(
                 until(
@@ -912,6 +1253,157 @@ esac
                 .await
             );
             assert!(out.borrow().is_empty());
+        }
+
+        #[test]
+        fn sweep_orphans_stops_only_orphaned_watchers() {
+            use crate::devices::processes::FakeProcesses;
+            use std::os::unix::process::ExitStatusExt;
+            let spawn = || {
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .unwrap()
+            };
+            let (mut track, mut oneshot, mut other) = (spawn(), spawn(), spawn());
+            let procs = FakeProcesses::default();
+            let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            *procs.orphans.lock().unwrap() = vec![
+                (track.id(), v(&["/sdk/adb", "track-devices"])),
+                (
+                    oneshot.id(),
+                    v(&["/sdk/adb", "-s", "e", "logcat", "-d", "flutter:I", "*:S"]),
+                ),
+                (other.id(), v(&["/usr/bin/notadb", "track-devices"])),
+            ];
+            assert_eq!(sweep_orphans(&procs), vec![track.id()]);
+            assert_eq!(track.wait().unwrap().signal(), Some(libc::SIGTERM));
+            assert_eq!(oneshot.try_wait().unwrap(), None);
+            assert_eq!(other.try_wait().unwrap(), None);
+            for c in [&mut oneshot, &mut other] {
+                c.kill().unwrap();
+                c.wait().unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn records_of_dead_runs_are_swept_and_others_kept() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = dir.path().join("state");
+            std::fs::create_dir_all(&state).unwrap();
+            let dead = {
+                let mut c = std::process::Command::new("true").spawn().unwrap();
+                let pid = c.id();
+                c.wait().unwrap();
+                pid
+            };
+            let mut live = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            save_record(
+                &record_path(&state, dead),
+                &[("emulator-5554".into(), 61001), ("R5CT".into(), 61002)],
+            );
+            save_record(
+                &record_path(&state, live.id()),
+                &[("emulator-5554".into(), 61003)],
+            );
+            std::fs::write(dir.path().join("silent"), "").unwrap();
+            let adb = fake_adb(dir.path(), "true");
+            let (out, status) = channels();
+            let _watch = AndroidWatch::spawn(
+                &Handle::current(),
+                adb,
+                timing(),
+                out,
+                status.clone(),
+                Children::default(),
+                Some(state.clone()),
+            );
+            assert!(
+                until(
+                    || *status.borrow() == PlatformState::Watching { devices: 1 },
+                    3
+                )
+                .await
+            );
+            let removed = std::fs::read_to_string(dir.path().join("removed")).unwrap();
+            assert!(removed.contains("-s emulator-5554 forward --remove tcp:61001"));
+            assert!(removed.contains("-s R5CT forward --remove tcp:61002"));
+            assert!(
+                !removed.contains("61003"),
+                "a live run's forward was removed"
+            );
+            assert!(!record_path(&state, dead).exists());
+            assert!(record_path(&state, live.id()).exists());
+            live.kill().unwrap();
+            live.wait().unwrap();
+        }
+
+        #[test]
+        fn forwards_are_removed_in_parallel_within_the_deadline() {
+            let dir = tempfile::tempdir().unwrap();
+            let slow = dir.path().join("slow-adb");
+            let tmp = dir.path().join("slow.tmp");
+            std::fs::write(&tmp, "#!/bin/sh\nexec sleep 5\n").unwrap();
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::rename(&tmp, &slow).unwrap();
+            let forwards: Vec<(String, u16)> = (1..=3).map(|p| ("e".to_string(), p)).collect();
+            let start = std::time::Instant::now();
+            let failed =
+                remove_forwards_blocking(&slow, &forwards, start + Duration::from_millis(500));
+            let took = start.elapsed();
+            assert!(took >= Duration::from_millis(500), "{took:?}");
+            assert!(
+                took < Duration::from_millis(1500),
+                "not one after another: {took:?}"
+            );
+            assert_eq!(failed, forwards, "unconfirmed removals stay recorded");
+
+            let adb = fake_adb(dir.path(), "true");
+            let start = std::time::Instant::now();
+            let failed = remove_forwards_blocking(&adb, &forwards, start + Duration::from_secs(5));
+            assert!(failed.is_empty());
+            assert!(start.elapsed() < Duration::from_secs(2));
+            let removed = std::fs::read_to_string(dir.path().join("removed")).unwrap();
+            assert_eq!(removed.lines().count(), 3);
+        }
+
+        #[tokio::test]
+        async fn shutdown_keeps_unremoved_forwards_in_the_record() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = dir.path().join("state");
+            let (port, _task) = holder().await;
+            std::fs::write(dir.path().join("port"), format!("{port}\n")).unwrap();
+            let adb = fake_adb(dir.path(), "true");
+            let (out, status) = channels();
+            let watch = AndroidWatch::spawn(
+                &Handle::current(),
+                adb,
+                timing(),
+                out.clone(),
+                status,
+                Children::default(),
+                Some(state.clone()),
+            );
+            assert!(until(|| out.borrow().len() == 1, 3).await);
+            let record = record_path(&state, std::process::id());
+            assert_eq!(
+                read_record(&record),
+                Some(vec![("emulator-5554".to_string(), port)])
+            );
+            // Removal now fails: the forward stays recorded for the next run.
+            std::fs::write(dir.path().join("remove_fails"), "").unwrap();
+            watch.shutdown(std::time::Instant::now() + Duration::from_secs(2));
+            assert!(out.borrow().is_empty());
+            assert_eq!(
+                read_record(&record),
+                Some(vec![("emulator-5554".to_string(), port)])
+            );
+            std::fs::remove_file(dir.path().join("remove_fails")).unwrap();
+            drop(watch);
+            assert!(!record.exists(), "removed at drop, and the record with it");
         }
     }
 }

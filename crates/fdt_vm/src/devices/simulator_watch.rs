@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use super::follow::run_once;
+use super::follow::{Children, run_once};
 use super::marker::simulator_hit;
 use super::processes::Processes;
 use super::simulators::SimulatorScan;
@@ -28,6 +28,14 @@ const MAX_WINDOW: Duration = Duration::from_secs(3600);
 /// How far before the process started a query begins reading.
 const WINDOW_MARGIN: Duration = Duration::from_secs(60);
 
+/// What the simulator watcher reads: `xcrun`, the simulator devices folder, and the host's
+/// processes.
+pub(crate) struct SimTools {
+    pub(crate) xcrun: PathBuf,
+    pub(crate) devices_dir: PathBuf,
+    pub(crate) processes: Arc<dyn Processes>,
+}
+
 /// Handle to the simulator watcher. Dropping it stops everything and empties its set.
 pub(crate) struct SimulatorWatch {
     task: JoinHandle<()>,
@@ -37,13 +45,17 @@ pub(crate) struct SimulatorWatch {
 impl SimulatorWatch {
     pub(crate) fn spawn(
         handle: &Handle,
-        xcrun: PathBuf,
-        devices_dir: PathBuf,
-        processes: Arc<dyn Processes>,
+        tools: SimTools,
+        children: Children,
         cfg: WatchTiming,
         out: Arc<watch::Sender<Arc<[Candidate]>>>,
         status: Arc<watch::Sender<PlatformState>>,
     ) -> SimulatorWatch {
+        let SimTools {
+            xcrun,
+            devices_dir,
+            processes,
+        } = tools;
         // `proc_pidpath` reports resolved paths, while the folder may be reached through a
         // symbolic link (a custom home), so both spellings are matched.
         let mut roots = vec![devices_dir.clone()];
@@ -59,6 +71,7 @@ impl SimulatorWatch {
                 roots,
                 scan: SimulatorScan::new(devices_dir),
                 processes,
+                children,
                 cfg,
                 out: out.clone(),
                 status,
@@ -71,13 +84,18 @@ impl SimulatorWatch {
         );
         SimulatorWatch { task, out }
     }
+
+    /// Stops the watcher and empties its set. Aborting drops the lookups, whose `log show`
+    /// children are `kill_on_drop`; a shutdown sends them SIGTERM first.
+    pub(crate) fn stop(&self) {
+        self.task.abort();
+        self.out.send_replace(Arc::from(Vec::new()));
+    }
 }
 
 impl Drop for SimulatorWatch {
     fn drop(&mut self) {
-        // Aborting drops the lookups, whose `log show` children are `kill_on_drop`.
-        self.task.abort();
-        self.out.send_replace(Arc::from(Vec::new()));
+        self.stop();
     }
 }
 
@@ -107,6 +125,7 @@ struct Watcher {
     roots: Vec<PathBuf>,
     scan: SimulatorScan,
     processes: Arc<dyn Processes>,
+    children: Children,
     cfg: WatchTiming,
     out: Arc<watch::Sender<Arc<[Candidate]>>>,
     status: Arc<watch::Sender<PlatformState>>,
@@ -183,6 +202,7 @@ impl Watcher {
                         pid,
                         started,
                         self.cfg,
+                        self.children.clone(),
                         tx.clone(),
                     ));
                     self.lookups.insert(pid, Lookup { udid, task });
@@ -281,6 +301,7 @@ async fn lookup(
     pid: u32,
     started: Option<SystemTime>,
     cfg: WatchTiming,
+    children: Children,
     tx: mpsc::UnboundedSender<Hit>,
 ) {
     let first = Instant::now();
@@ -288,12 +309,12 @@ async fn lookup(
     let retry = age.is_none_or(|a| a < cfg.lookup_give_up);
     let mut next = cfg.lookup_retry;
     loop {
-        if !pid_alive(pid) {
+        if !pid_alive(pid) || children.is_stopped() {
             return;
         }
         let args = show_args(&udid, pid, window(started));
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        if let Some(text) = run_once(&xcrun, &refs, QUERY_TIMEOUT).await
+        if let Some(text) = run_once(&xcrun, &refs, QUERY_TIMEOUT, &children).await
             && let Some(hit) = text
                 .lines()
                 .filter_map(simulator_hit)
@@ -528,9 +549,12 @@ esac
                 let c = chans();
                 let w = SimulatorWatch::spawn(
                     &Handle::current(),
-                    self.xcrun.clone(),
-                    self.sims.clone(),
-                    self.procs.clone(),
+                    SimTools {
+                        xcrun: self.xcrun.clone(),
+                        devices_dir: self.sims.clone(),
+                        processes: self.procs.clone(),
+                    },
+                    Children::default(),
                     cfg,
                     c.0.clone(),
                     c.1.clone(),

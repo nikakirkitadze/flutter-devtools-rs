@@ -20,8 +20,13 @@ use tokio::task::JoinHandle;
 
 use crate::discovery::Os;
 use android::AndroidWatch;
+use follow::Children;
 use processes::{HostProcesses, Processes};
-use simulator_watch::SimulatorWatch;
+use simulator_watch::{SimTools, SimulatorWatch};
+
+/// The longest a shutdown waits, overall, for the watchers' children to exit and for their adb
+/// forwards to be removed.
+pub(crate) const SHUTDOWN_CAP: Duration = Duration::from_millis(1500);
 
 /// How often the watchers check things, so tests can run them fast.
 #[derive(Clone, Copy, Debug)]
@@ -103,8 +108,11 @@ pub struct DeviceWatchConfig {
     pub adb: Option<PathBuf>,
     pub xcrun: Option<PathBuf>,
     pub simulator_dir: Option<PathBuf>,
-    /// The host's processes, where simulator apps run.
+    /// The host's processes, where simulator apps run and orphaned watchers are looked for.
     pub processes: Arc<dyn Processes>,
+    /// Where the adb forwards fdt holds are recorded (`<config dir>/fdt`), so a later run can
+    /// remove them if this one dies without doing so. `None` records nothing.
+    pub state_dir: Option<PathBuf>,
     pub timing: WatchTiming,
 }
 
@@ -123,20 +131,24 @@ impl DeviceWatchConfig {
             xcrun: tools::find_xcrun(&exists),
             simulator_dir: simulators::simulator_devices_dir(home),
             processes: Arc::new(HostProcesses),
+            state_dir: dirs::config_dir().map(|d| d.join("fdt")),
             timing: WatchTiming::default(),
         }
     }
 }
 
-/// Runs the simulator and Android watchers and publishes the union of what they find. Dropping
-/// it stops both, removes their forwards, and publishes an empty set and the default status.
+/// Runs the simulator and Android watchers and publishes the union of what they find.
+/// [`shutdown`](DeviceWatch::shutdown), which `Drop` also runs, stops both, ends their child
+/// processes, removes their forwards, and publishes an empty set and the default status.
 pub struct DeviceWatch {
     merge: JoinHandle<()>,
-    // Stopped by their own `Drop`, after ours has published the final empty values.
-    _simulator: Option<SimulatorWatch>,
-    _android: Option<AndroidWatch>,
+    simulator: Option<SimulatorWatch>,
+    android: Option<AndroidWatch>,
+    /// Every child process the watchers started and have not reaped.
+    children: Children,
     candidates: Arc<watch::Sender<Arc<[Candidate]>>>,
     status: Arc<watch::Sender<WatchStatus>>,
+    /// Set by `shutdown`; also keeps a merge already running from undoing its empty set.
     closed: Arc<AtomicBool>,
 }
 
@@ -149,6 +161,12 @@ impl DeviceWatch {
     ) -> DeviceWatch {
         let new_set = || Arc::new(watch::channel(Arc::<[Candidate]>::from(Vec::new())).0);
         let new_state = |s| Arc::new(watch::channel(s).0);
+        let children = Children::default();
+        {
+            // Watchers an earlier fdt left running when it crashed or was killed.
+            let processes = config.processes.clone();
+            handle.spawn_blocking(move || android::sweep_orphans(&*processes));
+        }
 
         let sim_out = new_set();
         let and_out = new_set();
@@ -157,9 +175,12 @@ impl DeviceWatch {
                 let st = new_state(PlatformState::Off);
                 let w = SimulatorWatch::spawn(
                     handle,
-                    xcrun,
-                    dir,
-                    config.processes,
+                    SimTools {
+                        xcrun,
+                        devices_dir: dir,
+                        processes: config.processes,
+                    },
+                    children.clone(),
                     config.timing,
                     sim_out.clone(),
                     st.clone(),
@@ -179,8 +200,15 @@ impl DeviceWatch {
         let (and_state, android) = match config.adb {
             Some(adb) => {
                 let st = new_state(PlatformState::Off);
-                let w =
-                    AndroidWatch::spawn(handle, adb, config.timing, and_out.clone(), st.clone());
+                let w = AndroidWatch::spawn(
+                    handle,
+                    adb,
+                    config.timing,
+                    and_out.clone(),
+                    st.clone(),
+                    children.clone(),
+                    config.state_dir,
+                );
                 (st, Some(w))
             }
             None => (
@@ -238,23 +266,49 @@ impl DeviceWatch {
         };
         DeviceWatch {
             merge,
-            _simulator: simulator,
-            _android: android,
+            simulator,
+            android,
+            children,
             candidates,
             status,
             closed,
         }
     }
+
+    /// Stops watching, synchronously. Sends SIGTERM to every child process the watchers
+    /// started and waits for them to exit, then removes the adb forwards they hold, in
+    /// parallel; all of it within [`SHUTDOWN_CAP`] overall. Then publishes an empty set and
+    /// the default status. Runs once; later calls return at once.
+    ///
+    /// The app calls it when it quits (GPUI never drops its globals) and on SIGTERM, SIGINT and
+    /// SIGHUP.
+    pub fn shutdown(&self) {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let deadline = std::time::Instant::now() + SHUTDOWN_CAP;
+        // With `closed` set, no merge write can land after the final values below.
+        self.merge.abort();
+        let pids = self.children.terminate();
+        // Wait for them to exit before the watchers are aborted, whose `kill_on_drop` would
+        // follow the SIGTERM with a SIGKILL.
+        while !pids.iter().all(|p| follow::has_exited(*p)) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if let Some(s) = &self.simulator {
+            s.stop();
+        }
+        if let Some(a) = &self.android {
+            a.shutdown(deadline);
+        }
+        self.candidates.send_replace(Arc::from(Vec::new()));
+        self.status.send_replace(WatchStatus::default());
+    }
 }
 
 impl Drop for DeviceWatch {
     fn drop(&mut self) {
-        self.closed.store(true, Ordering::SeqCst);
-        self.merge.abort();
-        // The watchers drop after this and stop their processes. With `closed` set, no merge
-        // write can land after these final values.
-        self.candidates.send_replace(Arc::from(Vec::new()));
-        self.status.send_replace(WatchStatus::default());
+        self.shutdown();
     }
 }
 
@@ -356,6 +410,7 @@ mod tests {
             xcrun: Some(xcrun),
             simulator_dir: Some(sims),
             processes: Arc::new(procs),
+            state_dir: None,
             timing: timing(),
         };
         let out = Arc::new(watch::channel(Arc::<[Candidate]>::from(Vec::new())).0);
@@ -461,5 +516,133 @@ mod tests {
         assert_eq!(*r.status.borrow(), WatchStatus::default());
         r.child.kill().unwrap();
         r.child.wait().unwrap();
+    }
+
+    /// A fake adb whose long-lived commands note a SIGTERM in `term_track` / `term_logcat`.
+    fn trapping_adb(dir: &std::path::Path, port: u16) -> PathBuf {
+        write_script(
+            dir,
+            "adb",
+            &format!(
+                r#"#!/bin/sh
+DIR="{dir}"
+case "$*" in
+  "track-devices")
+    trap 'touch "$DIR/term_track"; exit 0' TERM
+    printf '0015emulator-5554\tdevice\n'
+    while :; do sleep 0.05; done;;
+  "devices -l") echo 'emulator-5554 device model:Pixel_8';;
+  *"logcat -d"*) true;;
+  *"logcat -v brief -T 1"*)
+    trap 'touch "$DIR/term_logcat"; exit 0' TERM
+    echo 'I/flutter ( 4242): The Dart VM service is listening on http://127.0.0.1:40421/tok=/'
+    while :; do sleep 0.05; done;;
+  *"forward tcp:0 tcp:"*) echo {port};;
+  *"forward --remove"*) echo "$@" >> "$DIR/removed";;
+esac
+"#,
+                dir = dir.display()
+            ),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_ends_children_with_sigterm_and_removes_forwards() {
+        use tokio::net::TcpListener;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _holder = tokio::spawn(async move {
+            let mut keep = Vec::new();
+            while let Ok((s, _)) = listener.accept().await {
+                keep.push(s);
+            }
+        });
+        let out = Arc::new(watch::channel(Arc::<[Candidate]>::from(Vec::new())).0);
+        let status = Arc::new(watch::channel(WatchStatus::default()).0);
+        let w = DeviceWatch::spawn(
+            &Handle::current(),
+            DeviceWatchConfig {
+                adb: Some(trapping_adb(dir.path(), port)),
+                xcrun: None,
+                simulator_dir: None,
+                processes: Arc::new(FakeProcesses::default()),
+                state_dir: Some(state.clone()),
+                timing: timing(),
+            },
+            out.clone(),
+            status.clone(),
+        );
+        assert!(until(|| out.borrow().len() == 1, 3).await);
+        let record = android::record_path(&state, std::process::id());
+        assert!(record.exists(), "the held forward is recorded");
+        let children = w.children.pids();
+        assert_eq!(
+            children.len(),
+            2,
+            "track-devices and one logcat: {children:?}"
+        );
+
+        let started = Instant::now();
+        let shut = tokio::task::spawn_blocking(move || {
+            w.shutdown();
+            w
+        })
+        .await
+        .unwrap();
+        assert!(started.elapsed() < SHUTDOWN_CAP, "{:?}", started.elapsed());
+        assert!(
+            dir.path().join("term_track").exists(),
+            "track-devices got SIGTERM"
+        );
+        assert!(
+            dir.path().join("term_logcat").exists(),
+            "logcat got SIGTERM"
+        );
+        assert!(children.iter().all(|p| follow::has_exited(*p)));
+        let removed = std::fs::read_to_string(dir.path().join("removed")).unwrap();
+        assert_eq!(
+            removed.trim(),
+            format!("-s emulator-5554 forward --remove tcp:{port}")
+        );
+        assert!(!record.exists(), "the record goes with the forward");
+        assert!(out.borrow().is_empty());
+        assert_eq!(*status.borrow(), WatchStatus::default());
+
+        // Once is enough: a second call, and the drop, do nothing more.
+        shut.shutdown();
+        drop(shut);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let again = std::fs::read_to_string(dir.path().join("removed")).unwrap();
+        assert_eq!(again, removed);
+    }
+
+    #[tokio::test]
+    async fn spawn_stops_watchers_an_earlier_run_orphaned() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut orphan = Command::new("sleep").arg("30").spawn().unwrap();
+        let procs = FakeProcesses::default();
+        *procs.orphans.lock().unwrap() = vec![(
+            orphan.id(),
+            vec!["/sdk/platform-tools/adb".into(), "track-devices".into()],
+        )];
+        let out = Arc::new(watch::channel(Arc::<[Candidate]>::from(Vec::new())).0);
+        let status = Arc::new(watch::channel(WatchStatus::default()).0);
+        let _w = DeviceWatch::spawn(
+            &Handle::current(),
+            DeviceWatchConfig {
+                adb: None,
+                xcrun: None,
+                simulator_dir: None,
+                processes: Arc::new(procs),
+                state_dir: None,
+                timing: timing(),
+            },
+            out,
+            status,
+        );
+        assert!(until(|| follow::has_exited(orphan.id()), 3).await);
+        assert_eq!(orphan.wait().unwrap().signal(), Some(libc::SIGTERM));
     }
 }

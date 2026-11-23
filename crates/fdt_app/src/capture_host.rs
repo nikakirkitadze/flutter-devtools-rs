@@ -11,7 +11,7 @@ use fdt_vm::devices::{Candidate, DeviceWatch, DeviceWatchConfig, WatchStatus};
 use fdt_vm::discovery::{DiscoveredApp, Discovery, DiscoveryConfig};
 use gpui_kit::{App, Global};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
 use crate::settings::Settings;
@@ -83,8 +83,9 @@ pub struct CaptureHost {
     // Declared first so the scan stops before the runtime goes away.
     _discovery: Discovery,
     /// Watches simulators and devices for apps started without the Flutter tool. Dropping it
-    /// stops its processes and empties `candidates`.
-    device_watch: Option<DeviceWatch>,
+    /// stops its processes and empties `candidates`. Shared with the signal task, which shuts
+    /// it down before the process exits.
+    device_watch: Arc<Mutex<Option<DeviceWatch>>>,
     /// Whether a watch may be started at all: tests that stand in for the host say no, so they
     /// never touch a real simulator or adb.
     can_watch: bool,
@@ -112,7 +113,12 @@ impl CaptureHost {
             ..DiscoveryConfig::default()
         };
         Self::install_inner(cx, config, empty_candidates(), true);
-        if crate::settings::settings(cx).find_device_apps && cx.has_global::<CaptureHost>() {
+        if !cx.has_global::<CaptureHost>() {
+            return;
+        }
+        #[cfg(unix)]
+        cx.global::<CaptureHost>().stop_devices_on_signals();
+        if crate::settings::settings(cx).find_device_apps {
             cx.global_mut::<CaptureHost>().set_find_device_apps(true);
         }
     }
@@ -153,9 +159,17 @@ impl CaptureHost {
         };
         config.candidates = Some(candidates.subscribe());
         let (discovery, apps) = Discovery::spawn(&runtime.handle(), config);
+        // GPUI never drops its globals, so the watch's own `Drop` does not run on quit.
+        cx.on_app_quit(|cx| {
+            if let Some(host) = cx.try_global::<CaptureHost>() {
+                host.shutdown_devices();
+            }
+            std::future::ready(())
+        })
+        .detach();
         cx.set_global(CaptureHost {
             _discovery: discovery,
-            device_watch: None,
+            device_watch: Arc::new(Mutex::new(None)),
             can_watch,
             candidates,
             device_status: Arc::new(watch::channel(WatchStatus::default()).0),
@@ -174,22 +188,81 @@ impl CaptureHost {
     }
 
     /// Starts or stops looking for apps opened on simulators and devices. Off drops the watch
-    /// and publishes an empty set and the default status, so its rows leave the Connect page.
+    /// (which stops its processes and removes its forwards, within 1.5 s) and publishes an
+    /// empty set and the default status, so its rows leave the Connect page.
     pub fn set_find_device_apps(&mut self, on: bool) {
         if on {
-            if self.can_watch && self.device_watch.is_none() {
-                self.device_watch = Some(DeviceWatch::spawn(
-                    &self.runtime.handle(),
-                    DeviceWatchConfig::detect(),
-                    self.candidates.clone(),
-                    self.device_status.clone(),
-                ));
+            if self.can_watch {
+                self.start_device_watch(DeviceWatchConfig::detect());
             }
         } else {
-            self.device_watch = None;
+            *self.watch_slot() = None;
             self.candidates.send_replace(Arc::from(Vec::new()));
             self.device_status.send_replace(WatchStatus::default());
         }
+    }
+
+    /// Starts a watch with `config`, unless one runs.
+    fn start_device_watch(&self, config: DeviceWatchConfig) {
+        let mut slot = self.watch_slot();
+        if slot.is_none() {
+            *slot = Some(DeviceWatch::spawn(
+                &self.runtime.handle(),
+                config,
+                self.candidates.clone(),
+                self.device_status.clone(),
+            ));
+        }
+    }
+
+    /// Like `set_find_device_apps(true)`, with `config` in place of the real tools, even in a
+    /// host that tests installed.
+    #[cfg(test)]
+    pub(crate) fn start_device_watch_with(&self, config: DeviceWatchConfig) {
+        self.start_device_watch(config);
+    }
+
+    fn watch_slot(&self) -> std::sync::MutexGuard<'_, Option<DeviceWatch>> {
+        self.device_watch.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Stops the device watch's processes and removes its forwards (see
+    /// [`DeviceWatch::shutdown`]). The app calls it when it quits.
+    pub fn shutdown_devices(&self) {
+        if let Some(w) = self.watch_slot().as_ref() {
+            w.shutdown();
+        }
+    }
+
+    /// On SIGTERM, SIGINT or SIGHUP, shuts the device watch down and exits (0, 130 or 129):
+    /// the default action would end fdt with its watchers still running.
+    #[cfg(unix)]
+    fn stop_devices_on_signals(&self) {
+        let slot = self.device_watch.clone();
+        self.runtime.handle().spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let (Ok(mut term), Ok(mut int), Ok(mut hup)) = (
+                signal(SignalKind::terminate()),
+                signal(SignalKind::interrupt()),
+                signal(SignalKind::hangup()),
+            ) else {
+                log::warn!("could not listen for termination signals");
+                return;
+            };
+            let code = tokio::select! {
+                _ = term.recv() => 0,
+                _ = int.recv() => 130,
+                _ = hup.recv() => 129,
+            };
+            // Blocking: the shutdown waits for children and forward removals.
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Some(w) = slot.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                    w.shutdown();
+                }
+                std::process::exit(code);
+            })
+            .await;
+        });
     }
 
     /// What the simulator and Android watchers are doing.
@@ -239,6 +312,62 @@ fn is_file(p: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fdt_vm::devices::PlatformState;
+    use fdt_vm::devices::processes::{ExeInfo, Processes};
+    use gpui_kit::TestAppContext;
+
+    /// No processes at all, so a test watch never looks at (or signals) real ones.
+    #[derive(Debug)]
+    struct NoProcesses;
+
+    impl Processes for NoProcesses {
+        fn pids(&self) -> Vec<u32> {
+            Vec::new()
+        }
+        fn exe(&self, _pid: u32) -> Option<ExeInfo> {
+            None
+        }
+        fn orphans(&self, _name: &str) -> Vec<(u32, Vec<String>)> {
+            Vec::new()
+        }
+    }
+
+    /// GPUI never drops its globals, so only the quit hook can stop the watch's processes.
+    #[gpui_kit::test]
+    fn quitting_the_app_shuts_the_device_watch_down(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        crate::test_support::init(cx);
+        let status = cx.update(|cx| {
+            CaptureHost::install_with(cx, crate::app::tests::empty_discovery(dir.path()));
+            let host = cx.global::<CaptureHost>();
+            // No tools: the watch runs no process, but still reports each platform's state.
+            host.start_device_watch_with(DeviceWatchConfig {
+                adb: None,
+                xcrun: None,
+                simulator_dir: None,
+                processes: Arc::new(NoProcesses),
+                state_dir: None,
+                timing: Default::default(),
+            });
+            host.device_status()
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while status.borrow().android == PlatformState::Off && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            status.borrow().android,
+            PlatformState::Unavailable("adb not found".into())
+        );
+        cx.quit();
+        assert_eq!(
+            *status.borrow(),
+            WatchStatus::default(),
+            "shut down on quit"
+        );
+    }
 
     #[test]
     fn find_dart_searches_path_in_order() {
