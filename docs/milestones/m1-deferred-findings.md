@@ -43,14 +43,14 @@ These are review findings that were deliberately not fixed in M1. They were tria
 
 ## Carried into M2 and fixed
 
-Checked against `git log --oneline 796c24a..HEAD` on `m2-connect-logs-network`.
+Checked against `git log --oneline 97c9a68..HEAD` on `m2-connect-logs-network`.
 
-- logger uses `eprintln!` (panics on a broken stderr pipe) — **Fixed in `58c4cf0`:** the logger ignores write errors (`logger_ignores_write_errors`).
-- ⌘W (and Minimize/Zoom/FullScreen) do nothing while a dialog has focus — **Fixed in `58c4cf0`:** each window action closes the dialog, focuses the shell, then re-dispatches.
-- Carry into M2, a palette item model that carries parameters and a virtualised list — **Done in `b204dea`** (and the palette's data items run off the UI thread in `b204dea`, tidied in `b2877ee`).
-- Carry into M2, key-context rules so shell shortcuts do not steal keys from text fields (`Shell && !Input`) — **Done in `58c4cf0`** (`SHELL_NOT_INPUT`).
-- Carry into M2, pages own their scrolling — **Done in `58c4cf0`** (tool page).
-- Carry into M2, settings deserialisation that tolerates one bad field — **Done in `58c4cf0`.**
-- Carry into M2, run ids in `Location` and the time axis — **Done in `2ad179f`** (`EntryId { run, seq }`, `SessionTime`) and used by the capture from `28ad86f`.
+- logger uses `eprintln!` (panics on a broken stderr pipe) — **Fixed in `ec26cfa`:** the logger ignores write errors (`logger_ignores_write_errors`).
+- ⌘W (and Minimize/Zoom/FullScreen) do nothing while a dialog has focus — **Fixed in `ec26cfa`:** each window action closes the dialog, focuses the shell, then re-dispatches.
+- Carry into M2, a palette item model that carries parameters and a virtualised list — **Done in `312732a`** (and the palette's data items run off the UI thread in `312732a`, tidied in `786f62f`).
+- Carry into M2, key-context rules so shell shortcuts do not steal keys from text fields (`Shell && !Input`) — **Done in `ec26cfa`** (`SHELL_NOT_INPUT`).
+- Carry into M2, pages own their scrolling — **Done in `ec26cfa`** (tool page).
+- Carry into M2, settings deserialisation that tolerates one bad field — **Done in `ec26cfa`.**
+- Carry into M2, run ids in `Location` and the time axis — **Done in `a5c5de3`** (`EntryId { run, seq }`, `SessionTime`) and used by the capture from `9dd6bf5`.
 
 Not carried or fixed in M2: the other items above stay open.

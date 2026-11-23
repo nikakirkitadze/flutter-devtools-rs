@@ -1,10 +1,10 @@
 # M1 verification results and review checklist
 
-Branch `m1-foundation`, measured on commit `726bd08` (R1: Apple M3 Max, macOS, release build).
+Branch `m1-foundation`, measured on commit `eef6500` (R1: Apple M3 Max, macOS, release build).
 
 Legend: met, missed, not measured (needs the author on a machine with accessibility access to the UI).
 
-## Automated checks (all green on 726bd08)
+## Automated checks (all green on eef6500)
 
 | Check | Result |
 |---|---|

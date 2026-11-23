@@ -1,8 +1,8 @@
 # M3 verification results and review checklist
 
-Branch `m3-performance`, built from the commit that precedes this record (`3d0e8a7`, plus the `cpu_poll` default change described under "CPU polling" and the `p99` column added to `frame_build_sampler`). R1: Apple M3 Max, macOS, 14 cores, 120 Hz display, release build. Run on the night of 21 November 2026 (00:59 to 01:55 local). Corrected after its review the same day: the miss count, the load during the second overhead run, which statements are hypotheses, the memory units and the attach comparison. Nothing was re-measured; the fix round added two unit tests.
+Branch `m3-performance`, built from the commit that precedes this record (`c145993`, plus the `cpu_poll` default change described under "CPU polling" and the `p99` column added to `frame_build_sampler`). R1: Apple M3 Max, macOS, 14 cores, 120 Hz display, release build. Run on the night of 21 November 2026 (00:59 to 01:55 local). Corrected after its review the same day: the miss count, the load during the second overhead run, which statements are hypotheses, the memory units and the attach comparison. Nothing was re-measured; the fix round added two unit tests.
 
-**Final fix wave (after the whole-branch review, 21 November 2026).** The three-reviewer whole-branch review found no critical issue; its important findings were fixed in one wave (commits after `b132b3a`). Where a fix changes a figure in this record, the figure is updated and marked "(final fix wave)"; a figure the wave could change but did not re-measure is marked "pending re-measure". The rest of this record is the Task 26 verification as it was. After the wave: `cargo test --workspace` 902 passed, 0 failed, 12 ignored; `FDT_BUDGETS=strict cargo test --workspace --release -- budget` 28 passed (the two new ones are a contrast test and a capture test whose names contain "budget"); the live `jank_lab` test passed on the second of two profile runs (the first judged 0 frames with tracing on: no janky frame with phases arrived in its window).
+**Final fix wave (after the whole-branch review, 21 November 2026).** The three-reviewer whole-branch review found no critical issue; its important findings were fixed in one wave (commits after `d77def3`). Where a fix changes a figure in this record, the figure is updated and marked "(final fix wave)"; a figure the wave could change but did not re-measure is marked "pending re-measure". The rest of this record is the Task 26 verification as it was. After the wave: `cargo test --workspace` 902 passed, 0 failed, 12 ignored; `FDT_BUDGETS=strict cargo test --workspace --release -- budget` 28 passed (the two new ones are a contrast test and a capture test whose names contain "budget"); the live `jank_lab` test passed on the second of two profile runs (the first judged 0 frames with tracing on: no janky frame with phases arrived in its window).
 
 **Timeline clicks (ruling R22, after the wave's re-review).** A click on a Timeline lane opens its target at once, on mouse-up. A double-click clears the range only on the Timeline's ruler and on the session strip, as the plan and spec say; on a lane it is two clicks. (The wave had delayed every lane click by 500 ms so that a double-click on a lane could clear the range instead.)
 
@@ -131,7 +131,7 @@ Where the 153 MiB comes from (same night, same machine, release builds, 15 s set
 
 | Process | RSS |
 |---|---|
-| `fdt` at M2 (`aff8ccf`), window only, not connected | 69.1 MiB (70,784 KiB) |
+| `fdt` at M2 (`1b9cd1f`), window only, not connected | 69.1 MiB (70,784 KiB) |
 | `fdt` at M3, window only, not connected | 98.9 MiB (101,232 KiB; 98.7 MiB on a second run), +29.7 MiB since M2 |
 | `attach_hold` (the capture without a window), connected to the idle app | 50.5 MiB at 1 s, 59.0 MiB at 6 s, 59.5 to 60.2 MiB over the next 20 s |
 | `fdt` at M3, connected | 152.7 to 153.3 MiB |
@@ -510,6 +510,6 @@ fdt pid 893; warm-up 30 s; samples (rss_kb cpu%)
  1:41  up 5 days,  9:58, 9 users, load averages: 3.35 4.16 5.16
 ```
 
-Decomposition runs (single samples, same night): M2 `fdt` (aff8ccf) unconnected `70784 0.0` (KiB), M3 `fdt` unconnected `101232 0.0` (101024 on a second run), `attach_hold` connected: 51,696 KiB at 1 s rising to 51,936 at 5 s and 60,432 at 6 s; 60,896 to 61,600 KiB over the following 20 s with CPU 0.0 to 0.1 %. The M2 `fdt --connect` run at 70,720 KiB cannot have been connected (the capture host installs from a frame there, and the screen was locked); only its unconnected number is used.
+Decomposition runs (single samples, same night): M2 `fdt` (1b9cd1f) unconnected `70784 0.0` (KiB), M3 `fdt` unconnected `101232 0.0` (101024 on a second run), `attach_hold` connected: 51,696 KiB at 1 s rising to 51,936 at 5 s and 60,432 at 6 s; 60,896 to 61,600 KiB over the following 20 s with CPU 0.0 to 0.1 %. The M2 `fdt --connect` run at 70,720 KiB cannot have been connected (the capture host installs from a frame there, and the screen was locked); only its unconnected number is used.
 
 Attach: `FDT_JANK_LAB=1 cargo test --release -p fdt_capture --test jank_lab_live -- --ignored --nocapture` against the idle profile app: `attach_ms=126 debug=false`, then `panicked at crates/fdt_capture/tests/jank_lab_live.rs:74:17` (the `goto_logs` action never saw its screen mount).

@@ -1,6 +1,6 @@
 # M2 deferred and parked findings
 
-These are review findings that were deliberately not fixed in M2. They were triaged as "can wait" by the final whole-branch review (Opus), or parked after its fix wave and the residual fix round. Items struck through were fixed before the merge (master `aff8ccf`). Use them as input when planning M3.
+These are review findings that were deliberately not fixed in M2. They were triaged as "can wait" by the final whole-branch review (Opus), or parked after its fix wave and the residual fix round. Items struck through were fixed before the merge (master `1b9cd1f`). Use them as input when planning M3.
 
 ## Should fix soon (early M3)
 

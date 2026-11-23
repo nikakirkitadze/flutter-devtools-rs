@@ -462,7 +462,7 @@ Task 7 needs Flutter and a macOS or Linux desktop.
   - `crates/fdt_app/src/bench_ui.rs` (`live-logs`)
 
 **Interfaces:**
-- **Consumes:** M2 as merged at `aff8ccf`.
+- **Consumes:** M2 as merged at `1b9cd1f`.
 - **Produces:**
   - **The log store's tail.**
     - `LOG_TAIL_MAX_BYTES: usize = 256 * 1024`. The log store seals its tail chunk when it reaches the chunk's record count **or** when the tail's text bytes reach this value.

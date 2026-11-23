@@ -1,6 +1,6 @@
 # M2 verification results and review checklist
 
-Branch `m2-connect-logs-network`, verified on the commit that adds `fdt --connect` (`1c669b6`) plus the measurement examples. R1: Apple M3 Max, macOS, release build.
+Branch `m2-connect-logs-network`, verified on the commit that adds `fdt --connect` (`7c7c973`) plus the measurement examples. R1: Apple M3 Max, macOS, release build.
 
 Legend: met, missed, not measured (and why).
 
@@ -166,7 +166,7 @@ Save screenshots next to this file as `m2-<os>-<theme>-<view>.png`.
 
 ## Measurements filled in by M3 (21 November 2026)
 
-Taken on R1 (Apple M3 Max, 120 Hz) on the M3 branch (`3d0e8a7`), whose Logs, Network and shell code is M2's plus the M3 changes. Raw runs and context are in `m3-review.md`, appendices B and E.
+Taken on R1 (Apple M3 Max, 120 Hz) on the M3 branch (`c145993`), whose Logs, Network and shell code is M2's plus the M3 changes. Raw runs and context are in `m3-review.md`, appendices B and E.
 
 **`fdt bench-ui`, M2's six scenarios, 3 runs each, screen unlocked, `uptime` load 11.4, 11.1, 9.2 before the three batches.** Medians of draw p99 (budget 4 ms), interval p99 (budget 8.833 ms at 120 Hz):
 
