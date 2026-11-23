@@ -1472,7 +1472,7 @@ mod tests {
             times.sort();
             let (p50, p99, max) = (times[49], times[98], times[99]);
             println!("explain_budget: 100 slowest frames p50 {p50:?}, p99 {p99:?}, max {max:?}");
-            assert!(p99.as_millis() <= 50, "p99 {p99:?}");
+            fdt_store::budget::check(p99.as_millis() <= 50, || format!("p99 {p99:?}"));
         }
     }
 }

@@ -1057,7 +1057,9 @@ mod tests {
             total as f64 / p50.as_secs_f64() / 1e6
         );
         if !cfg!(debug_assertions) {
-            assert!(p50 <= std::time::Duration::from_millis(200), "{p50:?}");
+            fdt_store::budget::check(p50 <= std::time::Duration::from_millis(200), || {
+                format!("p50 {p50:?}")
+            });
         }
     }
 }

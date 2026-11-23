@@ -1646,7 +1646,7 @@ mod tests {
             times[times.len() - 1]
         );
         if !cfg!(debug_assertions) {
-            assert!(median < 8.0, "median {median:.2} ms");
+            fdt_store::budget::check(median < 8.0, || format!("median {median:.2} ms"));
         }
     }
 }

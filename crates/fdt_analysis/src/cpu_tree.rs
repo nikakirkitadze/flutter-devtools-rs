@@ -733,8 +733,8 @@ mod tests {
                 tree.nodes.len()
             );
             assert_eq!(tree.samples, 450_000);
-            assert!(td.as_millis() <= 100, "top_down {td:?}");
-            assert!(bu.as_millis() <= 100, "bottom_up {bu:?}");
+            fdt_store::budget::check(td.as_millis() <= 100, || format!("top_down {td:?}"));
+            fdt_store::budget::check(bu.as_millis() <= 100, || format!("bottom_up {bu:?}"));
         }
     }
 
@@ -754,7 +754,7 @@ mod tests {
                 spans.len()
             );
             assert!(!spans.is_empty());
-            assert!(d.as_millis() <= 50, "flame {d:?}");
+            fdt_store::budget::check(d.as_millis() <= 50, || format!("flame {d:?}"));
         }
     }
 }
