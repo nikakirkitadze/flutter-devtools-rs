@@ -118,6 +118,8 @@ test with `FDT_JANK_LAB_VM_URI` set, and stops only the app it started. It print
 timings: `attach_ms` (`connect()` to the first `Connected` status), `attach_to_data_ms`
 (`connect()` to the first live log record in a snapshot) and `first_log_ms` (the `emit_levels`
 call to its record in a snapshot). Hot restart is required in debug and skipped in profile.
+In profile mode it also checks that slow frames are blamed on the right code. Those checks depend
+on the machine, so they fail the run locally but only report on CI (`FDT_BUDGETS` overrides this).
 Discovery uses your real registry directory and picks the app named `jank_lab`; other Dart
 tooling on the machine is ignored. In CI this is the `jank_lab_live` job (Linux, under
 `xvfb-run`).

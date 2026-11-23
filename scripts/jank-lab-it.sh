@@ -19,6 +19,11 @@ esac
 root="$(cd "$(dirname "$0")/.." && pwd)"
 # Keep the macOS window above others: a covered window draws no frames.
 export JANK_LAB_FLOAT=1
+# The CPU and raster attribution checks depend on the machine. They fail the run locally, and only
+# report on hosted CI runners, which draw in software on two cores (set FDT_BUDGETS to override).
+if [ -z "${CI:-}" ]; then
+  export FDT_BUDGETS="${FDT_BUDGETS:-strict}"
+fi
 case "$(uname -s)" in
   Darwin) device=macos ;;
   Linux) device=linux ;;

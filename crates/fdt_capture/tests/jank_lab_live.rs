@@ -125,8 +125,11 @@ fn with_phases(s: &Snapshot, from: usize) -> usize {
 }
 
 /// Observes for `window`, fetching CPU samples each round, then explains every frame `pick`
-/// returns from `from` on. Requires at least 5 judged frames (with `covered_only`, only those with covering CPU samples) and at least 80 % of them accepted
-/// by `ok`. Prints the fraction and the slowest accepted frame's sentence.
+/// returns from `from` on. Expects at least 5 judged frames (with `covered_only`, only those with
+/// covering CPU samples) and at least 80 % of them accepted by `ok`. Both depend on the machine
+/// (a hosted runner draws in software and has two cores), so like the release budgets they fail
+/// only with `FDT_BUDGETS=strict`, which `scripts/jank-lab-it.sh` sets outside CI. Prints the
+/// fraction and the slowest accepted frame's sentence.
 #[allow(clippy::too_many_arguments)]
 async fn attributed(
     cap: &Capture,
@@ -184,15 +187,12 @@ async fn attributed(
         100.0 * good as f64 / judged.max(1) as f64,
         sentence.as_deref().unwrap_or("-")
     );
-    println!(
-        "{what}: libraries that are not Dart URIs: {:?}",
-        non_uri_libraries(&snap)
-    );
-    assert!(judged >= 5, "{what}: only {judged} judged frames");
-    assert!(
-        good * 5 >= judged * 4,
-        "{what}: {good}/{judged} attributed; misses {misses:?}"
-    );
+    fdt_store::budget::check(judged >= 5, || {
+        format!("{what}: only {judged} judged frames")
+    });
+    fdt_store::budget::check(good * 5 >= judged * 4, || {
+        format!("{what}: {good}/{judged} attributed; misses {misses:?}")
+    });
     format!("{good}/{judged}")
 }
 
@@ -203,24 +203,6 @@ fn function_origin(snap: &Snapshot, name: &str) -> String {
         .find(|f| &*f.name == name)
         .map(|f| format!("lib={:?} kind={:?}", f.library, f.kind))
         .unwrap_or_default()
-}
-
-/// Up to five distinct libraries without a URI scheme (Dart libraries always have one).
-fn non_uri_libraries(snap: &Snapshot) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for i in 0..snap.cpu.function_count() {
-        let f = snap.cpu.function(fdt_store::cpu::FunctionId(i as u32));
-        if let Some(l) = &f.library
-            && !l.contains(':')
-            && !out.iter().any(|o| o == &**l)
-        {
-            out.push(l.to_string());
-            if out.len() == 5 {
-                break;
-            }
-        }
-    }
-    out
 }
 
 fn frames_len(cap: &Capture) -> usize {
