@@ -192,7 +192,9 @@ impl TextQuery {
 
 /// A query prepared for scanning.
 pub enum Matcher {
-    Finder(memchr::memmem::Finder<'static>),
+    /// Boxed because `memchr`'s finder is about 300 bytes on x86-64 (its SIMD searchers), which
+    /// would make every `Matcher` that size. A matcher is built once per query, so the box is free.
+    Finder(Box<memchr::memmem::Finder<'static>>),
     Re(Regex),
 }
 
@@ -202,7 +204,9 @@ impl Matcher {
             TextQuery::Plain {
                 needle,
                 case_sensitive: true,
-            } => Matcher::Finder(memchr::memmem::Finder::new(needle.as_bytes()).into_owned()),
+            } => Matcher::Finder(Box::new(
+                memchr::memmem::Finder::new(needle.as_bytes()).into_owned(),
+            )),
             TextQuery::Plain {
                 needle,
                 case_sensitive: false,
