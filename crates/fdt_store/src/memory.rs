@@ -479,6 +479,10 @@ impl MemorySnapshot {
             .expect("class id from this session")
     }
 
+    pub fn alloc_class_count(&self) -> usize {
+        self.classes.len()
+    }
+
     /// Oldest first.
     pub fn profiles(&self) -> &[Arc<AllocProfile>] {
         &self.profiles
@@ -776,6 +780,44 @@ mod tests {
             5,
             "the oldest are dropped"
         );
+    }
+
+    #[test]
+    fn two_hundred_profiles_stay_bounded() {
+        const CLASSES: usize = 6_666;
+        const PROFILES: usize = 200;
+        assert!(std::mem::size_of::<AllocRow>() <= 24);
+        let (mut w, run) = writer();
+        for p in 0..PROFILES as u64 {
+            let rows: Vec<AllocRow> = (0..CLASSES)
+                .map(|c| AllocRow {
+                    class: w.intern_alloc_class(
+                        run,
+                        "isolates/1",
+                        &format!("classes/{c}"),
+                        &format!("Class{c}"),
+                        None,
+                        None,
+                    ),
+                    instances: p + c as u64,
+                    bytes: 32 * (p + c as u64),
+                })
+                .collect();
+            w.push_alloc_profile(AllocProfile {
+                rows: rows.into(),
+                ..profile(run, p * 1_000)
+            });
+        }
+        let m = w.publish().memory.clone();
+        assert_eq!(m.profiles().len(), PROFILES);
+        let classes = m.alloc_class_count();
+        assert_eq!(classes, CLASSES, "classes are interned once, not per row");
+        let row_bytes: usize = m
+            .profiles()
+            .iter()
+            .map(|p| p.rows.len() * std::mem::size_of::<AllocRow>())
+            .sum();
+        assert!(row_bytes <= 24 * CLASSES * PROFILES, "{row_bytes} bytes");
     }
 
     #[test]

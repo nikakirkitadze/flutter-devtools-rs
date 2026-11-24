@@ -613,18 +613,18 @@ pub fn cpu(w: &mut SessionWriter, run: RunId, samples: usize, seed: u64, span: T
 }
 
 /// Appends memory samples every 500 ms over `span`, with a sawtooth heap (it climbs for 20 s,
-/// then drops), and a GC about every 90 ms: 90 % scavenges and the rest alternating mark-sweep
-/// and mark-compact. A 30-minute span holds 3,600 samples and 20,000 GC records.
+/// then drops), and a GC about every 30 ms: 90 % scavenges and the rest alternating mark-sweep
+/// and mark-compact. A 10-minute span holds 1,200 samples and 20,000 GC records.
 pub fn memory(w: &mut SessionWriter, run: RunId, span: TimeRange, seed: u64) {
     const MIB: u64 = 1024 * 1024;
     const SAMPLE_NS: u64 = 500_000_000;
-    const GC_NS: u64 = 90_000_000;
+    const GC_NS: u64 = 30_000_000;
     const SAW_NS: u64 = 20_000_000_000;
     let mut r = Rng(seed.wrapping_mul(0xA24B_AED4_963E_E407) | 1);
     let used_at = |t: u64| 30 * MIB + (t % SAW_NS) * (40 * MIB) / SAW_NS;
     let capacity_at = |t: u64| (64 + 16 * (t / SAW_NS).min(8)) * MIB;
     let dur = span.duration_ns();
-    for i in 0..dur / SAMPLE_NS {
+    for i in 0..dur.div_ceil(SAMPLE_NS) {
         let t = i * SAMPLE_NS;
         w.push_memory_sample(
             run,
@@ -638,7 +638,7 @@ pub fn memory(w: &mut SessionWriter, run: RunId, span: TimeRange, seed: u64) {
         );
     }
     let mut majors = 0u64;
-    for i in 0..dur / GC_NS {
+    for i in 0..dur.div_ceil(GC_NS) {
         let t = i * GC_NS + r.below(20_000_000);
         let (kind, reason, dur_us) = if i % 10 == 9 {
             majors += 1;
@@ -716,6 +716,15 @@ pub fn session(
 
 /// The writer behind [`stress_session`], for scenarios that keep appending to it.
 pub fn stress_writer(seed: u64) -> (SessionWriter, RunId) {
+    let (mut w, run, span) = stress_base(seed);
+    // The memory series spans the session's 10 minutes (1,200 samples, 20,000 GC records), so
+    // the session's span is unchanged.
+    memory(&mut w, run, span, seed);
+    (w, run)
+}
+
+/// The stress session without its memory series, and the span its series cover.
+fn stress_base(seed: u64) -> (SessionWriter, RunId, TimeRange) {
     const FRAMES: usize = 72_000;
     // `perf` pushes the frames itself, so the plain frames of `writer` are left out.
     let (mut w, run) = writer(seed, 1_000_000, 100_000, 0);
@@ -726,14 +735,7 @@ pub fn stress_writer(seed: u64) -> (SessionWriter, RunId) {
         SessionTime(FRAMES as u64 * (1_000_000_000 / 120)),
     );
     cpu(&mut w, run, 450_000, seed, span);
-    // The memory series is 30 minutes: 3,600 samples and 20,000 GC records.
-    memory(
-        &mut w,
-        run,
-        TimeRange::new(SessionTime(0), SessionTime(30 * 60 * 1_000_000_000)),
-        seed,
-    );
-    (w, run)
+    (w, run, span)
 }
 
 /// The `fdt bench-ui` and M3 dataset in one run: 1,000,000 logs, 100,000 requests, 72,000
@@ -751,10 +753,10 @@ mod tests {
     #[test]
     fn synthetic_memory_follows_the_documented_shape() {
         let (mut w, run) = super::writer(1, 0, 0, 0);
-        let span = TimeRange::new(SessionTime(0), SessionTime(30 * 60 * 1_000_000_000));
+        let span = TimeRange::new(SessionTime(0), SessionTime(10 * 60 * 1_000_000_000));
         memory(&mut w, run, span, 3);
         let s = w.publish();
-        assert_eq!(s.memory.samples().len(), 3_600);
+        assert_eq!(s.memory.samples().len(), 1_200);
         assert_eq!(s.memory.gcs().len(), 20_000);
         let majors = s
             .memory
@@ -764,6 +766,17 @@ mod tests {
             .filter(|g| g.kind.is_major())
             .count();
         assert_eq!(majors, 2_000);
+    }
+
+    #[test]
+    fn stress_memory_keeps_the_session_span() {
+        let (mut w, run, span) = stress_base(1);
+        let before = w.publish().latest_time();
+        memory(&mut w, run, span, 1);
+        let s = w.publish();
+        assert_eq!(s.latest_time(), before, "the memory series adds no time");
+        assert_eq!(s.memory.samples().len(), 1_200);
+        assert_eq!(s.memory.gcs().len(), 20_000);
     }
 
     #[test]
