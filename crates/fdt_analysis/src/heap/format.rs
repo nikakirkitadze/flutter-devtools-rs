@@ -506,12 +506,6 @@ fn read_prelude<R: Read>(s: &mut Src<R>, len_hint: u64) -> Result<Prelude, HeapE
     if object_count > u64::from(u32::MAX) - 2 {
         return Err(HeapError::Overflow("object count"));
     }
-    if object_count == 0 {
-        return Err(HeapError::OutOfRange {
-            what: "object count",
-            at,
-        });
-    }
     if len_hint > 0 && (object_count > len_hint || ref_count > len_hint) {
         return Err(HeapError::OutOfRange {
             what: "count exceeds the file size",
@@ -1171,7 +1165,7 @@ mod tests {
     }
 
     #[test]
-    fn bad_magic_and_bad_tag_and_zero_objects() {
+    fn bad_magic_and_bad_tag() {
         let ok = raw(&[&[1, 0, 1, 0]]);
         assert!(run_parse(&ok).is_ok());
         let mut bad = ok.clone();
@@ -1190,16 +1184,21 @@ mod tests {
             decode_full(&bytes).unwrap_err(),
             HeapError::BadTag { tag: 9, at }
         );
+    }
 
-        let zero = raw(&[]);
-        assert!(matches!(
-            run_parse(&zero).unwrap_err(),
-            HeapError::OutOfRange {
-                what: "object count",
-                ..
-            }
-        ));
-        assert!(decode_full(&zero).is_err());
+    #[test]
+    fn zero_objects_parses() {
+        let bytes = raw(&[]);
+        let g = run_parse(&bytes).unwrap();
+        assert_eq!(g.object_count(), 0);
+        assert_eq!(g.classes.len(), 2);
+        assert_eq!(g.first_ref.len(), 2);
+        assert!(g.refs_of(0).is_empty() && g.refs_of(1).is_empty());
+        assert_eq!(g.identity_hash, vec![0]);
+        assert_eq!(g.isolate_object(), None);
+        assert!(g.static_values("x").is_empty());
+        let full = decode_full(&bytes).unwrap();
+        assert!(full.objects.is_empty());
     }
 
     #[test]
