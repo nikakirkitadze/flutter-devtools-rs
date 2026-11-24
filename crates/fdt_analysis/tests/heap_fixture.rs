@@ -200,3 +200,70 @@ fn fixture_counts() {
     let counted: u64 = s.classes.iter().map(|c| c.count).sum();
     assert_eq!(counted, s.reachable);
 }
+
+#[test]
+fn fixture_finds_the_leaky_state() {
+    use fdt_analysis::heap::{AnalyzeInput, analyze, path_text};
+    use fdt_store::heap::{Check, Edge, HeapFile, LeakKind};
+    use fdt_store::run::Mode;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("fixture.dartheap");
+    std::fs::write(&path, bytes()).expect("copy the fixture");
+    let input = AnalyzeInput {
+        file: Arc::new(HeapFile::new(path)),
+        flutter_version: Some("3.47.9".into()),
+        mode: Mode::Profile,
+        root_package: Some("jank_lab".into()),
+    };
+    let a = analyze(&input, &AtomicBool::new(false), &mut |_| {}).expect("analyze");
+    let s = &a.summary;
+    let name = |c: u32| &*s.classes[c as usize].name;
+
+    assert_eq!(s.checks.states, Check::Done);
+    assert!(
+        matches!(s.checks.notifiers, Check::Undecidable(_)),
+        "profile"
+    );
+    let leaks: Vec<_> = s
+        .findings
+        .iter()
+        .filter(|f| f.kind == LeakKind::UnmountedState)
+        .collect();
+    assert_eq!(leaks.len(), 1, "{:?}", s.findings.len());
+    assert_eq!(s.findings_total, 1);
+    let f = leaks[0];
+    assert_eq!(name(f.class), "_LeakyScreenState");
+
+    let classes: Vec<&str> = f.path.iter().map(|h| name(h.class)).collect();
+    assert!(
+        classes.ends_with(&[
+            "AppEvents",
+            "_List",
+            "_Closure",
+            "Context",
+            "_LeakyScreenState"
+        ]),
+        "{classes:?}"
+    );
+    let first_static = f.path.iter().find_map(|h| match &h.edge {
+        Edge::Static(n) => Some(n.to_string()),
+        _ => None,
+    });
+    assert_eq!(first_static.as_deref(), Some("instance"));
+    assert_eq!(f.path[0].node, 0, "the path starts at the root");
+    let culprit = &f.path[usize::from(f.culprit.expect("a culprit"))];
+    assert_eq!(name(culprit.class), "AppEvents");
+    assert_eq!(culprit.edge, Edge::Field("_listeners".into()));
+    assert!(
+        f.keeps
+            .iter()
+            .any(|(c, _)| name(*c) == "TextEditingController")
+    );
+    eprintln!("{}", path_text(s, &f.path));
+    eprintln!("retained {}, keeps {:?}", f.retained, f.keeps);
+    assert_eq!(f.retained, a.index.retained(f.node));
+    assert!(s.http.is_none() || s.http.unwrap().requests == 0);
+    assert!(!s.tracked.is_empty());
+}

@@ -17,20 +17,11 @@ use std::fs::File;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use fdt_store::heap::{
-    Check, HeapClass, HeapFile, HeapIndex, HeapIndexParts, HeapStage, HeapSummary, LeakChecks,
-};
+use fdt_store::heap::{HeapClass, HeapFile, HeapIndex, HeapIndexParts, HeapStage, HeapSummary};
 use fdt_store::run::Mode;
 
 use super::format::{ClassDef, Graph, HeapError, HeapHeader, Value, parse, read_object};
-
-/// `(class name, library uri)` of the classes whose references the heap does not retain.
-/// Task 7's versioned SDK table replaces this.
-const WEAK_CLASSES: &[(&str, &str)] = &[
-    ("_WeakProperty", "dart:core"),
-    ("_WeakReferenceImpl", "dart:core"),
-    ("FinalizerEntry", "dart:_internal"),
-];
+use super::{leaks, sdk};
 
 /// How often the long loops look at the cancel flag.
 const CANCEL_MASK: usize = 0xFFFF;
@@ -42,7 +33,7 @@ pub fn weak_classes(classes: &[ClassDef]) -> Vec<bool> {
         .enumerate()
         .map(|(i, c)| {
             i != 0
-                && WEAK_CLASSES
+                && sdk::WEAK
                     .iter()
                     .any(|(n, u)| c.name == *n && c.library_uri == *u)
         })
@@ -501,8 +492,18 @@ pub fn analyze(
     let retainers = shortest_retainers(&g, &weak);
     check(cancel)?;
 
-    // Task 7's scan hook goes here: the forward references still exist, the predecessor lists
-    // do not yet.
+    // The scan hook: the forward references still exist, the predecessor lists do not yet.
+    let rows = sdk::rows_for(input.flutter_version.as_deref());
+    let scan_file = File::open(input.file.path()).ok();
+    let scan = leaks::scan(
+        &g,
+        &retainers,
+        scan_file.as_ref(),
+        &rows,
+        input.root_package.as_deref(),
+        cancel,
+    )?;
+    drop(scan_file);
 
     progress(HeapStage::Dominators);
     let objects = g.object_count() as u64;
@@ -511,6 +512,7 @@ pub fn analyze(
     let reachable = (d.vertex.len() - 1) as u64;
     let reachable_bytes = d.retained[1];
 
+    let checks = scan.checks.clone();
     let mut counts = vec![(0u64, 0u64); d.classes.len()];
     for &o in &d.vertex[1..] {
         let c = &mut counts[d.class_of[o as usize] as usize];
@@ -521,11 +523,12 @@ pub fn analyze(
         .classes
         .iter()
         .zip(&counts)
-        .map(|(c, &(count, shallow))| HeapClass {
+        .enumerate()
+        .map(|(i, (c, &(count, shallow)))| HeapClass {
             name: c.name.as_str().into(),
             library: c.library_uri.as_str().into(),
-            user: false,
-            lifecycle: None,
+            user: scan.user.get(i).copied().unwrap_or(false),
+            lifecycle: scan.lifecycle.get(i).copied().flatten(),
             fields: c
                 .fields
                 .iter()
@@ -549,29 +552,32 @@ pub fn analyze(
         }
     }
 
+    check(cancel)?;
+    let header = (
+        d.header.shallow_size,
+        d.header.capacity,
+        d.header.external_size,
+    );
+    let (index, node_of) = build_index(d, retainers, names, input.file.clone());
+    let found = leaks::finalize(scan, &index, &node_of);
+    drop(node_of);
     let summary = HeapSummary {
         objects,
         reachable,
         unreachable_bytes: total_bytes.saturating_sub(reachable_bytes),
         reachable_bytes,
-        header_shallow: d.header.shallow_size,
-        header_capacity: d.header.capacity,
-        header_external: d.header.external_size,
+        header_shallow: header.0,
+        header_capacity: header.1,
+        header_external: header.2,
         mode: input.mode,
         root_package: input.root_package.as_deref().map(Arc::from),
         classes: classes.into(),
-        findings: Arc::from([]),
-        findings_total: 0,
-        checks: LeakChecks {
-            states: Check::NotFound,
-            elements: Check::NotFound,
-            notifiers: Check::NotFound,
-        },
-        http: None,
-        tracked: Arc::from([]),
+        findings: found.findings.into(),
+        findings_total: found.total,
+        checks,
+        http: found.http,
+        tracked: found.tracked.into(),
     };
-    check(cancel)?;
-    let (index, _node_of) = build_index(d, retainers, names, input.file.clone());
     progress(HeapStage::Ready);
     Ok(Analysis { summary, index })
 }
