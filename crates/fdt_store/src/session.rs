@@ -5,7 +5,11 @@ use crate::cpu::{CpuSample, CpuSnapshot, CpuStatus, CpuStore, FunctionId, NodeId
 use crate::frames::{
     DEFAULT_BUDGET_US, FrameInput, FrameStore, FramesSnapshot, RasterPhase, UiPhases, budget_us,
 };
+use crate::heap::{HeapDiff, HeapFile, HeapId, HeapIndex, HeapStage, HeapSummary};
 use crate::logs::{LOG_CHUNK, LogInput, LogStore, LogsSnapshot};
+use crate::memory::{
+    AllocClassId, AllocProfile, GcRecord, MemorySample, MemorySnapshot, MemoryStore,
+};
 use crate::net::{
     BodyKind, BodyLimits, BodyState, HttpUpdate, NetSnapshot, NetStore, RequestUpsert, SocketUpdate,
 };
@@ -28,6 +32,7 @@ pub struct Snapshot {
     pub frames: FramesSnapshot,
     pub timeline: TimelineSnapshot,
     pub cpu: CpuSnapshot,
+    pub memory: MemorySnapshot,
     latest: SessionTime,
 }
 
@@ -44,6 +49,7 @@ impl Snapshot {
             frames: FramesSnapshot::default(),
             timeline: TimelineSnapshot::default(),
             cpu: CpuSnapshot::default(),
+            memory: MemorySnapshot::default(),
             latest: SessionTime(0),
         }
     }
@@ -80,6 +86,7 @@ pub struct SessionWriter {
     frames: FrameStore,
     timeline: TimelineStore,
     cpu: CpuStore,
+    memory: MemoryStore,
     latest: SessionTime,
     generation: u64,
     dirty: bool,
@@ -113,6 +120,7 @@ impl SessionWriter {
             frames: FrameStore::new(chunk),
             timeline: TimelineStore::new(),
             cpu: CpuStore::new(),
+            memory: MemoryStore::new(),
             latest: SessionTime(0),
             generation: 0,
             dirty: false,
@@ -278,6 +286,100 @@ impl SessionWriter {
         self.dirty = true;
     }
 
+    /// Stores a memory sample unless it changes nothing: the heap values equal the last stored
+    /// sample's, RSS moved by less than [`crate::memory::RSS_STEP`], and that sample is less than
+    /// [`crate::memory::SAMPLE_MAX_GAP_NS`] old. A sample older than the last stored one is
+    /// dropped too. Returns whether it was stored.
+    pub fn push_memory_sample(&mut self, run: RunId, s: MemorySample) -> bool {
+        let stored = self.memory.push_sample(run, s);
+        if stored {
+            self.touch(s.time);
+        }
+        stored
+    }
+
+    /// Stores a GC record, dropping one earlier than the last. Its duration (0 when unknown)
+    /// goes into the GC level of detail.
+    pub fn push_gc(&mut self, _run: RunId, g: GcRecord) {
+        if self.memory.push_gc(g) {
+            self.touch(g.time);
+        }
+    }
+
+    /// Interns an allocation class by `(run, isolate, vm_id)`.
+    pub fn intern_alloc_class(
+        &mut self,
+        run: RunId,
+        isolate: &str,
+        vm_id: &str,
+        name: &str,
+        library: Option<&str>,
+        location: Option<&str>,
+    ) -> AllocClassId {
+        let (id, new) = self
+            .memory
+            .intern_class(run, isolate, vm_id, name, library, location);
+        self.dirty |= new;
+        id
+    }
+
+    /// Stores an allocation profile in time order; beyond [`crate::memory::MAX_PROFILES`] the
+    /// oldest is dropped.
+    pub fn push_alloc_profile(&mut self, p: AllocProfile) {
+        let at = p.time;
+        self.memory.push_profile(p);
+        self.touch(at);
+    }
+
+    /// Starts the record of a heap snapshot asked for at `at`.
+    pub fn heap_requested(&mut self, run: RunId, isolate: &str, at: SessionTime) -> HeapId {
+        let id = self.memory.heap_requested(run, isolate, at);
+        self.touch(at);
+        id
+    }
+
+    pub fn set_heap_stage(&mut self, id: HeapId, stage: HeapStage) {
+        self.dirty |= self.memory.set_stage(id, stage);
+    }
+
+    /// The snapshot's first chunk arrived at `time`; `file` holds its `bytes`.
+    pub fn set_heap_received(
+        &mut self,
+        id: HeapId,
+        time: SessionTime,
+        bytes: u64,
+        file: Arc<HeapFile>,
+    ) {
+        if self.memory.set_received(id, time, bytes, file) {
+            self.touch(time);
+        }
+    }
+
+    /// Stores the analysis of `id` and makes it the held snapshot: every other record's index is
+    /// dropped, so one index is held.
+    pub fn set_heap_analysed(
+        &mut self,
+        id: HeapId,
+        summary: Arc<HeapSummary>,
+        index: Arc<HeapIndex>,
+    ) {
+        self.dirty |= self.memory.set_analysed(id, summary, index);
+    }
+
+    pub fn set_heap_diff(&mut self, id: HeapId, diff: Option<Arc<HeapDiff>>) {
+        self.dirty |= self.memory.set_diff(id, diff);
+    }
+
+    pub fn set_heap_baseline(&mut self, id: Option<HeapId>) {
+        self.memory.set_baseline(id);
+        self.dirty = true;
+    }
+
+    /// Removes the record; its file is deleted once no snapshot holds it.
+    pub fn remove_heap(&mut self, id: HeapId) {
+        self.dirty |= self.memory.remove_heap(id);
+    }
+
     #[cfg(test)]
     pub(crate) fn with_build_cap(mut self, cap: u64) -> Self {
         self.timeline.set_build_cap(cap);
@@ -382,6 +484,7 @@ impl SessionWriter {
                 frames: self.frames.snapshot(),
                 timeline: self.timeline.snapshot(),
                 cpu: self.cpu.snapshot(),
+                memory: self.memory.snapshot(),
                 latest: self.latest,
             });
         }

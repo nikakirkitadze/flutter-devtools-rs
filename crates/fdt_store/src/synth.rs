@@ -3,6 +3,7 @@
 use crate::cpu::{CpuSample, FunctionId, NodeId};
 use crate::frames::{FrameInput, RasterPhase, UiPhases};
 use crate::logs::{LogInput, LogLevel, LogSource};
+use crate::memory::{GcKind, GcReason, GcRecord, MemorySample};
 use crate::net::HttpUpdate;
 use crate::session::SessionWriter;
 use crate::time::{RunId, SessionTime, TimeRange};
@@ -611,6 +612,64 @@ pub fn cpu(w: &mut SessionWriter, run: RunId, samples: usize, seed: u64, span: T
     w.push_cpu_samples(run, batch);
 }
 
+/// Appends memory samples every 500 ms over `span`, with a sawtooth heap (it climbs for 20 s,
+/// then drops), and a GC about every 90 ms: 90 % scavenges and the rest alternating mark-sweep
+/// and mark-compact. A 30-minute span holds 3,600 samples and 20,000 GC records.
+pub fn memory(w: &mut SessionWriter, run: RunId, span: TimeRange, seed: u64) {
+    const MIB: u64 = 1024 * 1024;
+    const SAMPLE_NS: u64 = 500_000_000;
+    const GC_NS: u64 = 90_000_000;
+    const SAW_NS: u64 = 20_000_000_000;
+    let mut r = Rng(seed.wrapping_mul(0xA24B_AED4_963E_E407) | 1);
+    let used_at = |t: u64| 30 * MIB + (t % SAW_NS) * (40 * MIB) / SAW_NS;
+    let capacity_at = |t: u64| (64 + 16 * (t / SAW_NS).min(8)) * MIB;
+    let dur = span.duration_ns();
+    for i in 0..dur / SAMPLE_NS {
+        let t = i * SAMPLE_NS;
+        w.push_memory_sample(
+            run,
+            MemorySample {
+                time: SessionTime(span.start.0 + t),
+                heap_used: used_at(t) + r.below(64) * 1024,
+                heap_capacity: capacity_at(t),
+                external: 6 * MIB + (t / SAW_NS) * 64 * 1024,
+                rss: Some(180 * MIB + used_at(t) + (t / SAW_NS).min(32) * MIB),
+            },
+        );
+    }
+    let mut majors = 0u64;
+    for i in 0..dur / GC_NS {
+        let t = i * GC_NS + r.below(20_000_000);
+        let (kind, reason, dur_us) = if i % 10 == 9 {
+            majors += 1;
+            let kind = if majors.is_multiple_of(2) {
+                GcKind::MarkCompact
+            } else {
+                GcKind::MarkSweep
+            };
+            (kind, GcReason::OldSpace, 5_000 + r.below(15_000) as u32)
+        } else {
+            (
+                GcKind::Scavenge,
+                GcReason::NewSpace,
+                400 + r.below(400) as u32,
+            )
+        };
+        w.push_gc(
+            run,
+            GcRecord {
+                time: SessionTime(span.start.0 + t),
+                dur_us: Some(dur_us),
+                kind,
+                reason,
+                heap_used: used_at(t),
+                heap_capacity: capacity_at(t),
+                external: 6 * MIB,
+            },
+        );
+    }
+}
+
 /// A writer holding one run of synthetic data (`logs_n` log records, `requests_n` requests and
 /// `frames_n` frames at 120 Hz), not yet published.
 pub fn writer(
@@ -667,6 +726,13 @@ pub fn stress_writer(seed: u64) -> (SessionWriter, RunId) {
         SessionTime(FRAMES as u64 * (1_000_000_000 / 120)),
     );
     cpu(&mut w, run, 450_000, seed, span);
+    // The memory series is 30 minutes: 3,600 samples and 20,000 GC records.
+    memory(
+        &mut w,
+        run,
+        TimeRange::new(SessionTime(0), SessionTime(30 * 60 * 1_000_000_000)),
+        seed,
+    );
     (w, run)
 }
 
@@ -681,6 +747,24 @@ mod tests {
     use super::*;
     use crate::logs::testkit::writer;
     use crate::net::StatusClass;
+
+    #[test]
+    fn synthetic_memory_follows_the_documented_shape() {
+        let (mut w, run) = super::writer(1, 0, 0, 0);
+        let span = TimeRange::new(SessionTime(0), SessionTime(30 * 60 * 1_000_000_000));
+        memory(&mut w, run, span, 3);
+        let s = w.publish();
+        assert_eq!(s.memory.samples().len(), 3_600);
+        assert_eq!(s.memory.gcs().len(), 20_000);
+        let majors = s
+            .memory
+            .gcs()
+            .chunks()
+            .flatten()
+            .filter(|g| g.kind.is_major())
+            .count();
+        assert_eq!(majors, 2_000);
+    }
 
     #[test]
     fn small_session_has_the_requested_sizes() {

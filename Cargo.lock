@@ -1780,6 +1780,7 @@ name = "fdt_store"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "log",
  "memchr",
  "rayon",
  "regex",
