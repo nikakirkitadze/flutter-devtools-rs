@@ -168,9 +168,14 @@ pub fn dominators(g: Graph, weak: &[bool], cancel: &AtomicBool) -> Result<Domina
 
     // Depth-first preorder, numbered when a vertex is discovered.
     let mut num = vec![0u32; n + 1];
-    let mut vertex: Vec<u32> = vec![0, 1];
-    let mut parent: Vec<u32> = vec![0, 0];
+    // Sized for every object so neither grows by doubling; shrunk once the search is done.
+    let mut vertex: Vec<u32> = Vec::with_capacity(n + 1);
+    let mut parent: Vec<u32> = Vec::with_capacity(n + 1);
+    vertex.extend([0, 1]);
+    parent.extend([0, 0]);
     num[1] = 1;
+    // Holds one frame (8 B) per vertex on the current path: at most `r` deep (a chain), and
+    // freed before the predecessor lists are allocated, so it never sits at the pass-3 peak.
     let mut stack: Vec<(u32, u32)> = Vec::new();
     // A weak object starts with its cursor at the end: its out-edges are not followed.
     let start_of = |o: u32| {
@@ -204,6 +209,8 @@ pub fn dominators(g: Graph, weak: &[bool], cancel: &AtomicBool) -> Result<Domina
         }
     }
     drop(stack);
+    vertex.shrink_to_fit();
+    parent.shrink_to_fit();
     let r = vertex.len() - 1;
 
     // Predecessors as a CSR over DFS numbers. `first_pred[w]` ends as the start of `w`'s list;

@@ -186,13 +186,16 @@ fn fixture_counts() {
     assert!(s.reachable < s.objects, "{} of {}", s.reachable, s.objects);
     assert_eq!(a.index.len() as u64, s.reachable);
     assert_eq!(a.index.retained(0), s.reachable_bytes);
-    // The redacted fixture's header is not the sum of its objects, so compare with the objects.
+    // The VM's header total is 256 B above the sum of the objects' sizes in this real snapshot
+    // (17,202,800 against 17,202,544): an accounting gap, not a parse error. Totals use the
+    // object sums; the gap is pinned so a parse regression can't hide in it.
     let all: u64 = decode_full(&bytes())
         .unwrap()
         .objects
         .iter()
         .map(|o| o.shallow)
         .sum();
+    assert_eq!(s.header_shallow - all, 256);
     assert_eq!(s.reachable_bytes + s.unreachable_bytes, all);
     let counted: u64 = s.classes.iter().map(|c| c.count).sum();
     assert_eq!(counted, s.reachable);
