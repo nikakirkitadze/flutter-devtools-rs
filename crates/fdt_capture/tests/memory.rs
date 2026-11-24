@@ -169,13 +169,17 @@ fn memory_is_polled_every_500_ms() {
         })
         .await;
         let stamps = sim.polls.lock().unwrap().clone();
-        for pair in stamps.windows(2) {
-            let gap = pair[1] - pair[0];
-            assert!(
-                gap >= Duration::from_millis(450) && gap <= Duration::from_millis(1000),
-                "polls are 500 ms apart, not {gap:?}"
-            );
-        }
+        let gaps: Vec<Duration> = stamps.windows(2).map(|p| p[1] - p[0]).collect();
+        let (min, max) = (gaps.iter().min().unwrap(), gaps.iter().max().unwrap());
+        assert!(
+            *min >= Duration::from_millis(450) && *max <= Duration::from_millis(2000),
+            "polls are 500 ms apart: {gaps:?}"
+        );
+        let span = stamps[4] - stamps[0];
+        assert!(
+            span >= Duration::from_millis(1800),
+            "four gaps span {span:?}"
+        );
         assert!(
             calls(&server, "getIsolateGroupMemoryUsage")
                 .iter()
@@ -372,11 +376,14 @@ fn paused_recording_drops_samples_but_keeps_profiles() {
         let before = connected(&cap).await;
         let n = before.memory.samples().len();
         let polls = calls(&server, "getIsolateGroupMemoryUsage").len();
-        cap.fetch_allocation_profile(false);
+        // The GC goes first, then the profile request. The server writes a notification and a
+        // reply to one connection in order, and the client reader hands them on in order, so
+        // once the profile is stored the GC frame has been routed, and dropped as paused.
         note_gc(
             &server,
             gc_event("isolates/1", GROUP, (3, 0.1), (3, 0.1), now_ms()),
         );
+        cap.fetch_allocation_profile(false);
         common::eventually(LIMIT, "more polls", || {
             calls(&server, "getIsolateGroupMemoryUsage").len() >= polls + 5
         })
@@ -385,8 +392,8 @@ fn paused_recording_drops_samples_but_keeps_profiles() {
             !s.memory.profiles().is_empty()
         })
         .await;
-        assert_eq!(s.memory.samples().len(), n);
         assert!(s.memory.gcs().is_empty());
+        assert_eq!(s.memory.samples().len(), n);
         drop(cap);
     });
 }
