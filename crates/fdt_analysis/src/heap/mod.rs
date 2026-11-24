@@ -2,6 +2,7 @@
 //! decoder for tests and single-object reads, and an encoder (with a builder) for fixtures.
 
 pub mod details;
+pub mod diff;
 pub mod dominators;
 pub mod encode;
 pub mod format;
@@ -9,6 +10,7 @@ pub mod leaks;
 pub mod sdk;
 
 pub use details::{ObjectDetails, labelled_path, object_details};
+pub use diff::{default_baseline, diff};
 pub use dominators::{
     Analysis, AnalyzeInput, Dominated, analyze, build_index, dominators, shortest_retainers,
     weak_classes,
