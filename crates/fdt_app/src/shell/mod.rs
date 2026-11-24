@@ -2495,15 +2495,15 @@ mod tests {
         fake.status.send(connected("demo", true)).unwrap();
         cx.run_until_parked();
         // The held snapshot is the newest.
-        run_command(cx, &shell, "Use as baseline");
-        run_command(cx, &shell, "Refresh allocation profile");
-        run_command(cx, &shell, "Cancel heap snapshot");
+        run_command(cx, &shell, "Use as Baseline");
+        run_command(cx, &shell, "Refresh Allocation Profile");
+        run_command(cx, &shell, "Cancel Heap Snapshot");
         // A selected snapshot wins over the held one.
         press(cx, "cmd-3", "ctrl-3");
         let mut to = shell.read_with(cx, |s, _| s.current().clone());
         to.selection = Some(Selection::Heap(HeapId(0)));
         shell.update_in(cx, |s, w, cx| s.navigate(to, w, cx));
-        run_command(cx, &shell, "Remove heap snapshot");
+        run_command(cx, &shell, "Remove Heap Snapshot");
         let log = fake.commands();
         for want in [
             "heap_baseline 1",
@@ -2514,11 +2514,11 @@ mod tests {
             assert!(log.contains(&want.to_string()), "{want} in {log:?}");
         }
         // The tab commands switch tab and page.
-        run_command(cx, &shell, "Show classes");
+        run_command(cx, &shell, "Show Classes");
         assert_eq!(memory_tab(&shell, cx), MemoryTab::Classes);
-        run_command(cx, &shell, "Show heap snapshot");
+        run_command(cx, &shell, "Show Heap Snapshot");
         assert_eq!(memory_tab(&shell, cx), MemoryTab::Snapshot);
-        run_command(cx, &shell, "Show leaks");
+        run_command(cx, &shell, "Show Leaks");
         assert_eq!(memory_tab(&shell, cx), MemoryTab::Leaks);
     }
 
