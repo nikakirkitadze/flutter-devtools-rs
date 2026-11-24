@@ -8,6 +8,7 @@ pub mod encode;
 pub mod format;
 pub mod leaks;
 pub mod sdk;
+pub mod synth;
 
 pub use details::{ObjectDetails, labelled_path, object_details};
 pub use diff::{default_baseline, diff};
