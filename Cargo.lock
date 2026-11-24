@@ -1736,6 +1736,7 @@ dependencies = [
  "criterion",
  "fdt_store",
  "rayon",
+ "tempfile",
 ]
 
 [[package]]
