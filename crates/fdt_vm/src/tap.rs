@@ -124,7 +124,8 @@ fn utf16le(text: &str) -> Vec<u8> {
 }
 
 /// Overwrites the user name in every UTF-16LE `/Users/<name>/` and `/home/<name>/` of `bytes`
-/// with `x`. Same length; a name ends at a separator, a quote, a control unit or a non-ASCII unit.
+/// with `x`. Same length; a name ends at a separator, a quote or a control unit, and every
+/// other unit, non-ASCII ones included, becomes `x`.
 fn mask_user_names_utf16(bytes: &mut [u8]) {
     for prefix in ["/Users/", "/home/"] {
         let prefix = utf16le(prefix);
@@ -136,16 +137,16 @@ fn mask_user_names_utf16(bytes: &mut [u8]) {
             }
             let start = i + prefix.len();
             let mut end = start;
-            while end + 1 < bytes.len()
-                && bytes[end + 1] == 0
-                && !matches!(bytes[end], b'/' | b'\\' | b'"')
-                && bytes[end] >= 0x20
-                && bytes[end] < 0x80
-            {
+            // A name ends only at a separator, a quote or a control unit; any other unit,
+            // whatever its script, is part of it.
+            while end + 1 < bytes.len() {
+                let unit = u16::from_le_bytes([bytes[end], bytes[end + 1]]);
+                if matches!(unit, 0x2f | 0x5c | 0x22) || unit < 0x20 {
+                    break;
+                }
+                bytes[end] = b'x';
+                bytes[end + 1] = 0;
                 end += 2;
-            }
-            for at in (start..end).step_by(2) {
-                bytes[at] = b'x';
             }
             i = end.max(start);
         }
@@ -327,7 +328,7 @@ mod tests {
             "/Users/jane/dev/b.dart /home/al/ http://h/AbCdEf123456_-xyz=/",
         ));
         raw.extend_from_slice(&utf16le("/Users/jane"));
-        raw.extend_from_slice(&[0xff, 0xff]);
+        raw.extend_from_slice(&[0x0a, 0x00]);
         let mut masked = raw.clone();
         mask_snapshot_secrets(&mut masked, token);
         assert_eq!(masked.len(), raw.len());
@@ -343,7 +344,7 @@ mod tests {
         assert!(has(&masked, &utf16le("/Users/xxxx/dev/b.dart /home/xx/ ")));
         assert!(has(&masked, &utf16le(&format!("http://h/{dots}/"))));
         assert!(has(&masked, &utf16le("/Users/xxxx")));
-        assert!(masked.ends_with(&[0xff, 0xff]));
+        assert!(masked.ends_with(&[0x0a, 0x00]));
         for secret in [&b"jane"[..], b"bob", token.as_bytes()] {
             assert!(!has(&masked, secret));
         }
@@ -355,5 +356,38 @@ mod tests {
         let mut again = masked.clone();
         mask_snapshot_secrets(&mut again, "");
         assert_eq!(again, masked);
+    }
+
+    #[test]
+    fn mask_snapshot_secrets_masks_non_ascii_names_in_both_forms() {
+        let name = "ნიკა-José-Иван-李";
+        let mut raw = Vec::new();
+        raw.extend_from_slice(format!("file:///Users/{name}/a.dart \"/home/{name}\"").as_bytes());
+        raw.push(7);
+        raw.extend_from_slice(&utf16le(&format!("/Users/{name}/b.dart /home/{name}\"z")));
+        let len = raw.len();
+        let mut masked = raw.clone();
+        mask_snapshot_secrets(&mut masked, "");
+        assert_eq!(masked.len(), len);
+        let n = name.chars().count();
+        let x_wide = "x".repeat(n);
+        // 1-byte: every UTF-8 byte of the name is masked, and the byte length is kept.
+        let x_bytes = "x".repeat(name.len());
+        let text = String::from_utf8_lossy(&masked).into_owned();
+        assert!(
+            text.contains(&format!(
+                "file:///Users/{x_bytes}/a.dart \"/home/{x_bytes}\""
+            )),
+            "{text}"
+        );
+        // UTF-16: one `x` unit per code unit, the high bytes zeroed.
+        assert!(has(
+            &masked,
+            &utf16le(&format!("/Users/{x_wide}/b.dart /home/{x_wide}\"z"))
+        ));
+        for part in ["ნიკა", "José", "Иван", "李"] {
+            assert!(!has(&masked, part.as_bytes()), "{part}");
+            assert!(!has(&masked, &utf16le(part)), "{part}");
+        }
     }
 }
