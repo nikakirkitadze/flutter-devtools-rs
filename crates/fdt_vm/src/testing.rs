@@ -19,6 +19,7 @@ use tokio_tungstenite::tungstenite::Message;
 /// A command sent to a live connection task.
 pub(crate) enum ConnCmd {
     Send(String),
+    Binary(Vec<u8>),
     /// Drop the TCP connection without a close frame.
     Abort,
 }
@@ -106,6 +107,8 @@ struct Shared {
     silenced: Mutex<std::collections::HashSet<String>>,
     /// While `Some((n, held))`, responses are collected and released in reverse once `n` arrive.
     reverse: Mutex<Option<Held>>,
+    /// Binary frames sent when a method arrives, before its reply.
+    binary: Mutex<HashMap<String, Vec<Vec<u8>>>>,
 }
 
 /// A JSON-RPC server whose answers come from a closure.
@@ -138,6 +141,11 @@ impl ScriptedServer {
         self.plumbing.broadcast(|| ConnCmd::Send(text.clone()));
     }
 
+    /// Sends a binary frame to every connected client.
+    pub fn send_binary(&self, frame: Vec<u8>) {
+        self.plumbing.broadcast(|| ConnCmd::Binary(frame.clone()));
+    }
+
     /// Drops every connection without a close frame.
     pub fn close_abruptly(&self) {
         self.plumbing.broadcast(|| ConnCmd::Abort);
@@ -164,6 +172,15 @@ impl ScriptedServer {
     /// Delays every response.
     pub fn set_latency(&self, latency: Duration) {
         *self.shared.latency.lock().unwrap() = latency;
+    }
+
+    /// When `method` arrives, sends these binary frames, then the handler's reply.
+    pub fn script_binary(&self, method: &str, frames: Vec<Vec<u8>>) {
+        self.shared
+            .binary
+            .lock()
+            .unwrap()
+            .insert(method.to_string(), frames);
     }
 
     /// Holds the next `n` responses and sends them in reverse order of arrival.
@@ -204,6 +221,10 @@ async fn serve_scripted(
                 if shared.silenced.lock().unwrap().contains(&method) {
                     continue;
                 }
+                let frames = shared.binary.lock().unwrap().get(&method).cloned();
+                for f in frames.into_iter().flatten() {
+                    let _ = tx.send(ConnCmd::Binary(f));
+                }
                 let reply = match handler(&method, &params) {
                     Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
                     Err((code, message)) => {
@@ -216,6 +237,11 @@ async fn serve_scripted(
             cmd = rx.recv() => match cmd {
                 Some(ConnCmd::Send(t)) => {
                     if ws.send(Message::text(t)).await.is_err() {
+                        break;
+                    }
+                }
+                Some(ConnCmd::Binary(b)) => {
+                    if ws.send(Message::binary(b)).await.is_err() {
                         break;
                     }
                 }
@@ -465,6 +491,11 @@ async fn serve_replay(
             cmd = rx.recv() => match cmd {
                 Some(ConnCmd::Send(t)) => {
                     if ws.send(Message::text(t)).await.is_err() {
+                        break;
+                    }
+                }
+                Some(ConnCmd::Binary(b)) => {
+                    if ws.send(Message::binary(b)).await.is_err() {
                         break;
                     }
                 }

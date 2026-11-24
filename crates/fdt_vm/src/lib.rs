@@ -8,6 +8,8 @@ pub mod discovery;
 pub mod dtd;
 pub mod events;
 pub mod flutter;
+pub mod heap_snapshot;
+pub mod memory;
 pub mod perfetto;
 pub mod rpc;
 pub mod service;

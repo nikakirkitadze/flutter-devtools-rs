@@ -70,10 +70,52 @@ pub enum StreamEvent {
     TimelineSubscriptions {
         recorded: Vec<String>,
     },
+    /// A garbage collection (`GC` stream). One arrives per isolate of the group, per GC.
+    Gc(GcEvent),
     Other {
         stream: String,
         kind: String,
     },
+}
+
+/// One heap space after a GC. Sizes are bytes; `time_s` is the cumulative GC time in seconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HeapSpace {
+    pub used: u64,
+    pub capacity: u64,
+    pub external: u64,
+    pub collections: u64,
+    pub time_s: f64,
+}
+
+impl HeapSpace {
+    fn from_json(v: Option<&Value>) -> HeapSpace {
+        let n = |k: &str| {
+            v.and_then(|v| v.get(k))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        };
+        HeapSpace {
+            used: n("used"),
+            capacity: n("capacity"),
+            external: n("external"),
+            collections: n("collections"),
+            time_s: v
+                .and_then(|v| v.get("time"))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GcEvent {
+    pub isolate_group: String,
+    pub gc_type: String,
+    pub reason: Option<String>,
+    pub timestamp_ms: i64,
+    pub new_space: HeapSpace,
+    pub old_space: HeapSpace,
 }
 
 #[derive(Deserialize)]
@@ -183,6 +225,18 @@ pub fn decode_notification(n: &Notification) -> Option<StreamEvent> {
                     .filter_map(|s| s.as_str().map(str::to_string))
                     .collect(),
             },
+            "GC" => StreamEvent::Gc(GcEvent {
+                isolate_group: ev
+                    .get("isolateGroup")
+                    .and_then(|g| str_of(g, "id"))
+                    .or_else(|| ev.get("isolate").and_then(|i| str_of(i, "isolateGroupId")))?
+                    .to_string(),
+                gc_type: str_of(ev, "gcType").unwrap_or("GC").to_string(),
+                reason: str_of(ev, "reason").map(str::to_string),
+                timestamp_ms: ts,
+                new_space: HeapSpace::from_json(ev.get("new")),
+                old_space: HeapSpace::from_json(ev.get("old")),
+            }),
             _ => return None,
         })
     })();
@@ -209,6 +263,7 @@ const KNOWN_KINDS: &[&str] = &[
     "ServiceRegistered",
     "TimelineEvents",
     "TimelineStreamSubscriptionsUpdate",
+    "GC",
 ];
 
 #[cfg(test)]
@@ -309,5 +364,64 @@ mod tests {
                 kind: "WriteEvent".into()
             }
         );
+    }
+
+    #[test]
+    fn gc_event_decodes() {
+        let ev = decode_notification(&note(
+            "GC",
+            json!({"kind": "GC", "gcType": "Scavenge", "reason": "new space",
+                   "timestamp": 1795272383990i64,
+                   "isolate": {"id": "isolates/1", "isolateGroupId": "isolateGroups/5"},
+                   "isolateGroup": {"id": "isolateGroups/5"},
+                   "new": {"type": "HeapSpace", "used": 3264, "capacity": 1048576,
+                           "external": 0, "collections": 10, "time": 0.010284},
+                   "old": {"type": "HeapSpace", "used": 9331424, "capacity": 10027008,
+                           "external": 1984, "collections": 5, "time": 0.00565}}),
+        ))
+        .unwrap();
+        assert_eq!(
+            ev,
+            StreamEvent::Gc(GcEvent {
+                isolate_group: "isolateGroups/5".into(),
+                gc_type: "Scavenge".into(),
+                reason: Some("new space".into()),
+                timestamp_ms: 1795272383990,
+                new_space: HeapSpace {
+                    used: 3264,
+                    capacity: 1048576,
+                    external: 0,
+                    collections: 10,
+                    time_s: 0.010284
+                },
+                old_space: HeapSpace {
+                    used: 9331424,
+                    capacity: 10027008,
+                    external: 1984,
+                    collections: 5,
+                    time_s: 0.00565
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn gc_event_without_gc_type_or_group_object() {
+        let ev = decode_notification(&note(
+            "GC",
+            json!({"kind": "GC", "timestamp": 7,
+                   "isolate": {"id": "isolates/1", "isolateGroupId": "isolateGroups/9"},
+                   "new": {"used": 5}}),
+        ))
+        .unwrap();
+        let StreamEvent::Gc(g) = ev else {
+            panic!("{ev:?}")
+        };
+        assert_eq!(g.isolate_group, "isolateGroups/9");
+        assert_eq!(g.gc_type, "GC");
+        assert_eq!(g.reason, None);
+        assert_eq!(g.new_space.used, 5);
+        assert_eq!(g.new_space.capacity, 0);
+        assert_eq!(g.old_space, HeapSpace::default());
     }
 }

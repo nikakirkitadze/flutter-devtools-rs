@@ -1,7 +1,7 @@
 //! A JSON-RPC 2.0 client over a plain WebSocket, as spoken by the Dart VM service.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,6 +14,7 @@ use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
+use crate::heap_snapshot::{HeapChunk, decode_chunk};
 use crate::tap::Tap;
 
 /// A body travels as a JSON array of integers, up to four characters a byte (`255,`), so a
@@ -51,6 +52,9 @@ pub struct Notification {
 }
 
 pub type NotificationRx = mpsc::UnboundedReceiver<Notification>;
+
+/// Heap-snapshot chunks, in arrival order (see [`RpcClient::heap_chunks`]).
+pub type HeapChunkRx = mpsc::UnboundedReceiver<HeapChunk>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RpcError {
@@ -141,6 +145,10 @@ struct Inner {
     call_timeout: Duration,
     max_message_bytes: usize,
     tap: Option<Tap>,
+    /// Where snapshot chunks go; `None` until someone asks for them.
+    chunks: Mutex<Option<mpsc::UnboundedSender<HeapChunk>>>,
+    /// Whether the "no receiver" debug line has been logged on this connection.
+    dropped_logged: AtomicBool,
 }
 
 /// A handle to one connection. Cheap to clone; safe to call from many tasks.
@@ -224,6 +232,8 @@ pub async fn connect(
         call_timeout: opts.call_timeout,
         max_message_bytes: opts.max_message_bytes,
         tap: opts.tap,
+        chunks: Mutex::new(None),
+        dropped_logged: AtomicBool::new(false),
     });
 
     // Writer: the only place that touches the sink.
@@ -268,10 +278,18 @@ pub async fn connect(
             };
             match msg {
                 Some(Ok(Message::Text(t))) => reader_inner.on_frame(t.as_str(), &note_tx),
-                Some(Ok(Message::Binary(b))) => match std::str::from_utf8(&b) {
-                    Ok(s) => reader_inner.on_frame(s, &note_tx),
-                    Err(_) => log::warn!("ignoring binary frame"),
-                },
+                Some(Ok(Message::Binary(b))) => {
+                    // A snapshot chunk can hold any bytes, valid UTF-8 included, so it is
+                    // recognised by its framing before the text path gets a look.
+                    if let Some(chunk) = decode_chunk(&b) {
+                        reader_inner.on_chunk(chunk);
+                    } else {
+                        match std::str::from_utf8(&b) {
+                            Ok(s) => reader_inner.on_frame(s, &note_tx),
+                            Err(_) => log::warn!("ignoring binary frame"),
+                        }
+                    }
+                }
                 Some(Ok(Message::Close(frame))) => {
                     if let Some(f) = frame {
                         reason = CloseReason {
@@ -340,6 +358,22 @@ fn raw_present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Box<RawV
 }
 
 impl Inner {
+    fn on_chunk(&self, chunk: HeapChunk) {
+        let mut slot = match self.chunks.lock() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
+        if let Some(tx) = slot.as_ref() {
+            if tx.send(chunk).is_ok() {
+                return;
+            }
+            *slot = None; // the receiver is gone
+        }
+        if !self.dropped_logged.swap(true, Ordering::Relaxed) {
+            log::debug!("dropping heap snapshot chunks: no receiver");
+        }
+    }
+
     fn on_frame(&self, text: &str, notes: &mpsc::UnboundedSender<Notification>) {
         if let Some(tap) = &self.tap {
             tap.record("recv", text);
@@ -449,6 +483,17 @@ impl RpcClient {
             Ok(Err(_)) => Err(RpcError::Closed),
             Err(_) => Err(RpcError::Timeout),
         }
+    }
+
+    /// Receives heap-snapshot chunks from now on. A second call replaces the first receiver,
+    /// whose channel then closes. With no receiver, chunks are dropped.
+    pub fn heap_chunks(&self) -> HeapChunkRx {
+        let (tx, rx) = mpsc::unbounded_channel();
+        match self.inner.chunks.lock() {
+            Ok(mut s) => *s = Some(tx),
+            Err(p) => *p.into_inner() = Some(tx),
+        }
+        rx
     }
 
     /// How long a call waits by default.
@@ -796,5 +841,105 @@ mod tests {
             .unwrap();
         let r = c.call("big", Value::Null).await.unwrap();
         assert_eq!(r.as_str().unwrap().len(), big.len());
+    }
+
+    async fn next_chunk(rx: &mut HeapChunkRx) -> HeapChunk {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("chunk in time")
+            .expect("open")
+    }
+
+    #[tokio::test]
+    async fn snapshot_frames_reach_the_chunk_channel() {
+        use crate::heap_snapshot::encode_frame;
+        let s = echo_server();
+        let (c, _rx) = connect(&s.ws_uri(), ConnectOptions::default())
+            .await
+            .unwrap();
+        let mut chunks = c.heap_chunks();
+        for (i, payload) in [&b"one"[..], b"two", b"three"].into_iter().enumerate() {
+            s.send_binary(encode_frame("isolates/1", i as i64, i == 2, payload));
+        }
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            got.push(next_chunk(&mut chunks).await);
+        }
+        let payloads: Vec<&[u8]> = got.iter().map(|c| c.payload.as_slice()).collect();
+        assert_eq!(payloads, [&b"one"[..], b"two", b"three"]);
+        assert_eq!(
+            got.iter().map(|c| c.last).collect::<Vec<_>>(),
+            [false, false, true]
+        );
+    }
+
+    #[tokio::test]
+    async fn utf8_json_binary_frames_still_route_as_text() {
+        let s = echo_server();
+        let (c, mut notes) = connect(&s.ws_uri(), ConnectOptions::default())
+            .await
+            .unwrap();
+        let mut chunks = c.heap_chunks();
+        let text = json!({"jsonrpc": "2.0", "method": "streamNotify",
+                          "params": {"streamId": "Logging", "event": {}}})
+        .to_string();
+        s.send_binary(text.into_bytes());
+        let n = tokio::time::timeout(Duration::from_secs(5), notes.recv())
+            .await
+            .expect("in time")
+            .expect("open");
+        assert_eq!(n.params["streamId"], "Logging");
+        assert!(chunks.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_valid_utf8_payload_is_still_a_chunk() {
+        use crate::heap_snapshot::encode_frame;
+        let s = echo_server();
+        let (c, mut notes) = connect(&s.ws_uri(), ConnectOptions::default())
+            .await
+            .unwrap();
+        let mut chunks = c.heap_chunks();
+        // Whole frame is valid UTF-8: padded JSON metadata, a little-endian 512, ASCII payload.
+        let frame = encode_frame("isolates/1", 9, true, b"abcdefghij0123456789");
+        s.send_binary(frame);
+        let chunk = next_chunk(&mut chunks).await;
+        assert_eq!(chunk.payload, b"abcdefghij0123456789");
+        assert!(chunk.last);
+        assert!(notes.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn chunks_without_a_receiver_are_dropped() {
+        use crate::heap_snapshot::encode_frame;
+        let s = echo_server();
+        let (c, _rx) = connect(&s.ws_uri(), ConnectOptions::default())
+            .await
+            .unwrap();
+        s.send_binary(encode_frame("isolates/1", 1, false, b"x"));
+        s.send_binary(encode_frame("isolates/1", 2, true, b"y"));
+        // The connection keeps working, and a receiver installed now sees only later chunks.
+        c.call("getVM", json!({})).await.unwrap();
+        let mut chunks = c.heap_chunks();
+        s.send_binary(encode_frame("isolates/1", 3, true, b"z"));
+        assert_eq!(next_chunk(&mut chunks).await.payload, b"z");
+        // A receiver dropped mid-snapshot doesn't break the reader either.
+        drop(chunks);
+        s.send_binary(encode_frame("isolates/1", 4, true, b"w"));
+        c.call("getVM", json!({})).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_new_receiver_replaces_the_old() {
+        use crate::heap_snapshot::encode_frame;
+        let s = echo_server();
+        let (c, _rx) = connect(&s.ws_uri(), ConnectOptions::default())
+            .await
+            .unwrap();
+        let mut old = c.heap_chunks();
+        let mut new = c.heap_chunks();
+        s.send_binary(encode_frame("isolates/1", 1, true, b"x"));
+        assert_eq!(next_chunk(&mut new).await.payload, b"x");
+        assert!(old.recv().await.is_none(), "the old channel is closed");
     }
 }
