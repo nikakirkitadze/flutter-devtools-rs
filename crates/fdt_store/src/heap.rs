@@ -236,7 +236,6 @@ pub struct HeapIndex {
     class: Vec<u32>,
     shallow: Vec<u32>,
     retained: Vec<u64>,
-    idom: Vec<u32>,
     first_child: Vec<u32>,
     retainer: Vec<u32>,
     offsets: Vec<u32>,
@@ -251,7 +250,6 @@ pub struct HeapIndexParts {
     pub class: Vec<u32>,
     pub shallow: Vec<u32>,
     pub retained: Vec<u64>,
-    pub idom: Vec<u32>,
     /// `n + 1` entries: node `i`'s children are `first_child[i]..first_child[i + 1]`.
     pub first_child: Vec<u32>,
     pub retainer: Vec<u32>,
@@ -279,7 +277,6 @@ impl HeapIndex {
             p.class.len() == n
                 && p.shallow.len() == n
                 && p.retained.len() == n
-                && p.idom.len() == n
                 && p.retainer.len() == n
                 && p.first_child.len() == n + 1,
             "heap index parts must have one entry per node (and n + 1 child starts)"
@@ -294,7 +291,6 @@ impl HeapIndex {
             class: p.class,
             shallow: p.shallow,
             retained: p.retained,
-            idom: p.idom,
             first_child: p.first_child,
             retainer: p.retainer,
             offsets: p.offsets,
@@ -324,8 +320,14 @@ impl HeapIndex {
         self.retained[node as usize]
     }
 
+    /// The immediate dominator of `node`: the node whose children range holds it (the ranges
+    /// are assigned in parent order, so `first_child` is nondecreasing). The root, which has
+    /// none, gives 0. O(log n).
     pub fn idom(&self, node: u32) -> u32 {
-        self.idom[node as usize]
+        if node == 0 {
+            return 0;
+        }
+        (self.first_child.partition_point(|&f| f <= node) - 1) as u32
     }
 
     pub fn retainer(&self, node: u32) -> u32 {
@@ -388,7 +390,6 @@ impl HeapIndex {
             + self.class.capacity() * size_of::<u32>()
             + self.shallow.capacity() * size_of::<u32>()
             + self.retained.capacity() * size_of::<u64>()
-            + self.idom.capacity() * size_of::<u32>()
             + self.first_child.capacity() * size_of::<u32>()
             + self.retainer.capacity() * size_of::<u32>()
             + self.offsets.capacity() * size_of::<u32>()
@@ -421,7 +422,6 @@ pub(crate) mod testkit {
             class: vec![0, 1, 1, 1, 2, 2],
             shallow: vec![0, 10, 10, 10, 5, 5],
             retained: vec![100, 40, 30, 20, 8, 5],
-            idom: vec![0, 0, 0, 0, 1, 1],
             first_child: vec![1, 4, 6, 6, 6, 6, 6],
             retainer: vec![0, 0, 0, 0, 1, 1],
             offsets: Vec::new(),
@@ -475,8 +475,7 @@ mod tests {
             class: vec![0; n as usize],
             shallow: vec![0; n as usize],
             retained: vec![0; n as usize],
-            idom: (0..n).map(|i| i.saturating_sub(1)).collect(),
-            first_child: (0..=n).map(|i| i.min(n)).collect(),
+            first_child: (0..=n).map(|i| (i + 1).min(n)).collect(),
             retainer: (0..n).map(|i| i.saturating_sub(1)).collect(),
             offsets: Vec::new(),
             mint_class: None,
@@ -496,7 +495,6 @@ mod tests {
             class: vec![0],
             shallow: vec![0, 0],
             retained: vec![0, 0],
-            idom: vec![0, 0],
             first_child: vec![0, 0, 0],
             retainer: vec![0, 0],
             offsets: Vec::new(),

@@ -348,7 +348,6 @@ pub fn build_index(
             class: Vec::new(),
             shallow: Vec::new(),
             retained: Vec::new(),
-            idom: Vec::new(),
             first_child: vec![0],
             retainer: Vec::new(),
             offsets,
@@ -405,10 +404,6 @@ pub fn build_index(
     let class: Vec<u32> = orig.iter().map(|&o| class_of[o as usize]).collect();
     let shallow: Vec<u32> = orig.iter().map(|&o| shallow[o as usize]).collect();
     let retained: Vec<u64> = order.iter().map(|&v| retained[v as usize]).collect();
-    let idom: Vec<u32> = order
-        .iter()
-        .map(|&v| node_of[idom[v as usize] as usize])
-        .collect();
     drop((order, node_of, vertex));
     let retainer: Vec<u32> = orig
         .iter()
@@ -435,7 +430,6 @@ pub fn build_index(
         class,
         shallow,
         retained,
-        idom,
         first_child,
         retainer,
         offsets,
@@ -947,6 +941,37 @@ mod tests {
             let d = dominators(g, &weak, &no_cancel()).unwrap();
             assert_eq!(d.retained[1], sum, "seed {seed}");
         }
+    }
+
+    /// `HeapIndex::idom` is derived from the children ranges; check it against the oracle.
+    fn assert_idom_matches_oracle(snap: &FullSnapshot, what: &str) {
+        let g = graph_of(snap);
+        let weak = weak_classes(&g.classes);
+        let want = oracle(&adjacency(&g), &g.class_of, &weak);
+        let (_dir, a) = run(snap);
+        let ix = &a.index;
+        assert_eq!(ix.len(), want.rpo.len(), "{what}: reachable count");
+        assert_eq!(ix.idom(0), 0, "{what}: the root has no dominator");
+        let node_of: HashMap<u32, u32> = (0..ix.len() as u32).map(|n| (ix.orig(n), n)).collect();
+        for node in 1..ix.len() as u32 {
+            let o = ix.orig(node);
+            assert_eq!(
+                ix.orig(ix.idom(node)),
+                want.idom[o as usize],
+                "{what}: idom of object {o}"
+            );
+            assert_eq!(node_of[&o], node);
+        }
+    }
+
+    #[test]
+    fn derived_idom_matches_the_oracle() {
+        for seed in 0..40 {
+            assert_idom_matches_oracle(&random_snapshot(seed, 200), &format!("seed {seed}"));
+        }
+        let raw = std::fs::read(FIXTURE).expect("fixture");
+        let snap = crate::heap::format::decode_full(&raw).expect("decode");
+        assert_idom_matches_oracle(&snap, "fixture");
     }
 
     #[test]
