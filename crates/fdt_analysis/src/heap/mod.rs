@@ -1,9 +1,14 @@
 //! Dart heap snapshots: a streaming parser into a compact struct-of-arrays graph, a full
 //! decoder for tests and single-object reads, and an encoder (with a builder) for fixtures.
 
+pub mod dominators;
 pub mod encode;
 pub mod format;
 
+pub use dominators::{
+    Analysis, AnalyzeInput, Dominated, analyze, build_index, dominators, shortest_retainers,
+    weak_classes,
+};
 pub use encode::{SnapshotBuilder, encode_full};
 pub use format::{
     ClassDef, ExternalDef, FieldDef, FullSnapshot, Graph, HeapError, HeapHeader, Kind,

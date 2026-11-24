@@ -160,3 +160,40 @@ fn fixture_holds_the_leaky_screen_state() {
         + 1;
     assert!(snap.objects.iter().any(|o| o.class == state));
 }
+
+#[test]
+fn fixture_counts() {
+    use fdt_analysis::heap::{AnalyzeInput, analyze};
+    use fdt_store::heap::HeapFile;
+    use fdt_store::run::Mode;
+    use std::sync::Arc;
+
+    // The analysis keeps the file until its handle drops, and dropping deletes it: use a copy.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("fixture.dartheap");
+    std::fs::write(&path, bytes()).expect("copy the fixture");
+    let input = AnalyzeInput {
+        file: Arc::new(HeapFile::new(path)),
+        flutter_version: None,
+        mode: Mode::Profile,
+        root_package: None,
+    };
+    let started = std::time::Instant::now();
+    let a = analyze(&input, &AtomicBool::new(false), &mut |_| {}).expect("analyze");
+    eprintln!("analyze: {:?}", started.elapsed());
+    let s = &a.summary;
+    assert_eq!(s.objects, 167_031);
+    assert!(s.reachable < s.objects, "{} of {}", s.reachable, s.objects);
+    assert_eq!(a.index.len() as u64, s.reachable);
+    assert_eq!(a.index.retained(0), s.reachable_bytes);
+    // The redacted fixture's header is not the sum of its objects, so compare with the objects.
+    let all: u64 = decode_full(&bytes())
+        .unwrap()
+        .objects
+        .iter()
+        .map(|o| o.shallow)
+        .sum();
+    assert_eq!(s.reachable_bytes + s.unreachable_bytes, all);
+    let counted: u64 = s.classes.iter().map(|c| c.count).sum();
+    assert_eq!(counted, s.reachable);
+}
