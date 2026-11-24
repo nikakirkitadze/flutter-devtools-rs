@@ -72,6 +72,14 @@ pub fn dialog_window_actions(el: Div, shell: FocusHandle) -> Div {
     forward(el, &shell, ToggleFullScreen)
 }
 
+/// What was on screen, and focused, when the palette opened.
+struct PaletteReturn {
+    page: Page,
+    tab: PerfTab,
+    session: u64,
+    focused: Option<FocusHandle>,
+}
+
 /// A count shown beside a tool in the sidebar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ToolCount {
@@ -113,6 +121,9 @@ pub struct MainWindow {
     session_id: u64,
     /// The page changed: the next render takes the focus back to the shell first.
     page_changed: bool,
+    /// Where the focus was when the palette opened, put back when it closes with the page, tab
+    /// and session unchanged.
+    palette_return: Option<PaletteReturn>,
     _appearance: gpui_kit::Subscription,
     _session_subs: Vec<gpui_kit::Subscription>,
 }
@@ -248,6 +259,7 @@ impl MainWindow {
             was_connected,
             session_id,
             page_changed: false,
+            palette_return: None,
             _appearance: appearance,
             _session_subs: {
                 let mut subs = vec![observed, connected, selected, net_selected];
@@ -271,6 +283,8 @@ impl MainWindow {
             return;
         }
         self.history = NavHistory::new(Location::at(self.current().page));
+        // A new session empties the pages: what had the focus may no longer be drawn.
+        self.page_changed = true;
         // The location reset below clears the range and selection in both views. Each view then
         // notices the new session id in its own data (Logs on its first result, full or
         // first-phase; Network on its next job and snapshot) and drops its expansion, details
@@ -656,9 +670,35 @@ impl MainWindow {
     /// does not redraw every cached view; not while a dialog (the palette) has the focus, which
     /// goes back to the shell when it closes.
     fn take_focus_after_page_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if std::mem::take(&mut self.page_changed) && !window.has_active_dialog(cx) {
+        self.restore_focus_after_palette(window, cx);
+        if self.page_changed && !window.has_active_dialog(cx) {
+            self.page_changed = false;
             window.focus(&self.focus, cx);
             self.focus_start_if_current(window, cx);
+        }
+    }
+
+    /// The palette closed: puts the focus back where it was, unless the page, tab or session
+    /// changed (then the page-change path takes over), or a command placed the focus itself.
+    /// The palette hands the focus to the shell before it runs a command, so focus anywhere else
+    /// than on the shell, or on the palette's own input, was placed on purpose.
+    fn restore_focus_after_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette_return.is_none() || window.has_active_dialog(cx) {
+            return;
+        }
+        let Some(before) = self.palette_return.take() else {
+            return;
+        };
+        let unchanged = before.page == self.current().page
+            && before.tab == self.performance.read(cx).tab()
+            && before.session == self.session_id;
+        if !unchanged {
+            self.page_changed = true;
+            return;
+        }
+        let placed_elsewhere = window.focused(cx).is_some_and(|f| f != self.focus);
+        if !placed_elsewhere && let Some(handle) = before.focused {
+            window.focus(&handle, cx);
         }
     }
 
@@ -711,6 +751,14 @@ impl MainWindow {
     }
 
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !window.has_active_dialog(cx) {
+            self.palette_return = Some(PaletteReturn {
+                page: self.current().page,
+                tab: self.performance.read(cx).tab(),
+                session: self.session_id,
+                focused: window.focused(cx),
+            });
+        }
         let snapshot = self.session.read(cx).snapshot().clone();
         self.palette = Some(open_palette(
             cx.weak_entity(),
@@ -1986,5 +2034,150 @@ mod tests {
         cx.run_until_parked();
         let b = cx.update(|_, cx| shell.read_with(cx, chrome::strip_key));
         assert_ne!(a, b);
+    }
+
+    // ---- Focus across new sessions and the palette ----
+
+    fn focused(cx: &mut gpui_kit::VisualTestContext) -> Option<FocusHandle> {
+        cx.update(|window, cx| window.focused(cx))
+    }
+
+    fn chart_focus(
+        shell: &Entity<MainWindow>,
+        cx: &mut gpui_kit::VisualTestContext,
+    ) -> FocusHandle {
+        shell.read_with(cx, |s, cx| {
+            s.performance_view()
+                .read(cx)
+                .chart()
+                .read(cx)
+                .focus_handle()
+                .clone()
+        })
+    }
+
+    /// The new session's empty snapshot, as the capture publishes it after ⌘N.
+    fn start_new_session(
+        cx: &mut gpui_kit::VisualTestContext,
+        fake: &crate::test_support::FakeHandle,
+    ) {
+        press(cx, "cmd-n", "ctrl-n");
+        fake.snaps.send(snapshot(|_, _| {})).unwrap();
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+    }
+
+    fn assert_shell_shortcuts_work(
+        shell: &Entity<MainWindow>,
+        cx: &mut gpui_kit::VisualTestContext,
+    ) {
+        press(cx, "cmd-k", "ctrl-k");
+        assert!(palette_open(cx), "⌘K opens the palette");
+        cx.update(|window, cx| window.close_dialog(cx));
+        cx.run_until_parked();
+        press(cx, "cmd-1", "ctrl-1");
+        assert_eq!(page(shell, cx), Page::Tool(Tool::Timeline));
+    }
+
+    #[gpui_kit::test]
+    fn new_session_leaves_focus_on_a_drawn_element(cx: &mut TestAppContext) {
+        let (shell, cx, fake) = open_shell_fake(cx);
+        // Disconnected, on a page with nothing to focus.
+        start_new_session(cx, &fake);
+        assert_shell_shortcuts_work(&shell, cx);
+        // On the Frames tab with an idle app: the chart has the focus, then the new session
+        // empties it and it is no longer drawn.
+        fake.snaps.send(five_frames()).unwrap();
+        cx.run_until_parked();
+        press(cx, "cmd-2", "ctrl-2");
+        let chart = chart_focus(&shell, cx);
+        assert!(is_focused(cx, &chart), "the frame chart has the focus");
+        start_new_session(cx, &fake);
+        assert!(
+            !is_focused(cx, &chart),
+            "the chart is not drawn, so it must not keep the focus"
+        );
+        assert_shell_shortcuts_work(&shell, cx);
+    }
+
+    #[gpui_kit::test]
+    fn first_data_does_not_take_focus_from_the_palette(cx: &mut TestAppContext) {
+        let (shell, cx, fake) = open_shell_fake(cx);
+        fake.status.send(connected("demo", true)).unwrap();
+        cx.run_until_parked();
+        press(cx, "cmd-2", "ctrl-2");
+        press(cx, "cmd-k", "ctrl-k");
+        assert!(palette_open(cx));
+        let input = focused(cx).expect("the palette input has the focus");
+        fake.snaps.send(five_frames()).unwrap();
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+        let chart = chart_focus(&shell, cx);
+        assert!(!is_focused(cx, &chart), "the chart did not take the focus");
+        assert_eq!(focused(cx), Some(input));
+    }
+
+    #[gpui_kit::test]
+    fn canvas_keys_work_after_a_palette_command(cx: &mut TestAppContext) {
+        let (shell, cx) = open_shell_snapshot(cx, frames_demo());
+        press(cx, "cmd-1", "ctrl-1");
+        let tl = shell.read_with(cx, |s, _| s.timeline_view().clone());
+        let fit = tl.read_with(cx, |v, _| v.viewport());
+        run_command(cx, &shell, "Theme: Dark");
+        press(cx, "cmd-=", "ctrl-=");
+        let keyed = tl.read_with(cx, |v, _| v.viewport());
+        assert!(keyed.span_ns < fit.span_ns, "{keyed:?} vs {fit:?}");
+
+        press(cx, "cmd-2", "ctrl-2");
+        let chart = chart_focus(&shell, cx);
+        assert!(is_focused(cx, &chart));
+        run_command(cx, &shell, "Show Frames");
+        assert!(is_focused(cx, &chart), "the chart kept the focus");
+        let before = selected_frame(&shell, cx);
+        press(cx, "right", "right");
+        assert_ne!(selected_frame(&shell, cx), before);
+    }
+
+    #[gpui_kit::test]
+    fn tab_change_refocus_respects_the_palette(cx: &mut TestAppContext) {
+        let (shell, cx, fake) = open_shell_fake(cx);
+        fake.snaps.send(five_frames()).unwrap();
+        fake.status.send(connected("demo", true)).unwrap();
+        cx.run_until_parked();
+        press(cx, "cmd-2", "ctrl-2");
+        press(cx, "cmd-k", "ctrl-k");
+        let input = focused(cx).expect("the palette input has the focus");
+        fake.status
+            .send(crate::test_support::connected("again", true))
+            .unwrap();
+        shell.update(cx, |s, cx| {
+            s.performance_view()
+                .update(cx, |v, cx| v.set_tab(PerfTab::Trace, cx))
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+        assert!(palette_open(cx));
+        assert_eq!(focused(cx), Some(input), "the palette keeps the focus");
+    }
+
+    #[gpui_kit::test]
+    fn esc_after_connect_focuses_a_drawn_page(cx: &mut TestAppContext) {
+        let (shell, cx, fake, _apps) = crate::test_support::open_start(cx, Some(vec![]));
+        let start = shell.read_with(cx, |s, cx| {
+            s.start_page()
+                .expect("the Start page")
+                .read(cx)
+                .focus_handle(cx)
+        });
+        assert!(is_focused(cx, &start), "the Start list has the focus");
+        press(cx, "cmd-k", "ctrl-k");
+        fake.status.send(connected("demo", true)).unwrap();
+        cx.run_until_parked();
+        assert_eq!(page(&shell, cx), Page::Tool(Tool::Logs));
+        press(cx, "escape", "escape");
+        assert!(!palette_open(cx));
+        cx.update(|window, cx| window.render_frame(cx));
+        assert!(!is_focused(cx, &start), "the Start list is not drawn");
+        assert_shell_shortcuts_work(&shell, cx);
     }
 }

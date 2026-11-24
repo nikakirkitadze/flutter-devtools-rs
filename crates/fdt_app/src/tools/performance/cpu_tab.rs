@@ -9,6 +9,7 @@
 //! recompute.
 
 use super::flame::{FlameChart, FlameData, FlameEvent, MAX_SPANS, RECENT_NOTE, RECENT_NS};
+use crate::focus::PendingFocus;
 use crate::nav::TimeRange;
 use crate::session_model::SessionModel;
 use crate::tools::network::model::format_duration_ns;
@@ -376,7 +377,7 @@ pub struct CpuTab {
     range: Option<TimeRange>,
     /// Whether the CPU tab is on screen; nothing is computed otherwise.
     active: bool,
-    focus_pending: bool,
+    focus_pending: PendingFocus,
     /// The tree holds the keyboard focus (set by us), so it must hand it back when it goes.
     tree_focus: bool,
     /// Where the focus goes when the tree is no longer shown.
@@ -453,7 +454,7 @@ impl CpuTab {
             whole_session: false,
             range: None,
             active: false,
-            focus_pending: false,
+            focus_pending: PendingFocus::default(),
             tree_focus: false,
             focus: cx.focus_handle(),
             input,
@@ -619,7 +620,7 @@ impl CpuTab {
         if self.active != active {
             self.active = active;
             if active {
-                self.focus_pending = true;
+                self.focus_pending.request();
                 self.snap = self.session.read(cx).snapshot().clone();
                 self.sync(cx);
                 cx.notify();
@@ -1241,8 +1242,7 @@ impl Render for CpuTab {
             self.render_tree(cx)
         };
         let tree_shown = samples > 0 && self.has_result() && self.mode != CpuMode::Flame;
-        if tree_shown && self.focus_pending {
-            self.focus_pending = false;
+        if self.focus_pending.due(window, cx, tree_shown) {
             self.focus_tree(window, cx);
         } else if !tree_shown {
             let to = self.focus.clone();

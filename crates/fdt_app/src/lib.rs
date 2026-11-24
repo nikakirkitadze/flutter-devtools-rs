@@ -4,6 +4,7 @@ pub mod app;
 pub mod bench_ui;
 pub mod capture_host;
 pub mod facet;
+pub mod focus;
 pub mod keymap;
 pub mod logging;
 pub mod menus;

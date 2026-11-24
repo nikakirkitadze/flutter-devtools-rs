@@ -12,6 +12,7 @@ use super::lanes::{
     tooltip_text, wants_spans, worst_frame,
 };
 use crate::actions::{ZoomIn, ZoomOut, ZoomToFit};
+use crate::focus::PendingFocus;
 use crate::keymap::LANES_CONTEXT;
 use crate::nav::{Location, Page, Selection, TimeRange, Tool};
 use crate::session_model::SessionModel;
@@ -271,7 +272,7 @@ pub struct TimelineView {
     click_task: Option<Task<()>>,
     focus: FocusHandle,
     /// The page was just opened: the lanes take the focus when they are next drawn.
-    focus_pending: bool,
+    focus_pending: PendingFocus,
     _observe: Subscription,
 }
 
@@ -310,7 +311,7 @@ impl TimelineView {
             spans_task: None,
             click_task: None,
             focus: cx.focus_handle(),
-            focus_pending: false,
+            focus_pending: PendingFocus::default(),
             _observe: observe,
         };
         v.refresh_visible();
@@ -336,7 +337,7 @@ impl TimelineView {
     /// work without a click. (With no lanes there is nothing to focus; focus on an element that
     /// is not drawn would leave the keys with nowhere to go.)
     pub fn focus_when_shown(&mut self, cx: &mut Context<Self>) {
-        self.focus_pending = true;
+        self.focus_pending.request();
         cx.notify();
     }
 
@@ -985,6 +986,11 @@ impl Render for TimelineView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::perf::bump(crate::perf::Counter::TimelineView, 1);
         let t = *cx.tokens();
+        // Granted only to lanes that are drawn: with none, the request is dropped, so data that
+        // arrives later does not take the focus.
+        let lanes = self.focus.clone();
+        self.focus_pending
+            .take(window, cx, &lanes, !self.visible.is_empty());
         if self.visible.is_empty() {
             let connected = matches!(
                 self.session.read(cx).status(),
@@ -1018,9 +1024,6 @@ impl Render for TimelineView {
                         )),
                 )
                 .into_any_element();
-        }
-        if std::mem::take(&mut self.focus_pending) {
-            window.focus(&self.focus, cx);
         }
         // The page was resized: lay the lanes out for the new width.
         let width = self.plot_width();

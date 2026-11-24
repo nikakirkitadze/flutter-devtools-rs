@@ -10,6 +10,7 @@ use super::frames_table::{FramesList, ListEvent};
 use super::rebuilds_tab::RebuildsTab;
 use super::trace_tab::{SliceKey, TraceEvent, TraceView};
 use crate::facet::Facet;
+use crate::focus::PendingFocus;
 use crate::nav::{EntryId, Location, Page, Selection, TimeRange, Tool};
 use crate::session_model::SessionModel;
 use crate::shell::sidebar::tool_icon;
@@ -20,6 +21,7 @@ use fdt_ui::assets::icons;
 use fdt_ui::empty_state::EmptyState;
 use fdt_ui::theme::TokensExt as _;
 use fdt_ui::tokens::{alpha, font, layout, radius, space};
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{Icon, Sizable as _, Size};
 use gpui_kit::{
@@ -92,7 +94,7 @@ pub struct PerformanceView {
     page_active: bool,
     /// The page or a tab was just shown: the next render gives the tab's canvas the focus, so
     /// its keys work without a click.
-    focus_pending: bool,
+    focus_pending: PendingFocus,
     /// The tab changed: the next render takes the focus back to the page first.
     tab_changed: bool,
     _observe: Subscription,
@@ -144,7 +146,7 @@ impl PerformanceView {
             hover: None,
             following: true,
             page_active: false,
-            focus_pending: false,
+            focus_pending: PendingFocus::default(),
             tab_changed: false,
             _observe: observe,
             _subs: subs,
@@ -278,7 +280,11 @@ impl PerformanceView {
         if self.tab != tab {
             self.tab = tab;
             self.tab_changed = true;
-            self.focus_pending = self.page_active;
+            if self.page_active {
+                self.focus_pending.request();
+            } else {
+                self.focus_pending.cancel();
+            }
             self.refresh_active(cx);
             cx.notify();
         }
@@ -288,7 +294,11 @@ impl PerformanceView {
     pub fn set_page_active(&mut self, active: bool, cx: &mut Context<Self>) {
         if self.page_active != active {
             self.page_active = active;
-            self.focus_pending = active;
+            if active {
+                self.focus_pending.request();
+            } else {
+                self.focus_pending.cancel();
+            }
             self.refresh_active(cx);
             cx.notify();
         }
@@ -314,38 +324,31 @@ impl PerformanceView {
         }
     }
 
-    /// Gives the shown tab's canvas the focus: the frame chart, the Raw trace, or the CPU tab's
-    /// flame chart (the CPU tab focuses its own tree). A canvas that is not drawn yet (no data,
-    /// or its result is still computing) gets it once it is; focus on an element that is not
-    /// drawn would leave the keys with nowhere to go. Returns whether that is done.
-    fn focus_canvas(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let handle = match self.tab {
-            PerfTab::Frames => {
-                if self.session.read(cx).snapshot().frames.is_empty() {
-                    return false;
-                }
-                self.chart.read(cx).focus_handle().clone()
-            }
+    /// The shown tab's canvas and whether it is drawn: the frame chart, the Raw trace, or the
+    /// CPU tab's flame chart (the CPU tab focuses its own tree). `None` for a tab with no
+    /// canvas to focus. Focus on a canvas that is not drawn would leave the keys with nowhere to
+    /// go, so a canvas that is not drawn is never given it.
+    fn canvas_target(&self, cx: &Context<Self>) -> Option<(FocusHandle, bool)> {
+        match self.tab {
+            PerfTab::Frames => Some((
+                self.chart.read(cx).focus_handle().clone(),
+                !self.session.read(cx).snapshot().frames.is_empty(),
+            )),
             PerfTab::Trace => {
-                if self.trace.read(cx).is_empty() {
-                    return false;
-                }
-                self.trace.read(cx).focus_handle().clone()
+                let trace = self.trace.read(cx);
+                Some((trace.focus_handle().clone(), !trace.is_empty()))
             }
             PerfTab::Cpu => {
                 let cpu = self.cpu.read(cx);
-                if cpu.mode() != super::cpu_tab::CpuMode::Flame {
-                    return true;
-                }
-                if !cpu.flame_shown(cx) {
-                    return false;
-                }
-                cpu.flame().read(cx).focus_handle().clone()
+                (cpu.mode() == super::cpu_tab::CpuMode::Flame).then(|| {
+                    (
+                        cpu.flame().read(cx).focus_handle().clone(),
+                        cpu.flame_shown(cx),
+                    )
+                })
             }
-            PerfTab::Rebuilds => return true,
-        };
-        window.focus(&handle, cx);
-        true
+            PerfTab::Rebuilds => None,
+        }
     }
 
     fn refresh_active(&mut self, cx: &mut Context<Self>) {
@@ -620,11 +623,18 @@ impl Render for PerformanceView {
         crate::perf::bump(crate::perf::Counter::PerformanceView, 1);
         // The page takes the focus before the new tab does: the old tab's canvas, if it had it,
         // is no longer drawn, and keys sent to it would reach none of the shell's handlers.
-        if std::mem::take(&mut self.tab_changed) {
+        // Not from a dialog (the palette), which has the focus until it closes.
+        if self.tab_changed && !window.has_active_dialog(cx) {
+            self.tab_changed = false;
             window.focus(&self.focus, cx);
         }
-        if self.focus_pending && self.page_active && self.focus_canvas(window, cx) {
-            self.focus_pending = false;
+        if self.page_active {
+            match self.canvas_target(cx) {
+                Some((canvas, drawn)) => {
+                    self.focus_pending.take(window, cx, &canvas, drawn);
+                }
+                None => self.focus_pending.cancel(),
+            }
         }
         if self.tab != PerfTab::Cpu {
             let to = self.focus.clone();
