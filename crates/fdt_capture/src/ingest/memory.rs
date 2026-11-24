@@ -218,3 +218,74 @@ impl GcTracker {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fdt_store::clock::RunClock;
+
+    fn sink() -> super::super::Sink {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let clock = RunClock {
+            origin_host_us: 0,
+            skew_us: 0,
+            timeline_to_wall_us: 0,
+        };
+        super::super::Sink::new(RunId(1), clock, 1, 0, tx)
+    }
+
+    fn space(collections: u64, time_s: f64) -> HeapSpace {
+        HeapSpace {
+            used: 10,
+            capacity: 20,
+            external: 1,
+            collections,
+            time_s,
+        }
+    }
+
+    fn ev(group: &str, new: HeapSpace, old: HeapSpace) -> GcEvent {
+        GcEvent {
+            isolate_group: group.into(),
+            gc_type: "Scavenge".into(),
+            reason: None,
+            timestamp_ms: 5,
+            new_space: new,
+            old_space: old,
+        }
+    }
+
+    #[test]
+    fn duration_sums_the_spaces_that_grew() {
+        let (mut t, s) = (GcTracker::default(), sink());
+        let first = ev("g", space(1, 0.001), space(1, 0.002));
+        assert_eq!(t.record(&s, &first).unwrap().1.dur_us, None);
+        // Both spaces collected: 0.0004 + 0.0003 s.
+        let both = ev("g", space(2, 0.0014), space(2, 0.0023));
+        assert_eq!(t.record(&s, &both).unwrap().1.dur_us, Some(700));
+    }
+
+    #[test]
+    fn duration_of_an_old_space_only_gc_ignores_new_space_time() {
+        let (mut t, s) = (GcTracker::default(), sink());
+        t.record(&s, &ev("g", space(1, 0.001), space(1, 0.002)));
+        // New space's time moved but its count did not: only old space grew.
+        let old_only = ev("g", space(1, 0.0015), space(2, 0.0027));
+        assert_eq!(t.record(&s, &old_only).unwrap().1.dur_us, Some(700));
+    }
+
+    #[test]
+    fn a_new_group_starts_without_a_duration() {
+        let (mut t, s) = (GcTracker::default(), sink());
+        t.record(&s, &ev("g1", space(5, 0.5), space(5, 0.5)));
+        t.record(&s, &ev("g1", space(6, 0.6), space(5, 0.5)));
+        // After a hot restart the new group's counters start over.
+        let first = t.record(&s, &ev("g2", space(1, 0.0006), space(1, 0.0)));
+        assert_eq!(first.unwrap().1.dur_us, None);
+        // The same GC seen again is dropped.
+        assert!(
+            t.record(&s, &ev("g2", space(1, 0.0006), space(1, 0.0)))
+                .is_none()
+        );
+    }
+}

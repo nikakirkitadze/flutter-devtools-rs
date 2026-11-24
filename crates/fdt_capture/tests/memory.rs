@@ -28,6 +28,8 @@ struct Sim {
     rss_fails: bool,
     /// Whether the heap grows on every poll.
     growing: bool,
+    /// When (on the tokio clock) each memory poll arrived.
+    polls: std::sync::Mutex<Vec<std::time::Instant>>,
 }
 
 impl Sim {
@@ -36,6 +38,7 @@ impl Sim {
             heap: AtomicU64::new(1000),
             rss_fails,
             growing,
+            polls: Default::default(),
         })
     }
 
@@ -58,6 +61,7 @@ impl Sim {
                 "getVMTimeline" => Ok(json!({"type": "Timeline", "traceEvents": [],
                     "timeOriginMicros": 0, "timeExtentMicros": 0})),
                 "getIsolateGroupMemoryUsage" => {
+                    sim.polls.lock().unwrap().push(std::time::Instant::now());
                     let used = if sim.growing {
                         sim.heap.fetch_add(1000, Ordering::SeqCst)
                     } else {
@@ -146,6 +150,41 @@ fn gc_stream_is_subscribed_at_connect() {
     });
 }
 
+/// The real 500 ms default, read off the arrival stamps of five polls. (A paused clock does not
+/// work here: the runtime jumps to the next timer whenever it waits on the socket, before the
+/// poll's replies re-arm the interval, so the polls come out in no useful number.)
+#[test]
+fn memory_is_polled_every_500_ms() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let sim = Sim::new(true, false);
+        let server = sim.server();
+        let cfg = CaptureConfig {
+            memory_poll: CaptureConfig::default().memory_poll,
+            ..config()
+        };
+        let cap = start(&server, cfg, &rt);
+        common::eventually(Duration::from_secs(10), "five polls", || {
+            sim.polls.lock().unwrap().len() >= 5
+        })
+        .await;
+        let stamps = sim.polls.lock().unwrap().clone();
+        for pair in stamps.windows(2) {
+            let gap = pair[1] - pair[0];
+            assert!(
+                gap >= Duration::from_millis(450) && gap <= Duration::from_millis(1000),
+                "polls are 500 ms apart, not {gap:?}"
+            );
+        }
+        assert!(
+            calls(&server, "getIsolateGroupMemoryUsage")
+                .iter()
+                .all(|p| p["isolateGroupId"] == GROUP)
+        );
+        drop(cap);
+    });
+}
+
 #[test]
 fn memory_is_polled_with_the_main_isolate_group() {
     let rt = CaptureRuntime::new().unwrap();
@@ -227,14 +266,22 @@ fn gc_events_are_deduped_and_timed() {
                 gc_event(iso, GROUP, (11, 0.0106), (5, 0.0050), t + 10),
             );
         }
-        let s = common::wait_for(&cap, LIMIT, "two records", |s| s.memory.gcs().len() >= 2).await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let s2 = connected(&cap).await;
-        assert_eq!(s.memory.gcs().len().max(s2.memory.gcs().len()), 2);
-        let g = s2.memory.gcs();
+        // The barrier: a later GC that must be stored. Events arrive in order, so once it is
+        // here the second copy has been seen, and must not have produced a record.
+        note_gc(
+            &server,
+            gc_event("isolates/1", GROUP, (12, 0.0116), (5, 0.0050), t + 20),
+        );
+        let s = common::wait_for(&cap, LIMIT, "the barrier record", |s| {
+            s.memory.gcs().len() >= 3
+        })
+        .await;
+        let g = s.memory.gcs();
+        assert_eq!(g.len(), 3, "the second isolate's copy is not a record");
         assert_eq!(g.get(0).unwrap().dur_us, None);
         assert_eq!(g.get(1).unwrap().dur_us, Some(600));
         assert_eq!(g.get(1).unwrap().heap_used, 200);
+        assert_eq!(g.get(2).unwrap().dur_us, Some(1000));
         drop(cap);
     });
 }
@@ -251,19 +298,13 @@ fn other_isolate_groups_are_ignored() {
             &server,
             gc_event("isolates/9", "isolateGroups/9", (1, 0.1), (1, 0.1), t),
         );
+        // The barrier, after the event that must be ignored.
         note_gc(
             &server,
             gc_event("isolates/1", GROUP, (1, 0.1), (1, 0.1), t + 1),
         );
-        let s = common::wait_for(&cap, LIMIT, "one record", |s| !s.memory.gcs().is_empty()).await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let s = connected(&cap)
-            .await
-            .memory
-            .gcs()
-            .len()
-            .max(s.memory.gcs().len());
-        assert_eq!(s, 1);
+        let s = common::wait_for(&cap, LIMIT, "the barrier", |s| !s.memory.gcs().is_empty()).await;
+        assert_eq!(s.memory.gcs().len(), 1);
         drop(cap);
     });
 }
@@ -390,7 +431,13 @@ fn hot_restart_moves_polling_to_the_new_group() {
         })
         .await;
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(connected(&cap).await.memory.gcs().len(), 1);
+        let s = connected(&cap).await;
+        assert_eq!(s.memory.gcs().len(), 1);
+        assert_eq!(
+            s.memory.gcs().get(0).unwrap().dur_us,
+            None,
+            "a new group's first GC"
+        );
         // Profiles come from the new isolate.
         cap.fetch_allocation_profile(false);
         common::eventually(LIMIT, "a profile", || {
