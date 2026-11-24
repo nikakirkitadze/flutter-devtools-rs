@@ -33,6 +33,14 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 
+#[cfg(test)]
+thread_local! {
+    /// Binary-search probes of GC records made by layouts, for the cost test.
+    static GC_PROBES: Cell<usize> = const { Cell::new(0) };
+    /// Layouts made.
+    static LAYOUTS: Cell<usize> = const { Cell::new(0) };
+}
+
 /// Quads kept apart from the per-column ones: grid lines, snapshot markers and the drag band.
 const RESERVED_QUADS: usize = 256;
 /// A column is drawn with at most five quads (capacity, used, external, RSS and a GC tick).
@@ -165,8 +173,11 @@ impl ChartGeometry {
 }
 
 /// Lays the chart out for `vp` in a chart of `size` (width, height). Work is proportional to the
-/// width, the samples and GC records in view, and the snapshots; never to the whole session.
+/// width, the samples in view and the snapshots, and to the width times the log of the GC count for
+/// the GC ticks (binary searches; no GC record is visited one by one).
 pub fn chart_layout(mem: &MemorySnapshot, vp: Viewport, size: (f32, f32)) -> ChartGeometry {
+    #[cfg(test)]
+    LAYOUTS.with(|p| p.set(p.get() + 1));
     let (width, height) = size;
     let ok = width.is_finite() && height.is_finite() && width >= 1.0 && height > plot_top();
     let samples = mem.samples();
@@ -234,30 +245,45 @@ pub fn chart_layout(mem: &MemorySnapshot, vp: Viewport, size: (f32, f32)) -> Cha
         .map(|(v, label)| (geo.y_of(v), label))
         .collect();
 
-    // One tick per column of GCs.
-    let mut current: Option<(i64, bool, usize)> = None;
-    let flush = |cur: Option<(i64, bool, usize)>, geo: &mut ChartGeometry| {
-        if let Some((c, major, i)) = cur {
-            geo.gcs.push((c as f32 * pitch, major, i));
+    // One tick per column of GCs, by binary search: the first GC of each column is found by
+    // partition point, and "any major in the column" by the store's index of majors. The work
+    // is O(columns x log n), whatever the number of GCs in view.
+    let gc_view = mem.gc_range(in_view);
+    let first_in = |c: usize| -> usize {
+        if c >= n {
+            return gc_view.end;
         }
+        let (mut lo, mut hi) = (gc_view.start, gc_view.end);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            #[cfg(test)]
+            GC_PROBES.with(|p| p.set(p.get() + 1));
+            let before = mem
+                .gcs()
+                .get(mid)
+                .is_some_and(|g| col_of(g.time).clamp(0, n as i64 - 1) < c as i64);
+            if before {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
     };
-    for i in mem.gc_range(in_view) {
-        let Some(g) = mem.gcs().get(i) else { break };
-        let c = col_of(g.time).clamp(0, n as i64 - 1);
-        match current.as_mut() {
-            Some((cc, major, first)) if *cc == c => {
-                if g.kind.is_major() && !*major {
-                    *major = true;
-                    *first = i;
-                }
+    if !gc_view.is_empty() {
+        let mut lo = first_in(0);
+        for c in 0..n {
+            let hi = first_in(c + 1);
+            if lo < hi {
+                let (major, index) = match mem.major_in(lo..hi) {
+                    Some(i) => (true, i),
+                    None => (false, lo),
+                };
+                geo.gcs.push((c as f32 * pitch, major, index));
             }
-            _ => {
-                flush(current.take(), &mut geo);
-                current = Some((c, g.kind.is_major(), i));
-            }
+            lo = hi;
         }
     }
-    flush(current, &mut geo);
 
     geo.heaps = mem
         .heaps()
@@ -533,6 +559,20 @@ pub struct ChartTip(pub Option<(String, Point<Pixels>)>);
 impl EventEmitter<ChartTip> for MemoryChart {}
 impl EventEmitter<OpenLocation> for MemoryChart {}
 
+/// Everything a layout depends on. A publish that changes none of it (a log line, a request)
+/// does not lay the chart out again.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LayoutKey {
+    session: u64,
+    samples: usize,
+    gcs: usize,
+    heaps: usize,
+    /// Heaps whose time is known: a snapshot's marker moves when its first chunk arrives.
+    timed_heaps: usize,
+    viewport: Viewport,
+    size: (f32, f32),
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Drag {
     start_x: f32,
@@ -551,6 +591,12 @@ pub struct MemoryChart {
     follow: bool,
     size: Rc<Cell<(f32, f32)>>,
     laid_for: (f32, f32),
+    /// What the current geometry was laid out from.
+    laid_key: Option<LayoutKey>,
+    /// The Memory page is the current one.
+    active: bool,
+    /// The data changed while the page was hidden.
+    dirty: bool,
     geo: Arc<ChartGeometry>,
     drag: Option<Drag>,
     hover: Option<(f32, f32, Point<Pixels>)>,
@@ -573,6 +619,9 @@ impl MemoryChart {
             follow: true,
             size: Rc::new(Cell::new(FIRST_SIZE)),
             laid_for: (0.0, 0.0),
+            laid_key: None,
+            active: false,
+            dirty: true,
             geo: Arc::new(ChartGeometry::default()),
             drag: None,
             hover: None,
@@ -667,15 +716,54 @@ impl MemoryChart {
         self.sync(cx);
     }
 
-    /// Lays the chart out again; repaints only when the result differs.
+    fn layout_key(&self) -> LayoutKey {
+        let mem = &self.snap.memory;
+        LayoutKey {
+            session: self.snap.session,
+            samples: mem.samples().len(),
+            gcs: mem.gcs().len(),
+            heaps: mem.heaps().len(),
+            timed_heaps: mem.heaps().iter().filter(|h| h.time.is_some()).count(),
+            viewport: self.viewport,
+            size: self.size.get(),
+        }
+    }
+
+    /// Lays the chart out if its inputs changed. Whether the geometry differs.
+    fn relayout(&mut self) -> bool {
+        let key = self.layout_key();
+        self.dirty = false;
+        if self.laid_key == Some(key) {
+            return false;
+        }
+        self.laid_key = Some(key);
+        self.laid_for = key.size;
+        let geo = chart_layout(&self.snap.memory, self.viewport, key.size);
+        if *self.geo == geo {
+            return false;
+        }
+        self.geo = Arc::new(geo);
+        true
+    }
+
+    /// Lays the chart out again; repaints only when the result differs. While the page is hidden
+    /// nothing is laid out: the chart is marked, and catches up when it is shown.
     fn sync(&mut self, cx: &mut Context<Self>) {
-        let size = self.size.get();
-        self.laid_for = size;
-        let geo = chart_layout(&self.snap.memory, self.viewport, size);
-        if *self.geo != geo {
-            self.geo = Arc::new(geo);
+        if !self.active {
+            self.dirty = true;
+            return;
+        }
+        if self.relayout() {
             self.resolve_hover(cx);
             cx.notify();
+        }
+    }
+
+    /// The Memory page was shown or hidden.
+    pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        self.active = active;
+        if active && self.dirty {
+            self.sync(cx);
         }
     }
 
@@ -836,8 +924,7 @@ impl Render for MemoryChart {
         // The chart was resized since the last layout.
         let dims = self.size.get();
         if (dims.0 - self.laid_for.0).abs() >= 1.0 || (dims.1 - self.laid_for.1).abs() >= 1.0 {
-            self.laid_for = dims;
-            self.geo = Arc::new(chart_layout(&self.snap.memory, self.viewport, dims));
+            self.relayout();
         }
         let t = *cx.tokens();
         let geo = self.geo.clone();
@@ -1479,5 +1566,82 @@ mod tests {
         assert!(!exists(cx, "memory-chart-empty"));
         assert!(exists(cx, "memory-chart-legend"));
         let _ = shell;
+    }
+
+    /// GC records every 10 ms, a major one every 1,000th, over `n` of them.
+    fn gcs_only(n: u64) -> std::sync::Arc<fdt_store::Snapshot> {
+        snapshot(|w, run| {
+            w.push_memory_sample(run, sample(0, MB, 2 * MB, 0, None));
+            for i in 0..n {
+                let kind = if i % 1_000 == 999 {
+                    GcKind::MarkSweep
+                } else {
+                    GcKind::Scavenge
+                };
+                w.push_gc(run, gc(i * 10, kind));
+            }
+        })
+    }
+
+    #[test]
+    fn the_gc_ticks_cost_does_not_depend_on_the_gc_count() {
+        let probes = |n: u64| {
+            let snap = gcs_only(n);
+            let vp = Viewport::fit(0, n * 10 * MS);
+            GC_PROBES.with(|p| p.set(0));
+            let geo = chart_layout(&snap.memory, vp, (2_000.0, 160.0));
+            (GC_PROBES.with(Cell::get), geo)
+        };
+        let (small, _) = probes(2_000);
+        let (big, geo) = probes(180_000);
+        // Binary searches: one per column edge, each about log2(n) probes.
+        assert!(big <= 2_001 * 19, "{big} probes");
+        assert!(
+            big < small * 2,
+            "{small} probes for 2,000 GCs, {big} for 180,000"
+        );
+        // Exactness is kept: a major GC in a column marks it, with its own index.
+        let majors: Vec<usize> = geo.gcs.iter().filter(|g| g.1).map(|g| g.2).collect();
+        assert_eq!(majors.len(), 180);
+        assert!(majors.iter().all(|i| i % 1_000 == 999));
+        assert!(geo.gcs.windows(2).all(|w| w[0].0 < w[1].0));
+    }
+
+    #[gpui_kit::test]
+    fn layout_only_when_the_memory_data_changes_and_the_page_is_shown(cx: &mut TestAppContext) {
+        let (shell, cx, fake) = open_shell_fake(cx);
+        fake.status.send(connected("demo", true)).unwrap();
+        let (mut w, run) = crate::test_support::writer();
+        for i in 0..40u64 {
+            w.push_memory_sample(run, sample(i * 500, (10 + i) * MB, 80 * MB, 0, None));
+        }
+        let layouts = || LAYOUTS.with(Cell::get);
+        // Hidden: publishes lay nothing out.
+        let before = layouts();
+        fake.snaps.send(w.publish()).unwrap();
+        w.push_memory_sample(run, sample(20_000, 60 * MB, 80 * MB, 0, None));
+        fake.snaps.send(w.publish()).unwrap();
+        cx.run_until_parked();
+        assert_eq!(layouts(), before, "a hidden chart does not lay out");
+        // Shown: it catches up once (and once more for its measured size).
+        let chart = show(&shell, cx);
+        let shown = layouts() - before;
+        assert!((1..=2).contains(&shown), "{shown} layouts when shown");
+        assert!(!chart.read_with(cx, |c, _| c.geometry().columns.is_empty()));
+        // A publish with no memory change (a log line inside the span) lays nothing out.
+        let before = layouts();
+        w.push_log(crate::test_support::log_at(
+            run,
+            1_000,
+            fdt_store::logs::LogLevel::Info,
+        ));
+        fake.snaps.send(w.publish()).unwrap();
+        settle(cx);
+        assert_eq!(layouts(), before, "a log line does not lay the chart out");
+        // A new sample does.
+        w.push_memory_sample(run, sample(20_500, 61 * MB, 80 * MB, 0, None));
+        fake.snaps.send(w.publish()).unwrap();
+        settle(cx);
+        assert!(layouts() > before);
     }
 }

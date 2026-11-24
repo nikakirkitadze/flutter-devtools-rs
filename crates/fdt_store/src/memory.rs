@@ -171,6 +171,8 @@ pub(crate) struct MemoryStore {
     samples: Chunked<MemorySample>,
     last_sample: HashMap<RunId, MemorySample>,
     gcs: Chunked<GcRecord>,
+    /// The indices (into `gcs`) of the major GCs, ascending.
+    majors: Chunked<u32>,
     gc_lod: LodSeries,
     classes: Chunked<Arc<AllocClass>>,
     class_ids: ClassKeys,
@@ -189,6 +191,7 @@ impl MemoryStore {
             samples: Chunked::with_chunk(SAMPLE_CHUNK),
             last_sample: HashMap::new(),
             gcs: Chunked::with_chunk(GC_CHUNK),
+            majors: Chunked::with_chunk(GC_CHUNK),
             gc_lod: LodSeries::new(),
             classes: Chunked::with_chunk(CLASS_CHUNK),
             class_ids: HashMap::new(),
@@ -245,6 +248,10 @@ impl MemoryStore {
             return false;
         }
         self.gc_lod.insert(g.time, g.dur_us.unwrap_or(0));
+        if g.kind.is_major() {
+            self.majors
+                .push(u32::try_from(self.gcs.len()).unwrap_or(u32::MAX));
+        }
         self.gcs.push(g);
         true
     }
@@ -421,6 +428,7 @@ impl MemoryStore {
         MemorySnapshot {
             samples: self.samples.snapshot(),
             gcs: self.gcs.snapshot(),
+            majors: self.majors.snapshot(),
             gc_lod: self.gc_lod.snapshot(),
             classes: self.classes.snapshot(),
             profiles,
@@ -435,6 +443,7 @@ impl MemoryStore {
 pub struct MemorySnapshot {
     samples: ChunkedSnapshot<MemorySample>,
     gcs: ChunkedSnapshot<GcRecord>,
+    majors: ChunkedSnapshot<u32>,
     gc_lod: LodSnapshot,
     classes: ChunkedSnapshot<Arc<AllocClass>>,
     profiles: Arc<[Arc<AllocProfile>]>,
@@ -483,6 +492,24 @@ impl MemorySnapshot {
     /// The GC records whose end lies in `r`.
     pub fn gc_range(&self, r: TimeRange) -> Range<usize> {
         range_by_time(&self.gcs, r, |g| g.time)
+    }
+
+    /// The index of the first major GC (mark-sweep or mark-compact) whose index lies in
+    /// `indices`, by binary search over an index kept as records arrive: O(log n), however many
+    /// GCs there are.
+    pub fn major_in(&self, indices: Range<usize>) -> Option<usize> {
+        let (mut lo, mut hi) = (0, self.majors.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let at = self.majors.get(mid).map_or(usize::MAX, |&i| i as usize);
+            if at < indices.start {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let first = self.majors.get(lo).map(|&i| i as usize)?;
+        (first < indices.end).then_some(first)
     }
 
     /// `insert(end, dur_us)` per GC record.
@@ -692,6 +719,9 @@ mod tests {
         assert_eq!((count, max), (3, 700), "a missing duration inserts 0");
         let r = TimeRange::new(SessionTime(150 * MS), SessionTime(300 * MS));
         assert_eq!(s.memory.gc_range(r), 1..3);
+        assert_eq!(s.memory.major_in(0..4), Some(1));
+        assert_eq!(s.memory.major_in(0..1), None);
+        assert_eq!(s.memory.major_in(2..4), None);
         assert!(GcKind::from_vm("MarkCompact").is_major());
         assert!(!GcKind::from_vm("Scavenge").is_major());
         assert_eq!(GcKind::from_vm("StartCMark"), GcKind::StartMark);

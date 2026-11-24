@@ -199,6 +199,7 @@ impl MemoryView {
             return;
         }
         self.page_active = active;
+        self.chart.update(cx, |c, cx| c.set_active(active, cx));
         if active {
             self.focus_pending.request();
             cx.notify();
