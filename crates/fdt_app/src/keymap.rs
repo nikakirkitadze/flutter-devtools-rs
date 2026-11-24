@@ -4,8 +4,8 @@ use crate::actions::{
     AppListConnect, AppListNext, AppListPrev, ClearSelection, CloseWindow, Collapse, Expand,
     FocusSearch, FollowLatest, GoBack, GoForward, GoToFirst, Hide, HideOthers, Minimize,
     NewSession, NewWindow, NextFrame, OpenDetails, OpenPalette, OpenSettings, PreviousFrame, Quit,
-    SearchEverywhere, SelectNext, SelectPrevious, ShowShortcuts, ToggleExpand, ToggleFullScreen,
-    ToggleRecording, ZoomIn, ZoomOut, ZoomToFit,
+    SearchEverywhere, SelectNext, SelectPrevious, ShowShortcuts, TakeHeapSnapshot, ToggleExpand,
+    ToggleFullScreen, ToggleRecording, ZoomIn, ZoomOut, ZoomToFit,
 };
 use crate::nav::Tool;
 use gpui_kit::KeyBinding;
@@ -82,6 +82,11 @@ pub fn bindings() -> Vec<KeyBinding> {
         ),
         KeyBinding::new(platform("cmd-r", "ctrl-r"), ToggleRecording, shell),
         KeyBinding::new(platform("cmd-n", "ctrl-n"), NewSession, shell),
+        KeyBinding::new(
+            platform("cmd-shift-s", "ctrl-shift-s"),
+            TakeHeapSnapshot,
+            shell,
+        ),
         KeyBinding::new(platform("cmd-shift-n", "ctrl-shift-n"), NewWindow, None),
         KeyBinding::new(platform("cmd-,", "ctrl-,"), OpenSettings, None),
         KeyBinding::new(platform("cmd-q", "ctrl-q"), Quit, None),
@@ -262,5 +267,18 @@ mod tests {
     fn platform_picks_the_os_variant() {
         let expected = if cfg!(target_os = "macos") { "a" } else { "b" };
         assert_eq!(platform("a", "b"), expected);
+    }
+
+    #[test]
+    fn take_heap_snapshot_is_bound_in_the_shell_only() {
+        use crate::actions::TakeHeapSnapshot;
+        use gpui_kit::Action as _;
+        assert_eq!(
+            keys_of(TakeHeapSnapshot.name()),
+            [(
+                platform("cmd-shift-s", "ctrl-shift-s").to_string(),
+                Some(SHELL_CONTEXT.to_string())
+            )]
+        );
     }
 }

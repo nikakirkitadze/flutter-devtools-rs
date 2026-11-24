@@ -1,9 +1,10 @@
-//! Range-aware sidebar counts for Logs, Network and Performance, computed off the UI thread.
+//! Range-aware sidebar counts for Logs, Network, Performance and Memory, computed off the UI thread.
 
 use crate::nav::{TimeRange, Tool};
 use crate::shell::{MainWindow, ToolCount};
 use fdt_store::Snapshot;
 use fdt_store::frames::{FrameStatus, frame_status};
+use fdt_store::heap::{HeapRecord, HeapStage};
 use fdt_store::logs::LogLevel;
 use fdt_store::net_query::{NetFilter, NetTab, count_requests};
 use gpui_kit::{AppContext as _, Context};
@@ -79,6 +80,28 @@ fn slow_frames(snap: &Snapshot, range: Option<TimeRange>) -> (u64, bool) {
     ((hi - lo) as u64, janky)
 }
 
+/// The Memory count: the leak suspects of the newest analysed heap snapshot taken in `range`, or
+/// of the newest one overall when none was. Wants attention when there are any. With no range, a
+/// count of zero is left off; with a range, zero is shown. Reads the records, not the heaps.
+pub fn memory_count(snap: &Snapshot, range: Option<TimeRange>) -> Option<ToolCount> {
+    let at = |h: &&HeapRecord| h.time.unwrap_or(h.requested);
+    let mut ready = snap
+        .memory
+        .heaps()
+        .iter()
+        .filter(|h| h.stage == HeapStage::Ready);
+    // The records are in the order they were taken.
+    let newest = ready.clone().next_back();
+    let record = range
+        .and_then(|r| ready.rfind(|h| r.contains(at(h))))
+        .or(newest)?;
+    let value = u64::from(record.suspects());
+    (value > 0 || range.is_some()).then_some(ToolCount {
+        value,
+        attention: value > 0,
+    })
+}
+
 impl MainWindow {
     /// Recomputes the counts when the snapshot or range changed. Runs at most one job at a time;
     /// inputs that arrive meanwhile are picked up when it finishes.
@@ -119,7 +142,10 @@ impl MainWindow {
                 let Ok(Some((key, snap))) = next else { break };
                 started = Some(cx.background_executor().now());
                 let counts = cx
-                    .background_spawn(async move { range_counts(&snap, key.range) })
+                    .background_spawn(async move {
+                        let (logs, net, perf) = range_counts(&snap, key.range);
+                        (logs, net, perf, memory_count(&snap, key.range))
+                    })
                     .await;
                 done = Some(key);
                 let applied = this.update(cx, |this, cx| {
@@ -128,6 +154,7 @@ impl MainWindow {
                         all[Tool::Logs.index()] = counts.0;
                         all[Tool::Network.index()] = counts.1;
                         all[Tool::Performance.index()] = counts.2;
+                        all[Tool::Memory.index()] = counts.3;
                         this.set_counts(all, cx);
                     }
                 });
@@ -335,5 +362,89 @@ mod tests {
         let perf = shell.read_with(cx, |s, _| s.counts()[Tool::Performance.index()]);
         assert_eq!(perf.map(|c| c.value), Some(3));
         assert!(crate::test_support::exists(cx, "sidebar-count-performance"));
+    }
+
+    fn leaky(b: &mut fdt_analysis::heap::encode::SnapshotBuilder) {
+        let class = b.class("LeakyState", "package:app/leaky.dart", &[]);
+        let o = b.object(class, 32, fdt_analysis::heap::format::Value::None, &[]);
+        b.static_field("leaky", o);
+    }
+
+    fn suspects(n: u32) -> impl FnOnce(&mut fdt_store::heap::HeapSummary) {
+        move |s| s.findings_total = n
+    }
+
+    #[test]
+    fn memory_count_uses_the_latest_snapshot_in_range() {
+        use crate::test_support::heap_record_with;
+        // Snapshots at 1 s, 2 s and 3 s with 4, 0 and 2 suspects.
+        let snap = snapshot(|w, run| {
+            for n in [4, 0, 2] {
+                heap_record_with(w, run, leaky, suspects(n));
+            }
+        });
+        let at = |from: u64, to: u64| {
+            Some(TimeRange::new(
+                SessionTime(from * SEC),
+                SessionTime(to * SEC),
+            ))
+        };
+        // No range: the latest overall.
+        assert_eq!(
+            memory_count(&snap, None),
+            Some(ToolCount {
+                value: 2,
+                attention: true
+            })
+        );
+        // The latest one inside the range, whichever is newest overall.
+        assert_eq!(
+            memory_count(&snap, at(0, 1)),
+            Some(ToolCount {
+                value: 4,
+                attention: true
+            })
+        );
+        // A range with several: the newest of them. Zero is shown with a range, without
+        // attention.
+        assert_eq!(
+            memory_count(&snap, at(1, 2)),
+            Some(ToolCount {
+                value: 0,
+                attention: false
+            })
+        );
+        // No snapshot in the range: the latest overall.
+        assert_eq!(memory_count(&snap, at(10, 20)).map(|c| c.value), Some(2));
+        // Nothing to count: no snapshot, or none analysed yet.
+        assert_eq!(memory_count(&Snapshot::empty(), None), None);
+        let pending = snapshot(|w, run| {
+            w.heap_requested(run, "isolates/1", SessionTime(SEC));
+        });
+        assert_eq!(memory_count(&pending, at(0, 5)), None);
+        // Zero without a range is left off, like the other tools.
+        let clean = snapshot(|w, run| {
+            heap_record_with(w, run, leaky, suspects(0));
+        });
+        assert_eq!(memory_count(&clean, None), None);
+    }
+
+    #[gpui_kit::test]
+    fn the_sidebar_shows_the_memory_count(cx: &mut gpui_kit::TestAppContext) {
+        use crate::test_support::heap_record_with;
+        let snap = snapshot(|w, run| {
+            heap_record_with(w, run, leaky, suspects(3));
+        });
+        let (shell, cx) = open_shell_snapshot(cx, snap);
+        cx.run_until_parked();
+        let count = shell.read_with(cx, |s, _| s.counts()[Tool::Memory.index()]);
+        assert_eq!(
+            count,
+            Some(ToolCount {
+                value: 3,
+                attention: true
+            })
+        );
+        assert!(crate::test_support::exists(cx, "sidebar-count-memory"));
     }
 }

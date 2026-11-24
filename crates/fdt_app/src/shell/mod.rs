@@ -21,9 +21,10 @@ use crate::actions::{
     UseSystemTheme, Zoom,
 };
 use crate::actions::{
-    FetchCpuSamples, NextFrame, NextSlowFrame, PreviousFrame, PreviousSlowFrame, ShowCpuTab,
-    ShowFramesTab, ShowRebuildsTab, ShowTraceTab, ToggleTraceWidgetBuilds, ZoomIn, ZoomOut,
-    ZoomToFit,
+    CancelHeapSnapshot, FetchCpuSamples, NextFrame, NextSlowFrame, PreviousFrame,
+    PreviousSlowFrame, RefreshAllocationProfile, RemoveHeapSnapshot, ShowClassesTab, ShowCpuTab,
+    ShowFramesTab, ShowLeaksTab, ShowRebuildsTab, ShowSnapshotTab, ShowTraceTab, TakeHeapSnapshot,
+    ToggleTraceWidgetBuilds, UseAsBaseline, ZoomIn, ZoomOut, ZoomToFit,
 };
 use crate::capture_host::{CaptureControl, CaptureHost, CaptureHostFailure};
 use crate::keymap::SHELL_CONTEXT;
@@ -33,6 +34,7 @@ use crate::palette::view::open_palette;
 use crate::session_model::{SessionEvent, SessionModel};
 use crate::settings::{settings, update_settings};
 use crate::tools::logs::{LogsEvent, LogsView};
+use crate::tools::memory::{MemoryTab, MemoryView};
 use crate::tools::network::{NetworkEvent, NetworkView};
 use crate::tools::performance::{PerfTab, PerformanceView, adjacent_slow};
 use crate::tools::timeline::TimelineView;
@@ -111,6 +113,8 @@ pub struct MainWindow {
     performance: Entity<PerformanceView>,
     /// The Timeline page, kept for the life of the window.
     timeline: Entity<TimelineView>,
+    /// The Memory page, kept for the life of the window.
+    memory: Entity<MemoryView>,
     _host_wait: Option<gpui_kit::Subscription>,
     /// Redraws the window when the device watch's status changes (the Settings page shows it).
     _device_status_task: Option<gpui_kit::Task<()>>,
@@ -195,6 +199,7 @@ impl MainWindow {
         });
         let performance = cx.new(|cx| PerformanceView::new(session.clone(), window, cx));
         let timeline = cx.new(|cx| TimelineView::new(session.clone(), window, cx));
+        let memory = cx.new(|cx| MemoryView::new(session.clone(), window, cx));
         // Any tool view can ask to open somewhere else; the shell keeps a Back step.
         let open =
             |this: &mut Self, event: &OpenLocation, window: &mut Window, cx: &mut Context<Self>| {
@@ -253,6 +258,7 @@ impl MainWindow {
             network,
             performance,
             timeline,
+            memory,
             _host_wait: host_wait,
             _device_status_task: None,
             _host_failed_wait: host_failed_wait,
@@ -283,6 +289,7 @@ impl MainWindow {
             return;
         }
         self.history = NavHistory::new(Location::at(self.current().page));
+        self.memory.update(cx, |m, cx| m.reset(cx));
         // A new session empties the pages: what had the focus may no longer be drawn.
         self.page_changed = true;
         // The location reset below clears the range and selection in both views. Each view then
@@ -412,6 +419,57 @@ impl MainWindow {
         });
         self.timeline
             .update(cx, |timeline, cx| timeline.set_location(loc.range, cx));
+        let on_memory = loc.page == Page::Tool(Tool::Memory) && self.memory_routed(cx);
+        self.memory.update(cx, |memory, cx| {
+            memory.set_page_active(on_memory, cx);
+            memory.set_location(loc.range, loc.selection, cx);
+        });
+    }
+
+    /// Whether the Memory page shows its view: the store has memory data, or an app is
+    /// connected. Data stays when the app goes (§10.5).
+    fn memory_routed(&self, cx: &App) -> bool {
+        let session = self.session.read(cx);
+        let memory = &session.snapshot().memory;
+        !memory.samples().is_empty()
+            || !memory.gcs().is_empty()
+            || !memory.profiles().is_empty()
+            || !memory.heaps().is_empty()
+            || matches!(session.status(), ConnStatus::Connected { .. })
+    }
+
+    /// Shows a Memory tab, going to the page first.
+    fn show_memory_tab(&mut self, tab: MemoryTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.show(Tool::Memory, window, cx);
+        self.memory.update(cx, |memory, cx| memory.set_tab(tab, cx));
+    }
+
+    /// ⌘⇧S: opens Memory › Leaks with a Back step, where the snapshot's progress and result are,
+    /// then asks the capture for a snapshot. Without an app it does nothing. While one is being
+    /// taken or analysed it only opens the page.
+    fn take_heap_snapshot(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let session = self.session.read(cx);
+        if !matches!(session.status(), ConnStatus::Connected { .. }) {
+            return;
+        }
+        let busy = session.snapshot().memory.busy().is_some();
+        self.show_memory_tab(MemoryTab::Leaks, window, cx);
+        if !busy {
+            self.with_control(cx, |c| c.take_heap_snapshot());
+        }
+    }
+
+    /// The heap snapshot a command acts on: the selected one, else the held one.
+    fn target_heap(&self, cx: &App) -> Option<fdt_store::heap::HeapId> {
+        self.current()
+            .selection
+            .and_then(Selection::heap)
+            .or_else(|| self.session.read(cx).snapshot().memory.held())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn memory_view(&self) -> &Entity<MemoryView> {
+        &self.memory
     }
 
     /// Shows a Performance tab, going to the page first.
@@ -880,6 +938,10 @@ impl Render for MainWindow {
                 tool_page::render_with(Tool::Performance, strip, self.performance.clone())
                     .into_any_element()
             }
+            Page::Tool(Tool::Memory) if self.memory_routed(cx) => {
+                let strip = self.strip_view();
+                tool_page::render_with(Tool::Memory, strip, self.memory.clone()).into_any_element()
+            }
             Page::Tool(tool) => {
                 let strip = self.strip_view();
                 tool_page::render(tool, strip, cx).into_any_element()
@@ -937,6 +999,34 @@ impl Render for MainWindow {
             }))
             .on_action(cx.listener(|this, _: &ShowTraceTab, w, cx| {
                 this.show_perf_tab(PerfTab::Trace, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowClassesTab, w, cx| {
+                this.show_memory_tab(MemoryTab::Classes, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowLeaksTab, w, cx| {
+                this.show_memory_tab(MemoryTab::Leaks, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowSnapshotTab, w, cx| {
+                this.show_memory_tab(MemoryTab::Snapshot, w, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &TakeHeapSnapshot, w, cx| this.take_heap_snapshot(w, cx)),
+            )
+            .on_action(cx.listener(|this, _: &CancelHeapSnapshot, _, cx| {
+                this.with_control(cx, |c| c.cancel_heap_snapshot());
+            }))
+            .on_action(cx.listener(|this, _: &RefreshAllocationProfile, _, cx| {
+                this.with_control(cx, |c| c.fetch_allocation_profile(false));
+            }))
+            .on_action(cx.listener(|this, _: &UseAsBaseline, _, cx| {
+                if let Some(id) = this.target_heap(cx) {
+                    this.with_control(cx, |c| c.set_heap_baseline(Some(id)));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &RemoveHeapSnapshot, _, cx| {
+                if let Some(id) = this.target_heap(cx) {
+                    this.with_control(cx, |c| c.remove_heap_snapshot(id));
+                }
             }))
             .on_action(
                 cx.listener(|this, _: &NextSlowFrame, w, cx| this.step_slow_frame(true, w, cx)),
@@ -1760,9 +1850,9 @@ mod tests {
         assert!(exists(cx, "performance-view"));
         assert!(exists(cx, "perf-tabs"));
         assert!(!exists(cx, "empty-state-performance"));
-        // Memory, Widgets and State are still not built.
-        press(cx, "cmd-3", "ctrl-3");
-        assert!(exists(cx, "empty-state-memory"));
+        // Widgets and State are still not built.
+        press(cx, "cmd-6", "ctrl-6");
+        assert!(exists(cx, "empty-state-widgets"));
     }
 
     /// Disconnected, with logs and requests but no frames (an app that never drew): the
@@ -2179,5 +2269,282 @@ mod tests {
         cx.update(|window, cx| window.render_frame(cx));
         assert!(!is_focused(cx, &start), "the Start list is not drawn");
         assert_shell_shortcuts_work(&shell, cx);
+    }
+
+    // ---- Memory ----
+
+    use crate::tools::memory::MemoryTab;
+
+    /// A heap with one user class, for tests that only need a stored snapshot.
+    fn tiny_heap(b: &mut fdt_analysis::heap::encode::SnapshotBuilder) {
+        let class = b.class("Thing", "package:app/thing.dart", &[]);
+        let o = b.object(class, 32, fdt_analysis::heap::format::Value::None, &[]);
+        b.static_field("thing", o);
+    }
+
+    fn memory_tab(shell: &Entity<MainWindow>, cx: &mut gpui_kit::VisualTestContext) -> MemoryTab {
+        shell.read_with(cx, |s, cx| s.memory_view().read(cx).tab())
+    }
+
+    #[gpui_kit::test]
+    fn memory_routes_when_connected(cx: &mut TestAppContext) {
+        let (_shell, cx, fake) = open_shell_fake(cx);
+        press(cx, "cmd-3", "ctrl-3");
+        assert!(exists(cx, "empty-state-memory"));
+        assert!(!exists(cx, "memory-view"));
+        fake.status.send(connected("demo", true)).unwrap();
+        cx.run_until_parked();
+        assert!(exists(cx, "memory-view"));
+        assert!(!exists(cx, "empty-state-memory"));
+        assert!(exists(cx, "memory-tabs"));
+        assert!(exists(cx, "memory-take-snapshot"));
+        // The chart and the Leaks tab each show an empty state.
+        assert!(exists(cx, "memory-chart-empty"));
+        assert!(exists(cx, "memory-leaks-empty"));
+    }
+
+    #[gpui_kit::test]
+    fn memory_routes_when_the_store_has_memory_data(cx: &mut TestAppContext) {
+        let snap = snapshot(|w, run| {
+            crate::test_support::heap_record(w, run, tiny_heap);
+        });
+        let (_shell, cx) = open_shell_snapshot(cx, snap);
+        press(cx, "cmd-3", "ctrl-3");
+        assert!(exists(cx, "memory-view"));
+        assert!(exists(cx, "memory-leaks-placeholder"));
+    }
+
+    #[gpui_kit::test]
+    fn default_tab_is_leaks(cx: &mut TestAppContext) {
+        let (shell, cx, fake) = open_shell_fake(cx);
+        fake.status.send(connected("demo", true)).unwrap();
+        cx.run_until_parked();
+        press(cx, "cmd-3", "ctrl-3");
+        assert_eq!(memory_tab(&shell, cx), MemoryTab::Leaks);
+        assert!(exists(cx, "memory-tab-leaks"));
+        // Opening the page asks the app for nothing.
+        assert!(!fake.commands().iter().any(|c| c.starts_with("heap_")));
+        assert!(!fake.commands().iter().any(|c| c.starts_with("alloc_")));
+        let labels: Vec<_> = MemoryTab::ALL.iter().map(|t| t.label()).collect();
+        assert_eq!(labels, ["Classes", "Leaks", "Snapshot"]);
+    }
+
+    #[gpui_kit::test]
+    fn cmd_shift_s_opens_leaks_and_takes_a_snapshot(cx: &mut TestAppContext) {
+        let (shell, cx, fake) = open_shell_fake(cx);
+        fake.status.send(connected("demo", true)).unwrap();
+        cx.run_until_parked();
+        assert_eq!(page(&shell, cx), Page::Tool(Tool::Logs));
+        // Whatever tab was last shown, the shortcut lands on Leaks.
+        shell.update(cx, |s, cx| {
+            s.memory_view()
+                .update(cx, |v, cx| v.set_tab(MemoryTab::Classes, cx))
+        });
+        press(cx, "cmd-shift-s", "ctrl-shift-s");
+        assert_eq!(page(&shell, cx), Page::Tool(Tool::Memory));
+        assert_eq!(memory_tab(&shell, cx), MemoryTab::Leaks);
+        let takes = fake.commands().iter().filter(|c| *c == "heap_take").count();
+        assert_eq!(takes, 1);
+        // Back returns to the page the shortcut was pressed on.
+        press(cx, "cmd-[", "ctrl-[");
+        assert_eq!(page(&shell, cx), Page::Tool(Tool::Logs));
+    }
+
+    #[gpui_kit::test]
+    fn cmd_shift_s_only_opens_the_page_while_a_snapshot_is_in_flight(cx: &mut TestAppContext) {
+        use fdt_store::heap::HeapStage;
+        let (shell, cx, fake) = open_shell_fake(cx);
+        fake.status.send(connected("demo", true)).unwrap();
+        let busy = snapshot(|w, run| {
+            let id = w.heap_requested(run, "isolates/1", SessionTime(1));
+            w.set_heap_stage(
+                id,
+                HeapStage::Receiving {
+                    bytes: 10,
+                    chunks: 1,
+                },
+            );
+        });
+        fake.snaps.send(busy).unwrap();
+        cx.run_until_parked();
+        press(cx, "cmd-shift-s", "ctrl-shift-s");
+        assert_eq!(page(&shell, cx), Page::Tool(Tool::Memory));
+        assert!(!fake.commands().contains(&"heap_take".to_string()));
+    }
+
+    #[gpui_kit::test]
+    fn cmd_shift_s_does_nothing_when_disconnected(cx: &mut TestAppContext) {
+        let (shell, cx, fake) = open_shell_fake(cx);
+        press(cx, "cmd-5", "ctrl-5");
+        let before = shell.read_with(cx, |s, _| s.history().back_len());
+        press(cx, "cmd-shift-s", "ctrl-shift-s");
+        assert_eq!(page(&shell, cx), Page::Tool(Tool::Logs));
+        assert_eq!(shell.read_with(cx, |s, _| s.history().back_len()), before);
+        assert!(fake.commands().iter().all(|c| c != "heap_take"));
+    }
+
+    #[gpui_kit::test]
+    fn the_snapshot_button_does_nothing_without_an_app(cx: &mut TestAppContext) {
+        let snap = snapshot(|w, run| {
+            crate::test_support::heap_record(w, run, tiny_heap);
+        });
+        let (shell, cx) = open_shell_snapshot(cx, snap);
+        press(cx, "cmd-3", "ctrl-3");
+        assert!(exists(cx, "memory-take-snapshot"));
+        assert_eq!(
+            crate::tools::memory::TAKE_SNAPSHOT_TIP,
+            "Connect to an app to take a heap snapshot."
+        );
+        let before = shell.read_with(cx, |s, _| s.history().back_len());
+        cx.update(|window, cx| window.click("memory-take-snapshot", cx));
+        cx.run_until_parked();
+        assert_eq!(page(&shell, cx), Page::Tool(Tool::Memory));
+        assert_eq!(shell.read_with(cx, |s, _| s.history().back_len()), before);
+    }
+
+    #[gpui_kit::test]
+    fn the_snapshot_button_takes_a_snapshot_when_connected(cx: &mut TestAppContext) {
+        let (_shell, cx, fake) = open_shell_fake(cx);
+        fake.status.send(connected("demo", true)).unwrap();
+        cx.run_until_parked();
+        press(cx, "cmd-3", "ctrl-3");
+        cx.update(|window, cx| window.click("memory-take-snapshot", cx));
+        cx.run_until_parked();
+        assert!(fake.commands().contains(&"heap_take".to_string()));
+    }
+
+    #[gpui_kit::test]
+    fn memory_selections_survive_back_and_forward(cx: &mut TestAppContext) {
+        use fdt_store::heap::HeapId;
+        let snap = snapshot(|w, run| {
+            crate::test_support::heap_record(w, run, tiny_heap);
+        });
+        let (shell, cx) = open_shell_snapshot(cx, snap);
+        press(cx, "cmd-3", "ctrl-3");
+        let heap = HeapId(0);
+        let picks = [
+            (Selection::Heap(heap), MemoryTab::Snapshot),
+            (Selection::HeapNode { heap, node: 4 }, MemoryTab::Snapshot),
+            (Selection::Leak { heap, finding: 2 }, MemoryTab::Leaks),
+            (Selection::Growth { heap, index: 1 }, MemoryTab::Leaks),
+            (
+                Selection::AllocClass(crate::nav::AllocClassId(5)),
+                MemoryTab::Classes,
+            ),
+        ];
+        let view = shell.read_with(cx, |s, _| s.memory_view().clone());
+        for (sel, tab) in picks {
+            let mut to = shell.read_with(cx, |s, _| s.current().clone());
+            to.selection = Some(sel);
+            shell.update_in(cx, |s, w, cx| s.navigate(to, w, cx));
+            assert_eq!(view.read_with(cx, |v, _| v.selection()), Some(sel));
+            assert_eq!(view.read_with(cx, |v, _| v.tab()), tab);
+        }
+        let selected =
+            |cx: &mut gpui_kit::VisualTestContext| view.read_with(cx, |v, _| v.selection());
+        // Back through the picks, then forward again.
+        for (sel, _) in picks.iter().rev().skip(1) {
+            press(cx, "cmd-[", "ctrl-[");
+            assert_eq!(selected(cx), Some(*sel));
+        }
+        press(cx, "cmd-[", "ctrl-[");
+        assert_eq!(selected(cx), None);
+        for (sel, _) in picks {
+            press(cx, "cmd-]", "ctrl-]");
+            assert_eq!(selected(cx), Some(sel));
+        }
+        // Another tool's page drops the selection.
+        press(cx, "cmd-5", "ctrl-5");
+        assert_eq!(selected(cx), None);
+    }
+
+    #[gpui_kit::test]
+    fn new_session_resets_memory(cx: &mut TestAppContext) {
+        use fdt_store::heap::HeapId;
+        let (shell, cx, fake) = open_shell_fake(cx);
+        fake.status.send(connected("demo", true)).unwrap();
+        fake.snaps.send(snapshot(|_, _| {})).unwrap();
+        cx.run_until_parked();
+        press(cx, "cmd-3", "ctrl-3");
+        let mut to = shell.read_with(cx, |s, _| s.current().clone());
+        to.selection = Some(Selection::Heap(HeapId(0)));
+        to.range = Some(range());
+        shell.update_in(cx, |s, w, cx| s.navigate(to, w, cx));
+        let view = shell.read_with(cx, |s, _| s.memory_view().clone());
+        assert_eq!(view.read_with(cx, |v, _| v.tab()), MemoryTab::Snapshot);
+        assert!(shell.read_with(cx, |s, _| s.history().can_go_back()));
+        press(cx, "cmd-n", "ctrl-n");
+        fake.snaps.send(snapshot(|_, _| {})).unwrap();
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |v, _| v.tab()), MemoryTab::Leaks);
+        assert_eq!(view.read_with(cx, |v, _| v.selection()), None);
+        assert_eq!(view.read_with(cx, |v, _| v.range()), None);
+        assert!(!shell.read_with(cx, |s, _| s.history().can_go_back()));
+        assert_eq!(page(&shell, cx), Page::Tool(Tool::Memory));
+    }
+
+    #[gpui_kit::test]
+    fn memory_commands_reach_the_capture(cx: &mut TestAppContext) {
+        use fdt_store::heap::HeapId;
+        let (shell, cx, fake) = open_shell_fake(cx);
+        let snap = snapshot(|w, run| {
+            crate::test_support::heap_record(w, run, tiny_heap);
+            crate::test_support::heap_record(w, run, tiny_heap);
+        });
+        fake.snaps.send(snap).unwrap();
+        fake.status.send(connected("demo", true)).unwrap();
+        cx.run_until_parked();
+        // The held snapshot is the newest.
+        run_command(cx, &shell, "Use as baseline");
+        run_command(cx, &shell, "Refresh allocation profile");
+        run_command(cx, &shell, "Cancel heap snapshot");
+        // A selected snapshot wins over the held one.
+        press(cx, "cmd-3", "ctrl-3");
+        let mut to = shell.read_with(cx, |s, _| s.current().clone());
+        to.selection = Some(Selection::Heap(HeapId(0)));
+        shell.update_in(cx, |s, w, cx| s.navigate(to, w, cx));
+        run_command(cx, &shell, "Remove heap snapshot");
+        let log = fake.commands();
+        for want in [
+            "heap_baseline 1",
+            "alloc_profile false",
+            "heap_cancel",
+            "heap_remove 0",
+        ] {
+            assert!(log.contains(&want.to_string()), "{want} in {log:?}");
+        }
+        // The tab commands switch tab and page.
+        run_command(cx, &shell, "Show classes");
+        assert_eq!(memory_tab(&shell, cx), MemoryTab::Classes);
+        run_command(cx, &shell, "Show heap snapshot");
+        assert_eq!(memory_tab(&shell, cx), MemoryTab::Snapshot);
+        run_command(cx, &shell, "Show leaks");
+        assert_eq!(memory_tab(&shell, cx), MemoryTab::Leaks);
+    }
+
+    #[gpui_kit::test]
+    fn the_palette_lists_heap_snapshots_and_opens_them(cx: &mut TestAppContext) {
+        use fdt_store::heap::HeapId;
+        let snap = snapshot(|w, run| {
+            crate::test_support::heap_record(w, run, tiny_heap);
+        });
+        let (shell, cx) = open_shell_snapshot(cx, snap);
+        press(cx, "cmd-k", "ctrl-k");
+        cx.simulate_input("Heap snapshot #1");
+        cx.run_until_parked();
+        let top = shell.read_with(cx, |s, cx| {
+            s.palette().unwrap().read(cx).item(0).label.clone()
+        });
+        assert!(
+            top.starts_with("Heap snapshot #1 \u{b7} 0:01 \u{b7} "),
+            "{top}"
+        );
+        press(cx, "enter", "enter");
+        assert_eq!(page(&shell, cx), Page::Tool(Tool::Memory));
+        let view = shell.read_with(cx, |s, _| s.memory_view().clone());
+        assert_eq!(
+            view.read_with(cx, |v, _| v.selection()),
+            Some(Selection::Heap(HeapId(0)))
+        );
     }
 }

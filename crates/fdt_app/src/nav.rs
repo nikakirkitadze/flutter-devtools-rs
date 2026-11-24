@@ -62,6 +62,8 @@ pub enum Page {
     Settings,
 }
 
+pub use fdt_store::heap::HeapId;
+pub use fdt_store::memory::AllocClassId;
 pub use fdt_store::time::{EntryId, SessionTime, TimeRange};
 
 /// The selected record. Ids carry their run, so a selection survives a reconnect.
@@ -72,6 +74,48 @@ pub enum Selection {
     Socket(EntryId),
     /// A frame in the Performance tool.
     Frame(EntryId),
+    /// A heap snapshot in the Memory tool.
+    Heap(HeapId),
+    /// An object of a heap snapshot, by its node in the dominator tree.
+    HeapNode {
+        heap: HeapId,
+        node: u32,
+    },
+    /// A leak finding of a heap snapshot, by its index in the snapshot's findings.
+    Leak {
+        heap: HeapId,
+        finding: u32,
+    },
+    /// A class that grew since the baseline: `index` counts the user classes, then the
+    /// lifecycle classes.
+    Growth {
+        heap: HeapId,
+        index: u32,
+    },
+    /// A class of the allocation profile.
+    AllocClass(AllocClassId),
+}
+
+impl Selection {
+    /// The heap snapshot the selection belongs to, if it is one of the Memory tool's.
+    pub fn heap(self) -> Option<HeapId> {
+        match self {
+            Selection::Heap(heap)
+            | Selection::HeapNode { heap, .. }
+            | Selection::Leak { heap, .. }
+            | Selection::Growth { heap, .. } => Some(heap),
+            Selection::Log(_)
+            | Selection::Request(_)
+            | Selection::Socket(_)
+            | Selection::Frame(_)
+            | Selection::AllocClass(_) => None,
+        }
+    }
+
+    /// Whether the Memory tool shows this selection.
+    pub fn is_memory(self) -> bool {
+        self.heap().is_some() || matches!(self, Selection::AllocClass(_))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -222,6 +266,24 @@ mod tests {
 
     fn tl(t: Tool) -> Location {
         Location::at(Page::Tool(t))
+    }
+
+    #[test]
+    fn memory_selections_know_their_heap() {
+        let heap = HeapId(3);
+        for (sel, owner) in [
+            (Selection::Heap(heap), Some(heap)),
+            (Selection::HeapNode { heap, node: 9 }, Some(heap)),
+            (Selection::Leak { heap, finding: 1 }, Some(heap)),
+            (Selection::Growth { heap, index: 2 }, Some(heap)),
+            (Selection::AllocClass(AllocClassId(4)), None),
+            (Selection::Log(eid(1)), None),
+        ] {
+            assert_eq!(sel.heap(), owner);
+        }
+        assert!(Selection::AllocClass(AllocClassId(4)).is_memory());
+        assert!(Selection::Heap(heap).is_memory());
+        assert!(!Selection::Frame(eid(1)).is_memory());
     }
 
     #[test]

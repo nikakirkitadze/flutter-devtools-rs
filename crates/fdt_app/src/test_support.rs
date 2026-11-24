@@ -391,6 +391,59 @@ pub fn request(
     });
 }
 
+/// Stores a `Ready` heap snapshot of `run` taken one second after the previous one: `build` fills
+/// a [`SnapshotBuilder`](fdt_analysis::heap::encode::SnapshotBuilder), which is encoded into a
+/// file in a temp heap directory and analysed like a real snapshot.
+pub fn heap_record(
+    w: &mut fdt_store::SessionWriter,
+    run: RunId,
+    build: impl FnOnce(&mut fdt_analysis::heap::encode::SnapshotBuilder),
+) -> fdt_store::heap::HeapId {
+    heap_record_with(w, run, build, |_| {})
+}
+
+/// Like [`heap_record`], with `edit` applied to the summary before it is stored: for tests that
+/// need findings the builder can't easily produce.
+pub fn heap_record_with(
+    w: &mut fdt_store::SessionWriter,
+    run: RunId,
+    build: impl FnOnce(&mut fdt_analysis::heap::encode::SnapshotBuilder),
+    edit: impl FnOnce(&mut fdt_store::heap::HeapSummary),
+) -> fdt_store::heap::HeapId {
+    use fdt_analysis::heap::analyze;
+    use fdt_analysis::heap::dominators::AnalyzeInput;
+    use fdt_analysis::heap::encode::{SnapshotBuilder, encode_full};
+    use fdt_store::heap::{HeapFile, HeapStage};
+    use fdt_store::time::SessionTime;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let mut builder = SnapshotBuilder::new();
+    build(&mut builder);
+    let bytes = encode_full(&builder.finish());
+    let dir = std::env::temp_dir().join(format!("fdt-app-heaps-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("heap directory");
+    let path = dir.join(format!("{}.dartheap", NEXT.fetch_add(1, Ordering::Relaxed)));
+    std::fs::write(&path, &bytes).expect("heap file");
+    // Dropping the last handle deletes the file.
+    let file = Arc::new(HeapFile::new(path));
+    let at = SessionTime((w.heap_records().len() as u64 + 1) * 1_000_000_000);
+    let id = w.heap_requested(run, "isolates/1", at);
+    w.set_heap_received(id, at, bytes.len() as u64, file.clone());
+    let input = AnalyzeInput {
+        file,
+        flutter_version: None,
+        mode: Mode::Profile,
+        root_package: None,
+    };
+    let analysis =
+        analyze(&input, &AtomicBool::new(false), &mut |_| {}).expect("the snapshot analyses");
+    let mut summary = analysis.summary;
+    edit(&mut summary);
+    w.set_heap_analysed(id, Arc::new(summary), Arc::new(analysis.index));
+    w.set_heap_stage(id, HeapStage::Ready);
+    id
+}
+
 /// A valid 1x1 PNG.
 pub const PNG: [u8; 70] = [
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,

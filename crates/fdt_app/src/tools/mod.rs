@@ -3,6 +3,7 @@
 #[cfg(test)]
 mod cross_links;
 pub mod logs;
+pub mod memory;
 pub mod network;
 pub mod performance;
 pub mod related;

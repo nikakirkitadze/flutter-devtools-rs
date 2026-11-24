@@ -5,7 +5,7 @@
 
 use super::items::{
     ItemKind, PaletteItem, PaletteModel, REQUEST_ITEM_LIMIT, SLOW_FRAME_ITEM_LIMIT, command_items,
-    frame_items, request_items, slow_frame_items,
+    frame_items, heap_items, request_items, slow_frame_items,
 };
 use super::recent::record_recent;
 use crate::actions::OpenPalette;
@@ -98,6 +98,7 @@ impl PaletteView {
         let scan = cx.background_spawn(async move {
             let mut items = request_items(&scanned, REQUEST_ITEM_LIMIT);
             items.extend(slow_frame_items(&scanned, SLOW_FRAME_ITEM_LIMIT));
+            items.extend(heap_items(&scanned, ""));
             items
         });
         let target = model.clone();

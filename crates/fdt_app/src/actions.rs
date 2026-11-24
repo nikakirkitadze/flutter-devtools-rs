@@ -63,7 +63,15 @@ gpui_kit::actions!(
         ZoomOut,
         ZoomToFit,
         PreviousFrame,
-        NextFrame
+        NextFrame,
+        TakeHeapSnapshot,
+        CancelHeapSnapshot,
+        ShowClassesTab,
+        ShowLeaksTab,
+        ShowSnapshotTab,
+        RefreshAllocationProfile,
+        UseAsBaseline,
+        RemoveHeapSnapshot
     ]
 );
 

@@ -2,12 +2,13 @@
 
 use crate::actions::show_tool;
 use crate::actions::{
-    About, CloseWindow, ConnectToApp, Disconnect, FetchCpuSamples, GoBack, GoForward, Minimize,
-    NewSession, NewWindow, NextFrame, NextSlowFrame, OpenPalette, OpenSettings, PreviousFrame,
-    PreviousSlowFrame, Quit, ShowCpuTab, ShowFramesTab, ShowRebuildsTab, ShowShortcuts,
-    ShowTraceTab, StopWaiting, ToggleFrameHud, ToggleFullScreen, ToggleRecording,
-    ToggleTraceWidgetBuilds, UseDarkTheme, UseLightTheme, UseSystemTheme, Zoom, ZoomIn, ZoomOut,
-    ZoomToFit,
+    About, CancelHeapSnapshot, CloseWindow, ConnectToApp, Disconnect, FetchCpuSamples, GoBack,
+    GoForward, Minimize, NewSession, NewWindow, NextFrame, NextSlowFrame, OpenPalette,
+    OpenSettings, PreviousFrame, PreviousSlowFrame, Quit, RefreshAllocationProfile,
+    RemoveHeapSnapshot, ShowClassesTab, ShowCpuTab, ShowFramesTab, ShowLeaksTab, ShowRebuildsTab,
+    ShowShortcuts, ShowSnapshotTab, ShowTraceTab, StopWaiting, TakeHeapSnapshot, ToggleFrameHud,
+    ToggleFullScreen, ToggleRecording, ToggleTraceWidgetBuilds, UseAsBaseline, UseDarkTheme,
+    UseLightTheme, UseSystemTheme, Zoom, ZoomIn, ZoomOut, ZoomToFit,
 };
 #[cfg(target_os = "macos")]
 use crate::actions::{Hide, HideOthers, ShowAll};
@@ -79,6 +80,15 @@ pub fn app_menus() -> Vec<Menu> {
             MenuItem::action("Next Slow Frame", NextSlowFrame),
             MenuItem::action("Previous Slow Frame", PreviousSlowFrame),
             MenuItem::action("Fetch CPU Samples Now", FetchCpuSamples),
+            MenuItem::separator(),
+            MenuItem::action("Show classes", ShowClassesTab),
+            MenuItem::action("Show leaks", ShowLeaksTab),
+            MenuItem::action("Show heap snapshot", ShowSnapshotTab),
+            MenuItem::action("Take a heap snapshot", TakeHeapSnapshot),
+            MenuItem::action("Cancel heap snapshot", CancelHeapSnapshot),
+            MenuItem::action("Refresh allocation profile", RefreshAllocationProfile),
+            MenuItem::action("Use as baseline", UseAsBaseline),
+            MenuItem::action("Remove heap snapshot", RemoveHeapSnapshot),
             MenuItem::separator(),
             MenuItem::action("Zoom In", ZoomIn),
             MenuItem::action("Zoom Out", ZoomOut),

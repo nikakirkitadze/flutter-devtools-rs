@@ -1,14 +1,16 @@
 //! The command registry the palette, menus and cheat sheet are built from.
 
 use crate::actions::{
-    About, ClearSelection, CloseWindow, Collapse, ConnectToApp, Disconnect, Expand,
-    FetchCpuSamples, FocusSearch, FollowLatest, GoBack, GoForward, GoToFirst, LoadFullBody,
+    About, CancelHeapSnapshot, ClearSelection, CloseWindow, Collapse, ConnectToApp, Disconnect,
+    Expand, FetchCpuSamples, FocusSearch, FollowLatest, GoBack, GoForward, GoToFirst, LoadFullBody,
     Minimize, NewSession, NewWindow, NextFrame, NextSlowFrame, OpenDetails, OpenSettings,
-    PreviousFrame, PreviousSlowFrame, Quit, SearchEverywhere, SelectNext, SelectPrevious,
-    ShowCpuTab, ShowFramesTab, ShowLogs, ShowMemory, ShowNetwork, ShowPerformance, ShowRebuildsTab,
-    ShowShortcuts, ShowState, ShowTimeline, ShowTraceTab, ShowWidgets, StopWaiting, ToggleExpand,
-    ToggleFrameHud, ToggleFullScreen, ToggleRecording, ToggleTraceWidgetBuilds, UseDarkTheme,
-    UseLightTheme, UseSystemTheme, Zoom, ZoomIn, ZoomOut, ZoomToFit,
+    PreviousFrame, PreviousSlowFrame, Quit, RefreshAllocationProfile, RemoveHeapSnapshot,
+    SearchEverywhere, SelectNext, SelectPrevious, ShowClassesTab, ShowCpuTab, ShowFramesTab,
+    ShowLeaksTab, ShowLogs, ShowMemory, ShowNetwork, ShowPerformance, ShowRebuildsTab,
+    ShowShortcuts, ShowSnapshotTab, ShowState, ShowTimeline, ShowTraceTab, ShowWidgets,
+    StopWaiting, TakeHeapSnapshot, ToggleExpand, ToggleFrameHud, ToggleFullScreen, ToggleRecording,
+    ToggleTraceWidgetBuilds, UseAsBaseline, UseDarkTheme, UseLightTheme, UseSystemTheme, Zoom,
+    ZoomIn, ZoomOut, ZoomToFit,
 };
 #[cfg(target_os = "macos")]
 use crate::actions::{Hide, HideOthers, ShowAll};
@@ -336,6 +338,62 @@ pub fn commands() -> Vec<CommandSpec> {
             action: || Box::new(FetchCpuSamples),
         },
         CommandSpec {
+            id: "memory.classes",
+            label: "Show classes",
+            keywords: &["memory", "allocations", "profile"],
+            group: Group::View,
+            action: || Box::new(ShowClassesTab),
+        },
+        CommandSpec {
+            id: "memory.leaks",
+            label: "Show leaks",
+            keywords: &["memory", "suspects", "retained"],
+            group: Group::View,
+            action: || Box::new(ShowLeaksTab),
+        },
+        CommandSpec {
+            id: "memory.snapshot",
+            label: "Show heap snapshot",
+            keywords: &["memory", "objects", "dominators"],
+            group: Group::View,
+            action: || Box::new(ShowSnapshotTab),
+        },
+        CommandSpec {
+            id: "memory.take_snapshot",
+            label: "Take a heap snapshot",
+            keywords: &["memory", "leaks", "heap", "dump"],
+            group: Group::App,
+            action: || Box::new(TakeHeapSnapshot),
+        },
+        CommandSpec {
+            id: "memory.cancel_snapshot",
+            label: "Cancel heap snapshot",
+            keywords: &["memory", "stop", "abort"],
+            group: Group::App,
+            action: || Box::new(CancelHeapSnapshot),
+        },
+        CommandSpec {
+            id: "memory.refresh_profile",
+            label: "Refresh allocation profile",
+            keywords: &["memory", "classes", "allocations", "reload"],
+            group: Group::App,
+            action: || Box::new(RefreshAllocationProfile),
+        },
+        CommandSpec {
+            id: "memory.use_baseline",
+            label: "Use as baseline",
+            keywords: &["memory", "compare", "diff", "snapshot"],
+            group: Group::App,
+            action: || Box::new(UseAsBaseline),
+        },
+        CommandSpec {
+            id: "memory.remove_snapshot",
+            label: "Remove heap snapshot",
+            keywords: &["memory", "delete", "discard"],
+            group: Group::App,
+            action: || Box::new(RemoveHeapSnapshot),
+        },
+        CommandSpec {
             id: "lanes.zoom_in",
             label: "Zoom In",
             keywords: &["timeline", "time", "magnify"],
@@ -507,6 +565,63 @@ mod tests {
         let cmds = commands();
         let memory = cmds.iter().find(|c| c.id == "tool.memory").unwrap();
         assert_eq!(haystack(memory), "Go to Memory heap leaks gc");
+    }
+
+    #[test]
+    fn registry_lists_m4_commands() {
+        use crate::keymap::bindings;
+        use crate::menus::app_menus;
+        use gpui_kit::MenuItem;
+        let cmds = commands();
+        let bound: Vec<&str> = bindings().iter().map(|b| b.action().name()).collect();
+        let mut menu_actions = Vec::new();
+        for m in app_menus() {
+            for item in &m.items {
+                if let MenuItem::Action { action, .. } = item {
+                    menu_actions.push(action.name());
+                }
+            }
+        }
+        for (id, label, group, shortcut) in [
+            ("memory.classes", "Show classes", Group::View, false),
+            ("memory.leaks", "Show leaks", Group::View, false),
+            ("memory.snapshot", "Show heap snapshot", Group::View, false),
+            (
+                "memory.take_snapshot",
+                "Take a heap snapshot",
+                Group::App,
+                true,
+            ),
+            (
+                "memory.cancel_snapshot",
+                "Cancel heap snapshot",
+                Group::App,
+                false,
+            ),
+            (
+                "memory.refresh_profile",
+                "Refresh allocation profile",
+                Group::App,
+                false,
+            ),
+            ("memory.use_baseline", "Use as baseline", Group::App, false),
+            (
+                "memory.remove_snapshot",
+                "Remove heap snapshot",
+                Group::App,
+                false,
+            ),
+        ] {
+            let c = cmds
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("no {id}"));
+            assert_eq!(c.label, label);
+            assert_eq!(c.group, group, "{id}");
+            let name = (c.action)().name();
+            assert_eq!(bound.contains(&name), shortcut, "{id}");
+            assert!(menu_actions.contains(&name), "{id} is not in a menu");
+        }
     }
 
     #[test]

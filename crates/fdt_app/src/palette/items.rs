@@ -4,7 +4,9 @@
 use super::rank::rank;
 use super::registry::{Group, commands};
 use crate::nav::{Location, Page, Selection, Tool};
-use crate::tools::network::model::status_text;
+use crate::shell::strip::format_offset;
+use crate::tools::memory::{group_digits, heap_number};
+use crate::tools::network::model::{format_bytes, status_text};
 use fdt_store::Snapshot;
 use fdt_store::frames::{FrameRecord, FrameStatus, frame_status};
 use std::cmp::Reverse;
@@ -194,6 +196,72 @@ pub fn slow_frame_items(snap: &Snapshot, limit: usize) -> Vec<PaletteItem> {
             Some(frame_item(f, label, None))
         })
         .collect()
+}
+
+/// The heap snapshots, newest first, as "Heap snapshot #N · 2:41 · 1,204,331 objects", then the
+/// leak findings of the held one, as "Leak · _MyScreenState · 1.2 MB".
+///
+/// A snapshot that is not analysed has no object count, so it is not listed. A query keeps the
+/// items whose label contains it, ignoring case; the palette ranks the rest. Reads one summary
+/// and its findings, so it runs off the UI thread with the other scans.
+pub fn heap_items(snap: &Snapshot, query: &str) -> Vec<PaletteItem> {
+    let memory = &snap.memory;
+    let mut out = Vec::new();
+    for record in memory.heaps().iter().rev() {
+        let Some(summary) = &record.summary else {
+            continue;
+        };
+        let time = record.time.unwrap_or(record.requested);
+        out.push(PaletteItem {
+            id: format!("heap.{}", record.id.0),
+            label: format!(
+                "Heap snapshot #{} \u{b7} {} \u{b7} {} objects",
+                heap_number(record.id),
+                format_offset(time),
+                group_digits(summary.objects)
+            ),
+            detail: None,
+            keywords: vec!["memory".to_string()],
+            group: Group::Data,
+            kind: ItemKind::Navigate(Location {
+                page: Page::Tool(Tool::Memory),
+                selection: Some(Selection::Heap(record.id)),
+                range: None,
+            }),
+        });
+    }
+    let held = memory.held().and_then(|id| memory.heap(id));
+    if let Some((record, summary)) = held.and_then(|r| Some((r, r.summary.as_ref()?))) {
+        for (i, finding) in summary.findings.iter().enumerate() {
+            let class = summary
+                .classes
+                .get(finding.class as usize)
+                .map_or("Object", |c| &*c.name);
+            out.push(PaletteItem {
+                id: format!("leak.{}.{i}", record.id.0),
+                label: format!(
+                    "Leak \u{b7} {class} \u{b7} {}",
+                    format_bytes(finding.retained)
+                ),
+                detail: None,
+                keywords: vec!["memory".to_string(), "leaks".to_string()],
+                group: Group::Data,
+                kind: ItemKind::Navigate(Location {
+                    page: Page::Tool(Tool::Memory),
+                    selection: Some(Selection::Leak {
+                        heap: record.id,
+                        finding: i as u32,
+                    }),
+                    range: None,
+                }),
+            });
+        }
+    }
+    let q = query.trim().to_lowercase();
+    if !q.is_empty() {
+        out.retain(|item| item.label.to_lowercase().contains(&q));
+    }
+    out
 }
 
 /// "Search logs for “query”".
@@ -483,5 +551,84 @@ mod tests {
         assert_eq!(m.item(0).label, "Frame #1");
         m.set_exact(Vec::new());
         assert_eq!(m.row_count(), before);
+    }
+
+    fn leaky_heap(b: &mut fdt_analysis::heap::encode::SnapshotBuilder) {
+        let class = b.class("LeakyState", "package:app/leaky.dart", &[]);
+        let o = b.object(class, 32, fdt_analysis::heap::format::Value::None, &[]);
+        b.static_field("leaky", o);
+    }
+
+    /// Gives the summary two findings of `LeakyState`.
+    fn with_findings(summary: &mut fdt_store::heap::HeapSummary) {
+        use fdt_store::heap::{LeakFinding, LeakKind};
+        let class = summary
+            .classes
+            .iter()
+            .position(|c| &*c.name == "LeakyState")
+            .expect("the class") as u32;
+        let finding = |node, retained| LeakFinding {
+            kind: LeakKind::UnmountedState,
+            node,
+            class,
+            retained,
+            path: Vec::new().into(),
+            culprit: None,
+            keeps: Vec::new().into(),
+        };
+        summary.findings = vec![finding(7, 1_258_291), finding(8, 2_048)].into();
+        summary.findings_total = 2;
+    }
+
+    #[test]
+    fn heap_items_list_snapshots_and_leaks() {
+        use crate::test_support::{heap_record, heap_record_with};
+        let snap = snapshot(|w, run| {
+            heap_record(w, run, |_| {});
+            heap_record_with(w, run, leaky_heap, with_findings);
+            // Still being taken: no object count yet, so not listed.
+            w.heap_requested(run, "isolates/1", fdt_store::time::SessionTime(9));
+        });
+        let objects = |n: usize| {
+            let summary = snap.memory.heaps()[n].summary.as_ref().unwrap();
+            crate::tools::memory::group_digits(summary.objects)
+        };
+        let items = heap_items(&snap, "");
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                format!("Heap snapshot #2 \u{b7} 0:02 \u{b7} {} objects", objects(1)),
+                format!("Heap snapshot #1 \u{b7} 0:01 \u{b7} {} objects", objects(0)),
+                "Leak \u{b7} LeakyState \u{b7} 1.2 MB".to_string(),
+                "Leak \u{b7} LeakyState \u{b7} 2.0 KB".to_string(),
+            ]
+        );
+        // The snapshot goes to the Snapshot tab's selection; a leak to its finding.
+        let go = |i: usize| match &items[i].kind {
+            ItemKind::Navigate(l) => l.clone(),
+            other => panic!("{other:?}"),
+        };
+        let held = snap.memory.held().unwrap();
+        assert_eq!(go(0).page, Page::Tool(Tool::Memory));
+        assert_eq!(go(0).selection, Some(Selection::Heap(held)));
+        assert_eq!(
+            go(3).selection,
+            Some(Selection::Leak {
+                heap: held,
+                finding: 1
+            })
+        );
+        assert!(items.iter().all(|i| i.group == Group::Data));
+        // A query keeps the matching items.
+        let leaks = heap_items(&snap, "leak");
+        assert_eq!(leaks.len(), 2);
+        // Findings of a snapshot that is not held are not listed.
+        let older = snapshot(|w, run| {
+            heap_record_with(w, run, leaky_heap, with_findings);
+            heap_record(w, run, |_| {});
+        });
+        assert_eq!(heap_items(&older, "").len(), 2);
+        assert!(heap_items(&Snapshot::empty(), "").is_empty());
     }
 }
