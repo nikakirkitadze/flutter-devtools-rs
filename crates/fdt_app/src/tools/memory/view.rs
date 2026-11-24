@@ -1,26 +1,31 @@
 //! The Memory tool's page: the strip's chart slot, a tab bar with the snapshot button, and the
 //! tab's body.
 //!
-//! The page keeps the shared range and the selection the shell hands it. The chart and the three
-//! tabs are placeholders that show their empty states until they are built.
+//! The page keeps the shared range and the selection the shell hands it, and the chart's tooltip.
+//! The three tabs are placeholders that show their empty states until they are built.
 
+use super::chart::{ChartTip, EMPTY_TEXT, MemoryChart};
 use super::{group_digits, heap_number};
 use crate::actions::TakeHeapSnapshot;
+use crate::actions::{ZoomIn, ZoomOut, ZoomToFit};
 use crate::focus::PendingFocus;
+use crate::keymap::LANES_CONTEXT;
 use crate::nav::{Selection, TimeRange, Tool};
 use crate::session_model::SessionModel;
 use crate::shell::sidebar::tool_icon;
+use crate::tools::{KeyZoom, OpenLocation};
 use fdt_capture::ConnStatus;
 use fdt_ui::empty_state::EmptyState;
 use fdt_ui::theme::TokensExt as _;
-use fdt_ui::tokens::{font, layout, space};
+use fdt_ui::tokens::{font, layout, radius, space};
 use gpui_kit::component::button::Button;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{Disableable as _, Sizable as _, Size};
 use gpui_kit::{
-    Action as _, AnyElement, Context, Entity, FocusHandle, Hsla, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, Styled as _, Subscription,
-    TestSupportExt as _, Window, div,
+    Action as _, AnyElement, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Hsla,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, Render, SharedString,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription,
+    TestSupportExt as _, Window, anchored, deferred, div, point,
 };
 
 /// The tooltip of the snapshot button while no app is connected.
@@ -81,8 +86,14 @@ pub struct MemoryView {
     focus_pending: PendingFocus,
     /// Whether the Memory page is the current one.
     page_active: bool,
+    chart: Entity<MemoryChart>,
+    /// What the pointer is over on the chart, and where.
+    tip: Option<(String, Point<Pixels>)>,
     _observe: Subscription,
+    _chart: [Subscription; 2],
 }
+
+impl EventEmitter<OpenLocation> for MemoryView {}
 
 impl MemoryView {
     pub fn new(
@@ -91,15 +102,27 @@ impl MemoryView {
         cx: &mut Context<Self>,
     ) -> Self {
         let observe = cx.observe(&session, |_, _, cx| cx.notify());
+        let focus = cx.focus_handle();
+        let chart = cx.new(|cx| MemoryChart::new(session.clone(), focus.clone(), cx));
+        let chart_subs = [
+            cx.subscribe(&chart, |this, _, tip: &ChartTip, cx| {
+                this.tip = tip.0.clone();
+                cx.notify();
+            }),
+            cx.subscribe(&chart, |_, _, e: &OpenLocation, cx| cx.emit(e.clone())),
+        ];
         Self {
             session,
             tab: MemoryTab::Leaks,
             range: None,
             selection: None,
-            focus: cx.focus_handle(),
+            focus,
             focus_pending: PendingFocus::default(),
             page_active: false,
+            chart,
+            tip: None,
             _observe: observe,
+            _chart: chart_subs,
         }
     }
 
@@ -111,6 +134,20 @@ impl MemoryView {
         self.range
     }
 
+    pub fn chart(&self) -> &Entity<MemoryChart> {
+        &self.chart
+    }
+
+    /// The chart's tooltip, if the pointer is over something.
+    pub fn tooltip(&self) -> Option<&str> {
+        self.tip.as_ref().map(|(text, _)| text.as_str())
+    }
+
+    /// A zoom command from the keys or the palette, for the chart.
+    pub fn key_zoom(&mut self, z: KeyZoom, cx: &mut Context<Self>) {
+        self.chart.update(cx, |c, cx| c.key_zoom(z, cx));
+    }
+
     pub fn selection(&self) -> Option<Selection> {
         self.selection
     }
@@ -120,6 +157,9 @@ impl MemoryView {
         self.tab = MemoryTab::Leaks;
         self.range = None;
         self.selection = None;
+        self.tip = None;
+        self.chart
+            .update(cx, |c, cx| c.set_location(None, None, cx));
         cx.notify();
     }
 
@@ -145,6 +185,8 @@ impl MemoryView {
         }
         self.range = range;
         self.selection = selection;
+        self.chart
+            .update(cx, |c, cx| c.set_location(range, selection, cx));
         if selected && let Some(tab) = selection.and_then(MemoryTab::showing) {
             self.tab = tab;
         }
@@ -219,42 +261,68 @@ impl MemoryView {
             .into_any_element()
     }
 
-    /// The chart's place above the tabs.
+    /// The chart above the tabs, or what it says while there are no samples.
     fn render_chart_slot(&self, cx: &mut Context<Self>) -> AnyElement {
-        crate::perf::bump(crate::perf::Counter::MemoryChart, 1);
         let t = *cx.tokens();
-        let samples = self.session.read(cx).snapshot().memory.samples().len();
-        let (id, text) = if samples == 0 {
-            (
-                "memory-chart-empty",
-                "No memory samples yet. They are recorded while an app is connected.".to_string(),
-            )
-        } else {
-            (
-                "memory-chart-placeholder",
-                format!("{} memory samples recorded.", group_digits(samples as u64)),
-            )
-        };
-        div()
+        let slot = div()
             .id("memory-chart")
             .test_support()
             .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
             .w_full()
-            .h(layout::FRAME_CHART_HEIGHT)
+            .h(layout::MEMORY_CHART_HEIGHT)
             .border_b(layout::BORDER)
-            .border_color(Hsla::from(t.border))
-            .child(
-                div()
-                    .id(id)
-                    .test_support()
-                    .text_size(font::BODY)
-                    .text_color(Hsla::from(t.text_muted))
-                    .child(text),
+            .border_color(Hsla::from(t.border));
+        if self.session.read(cx).snapshot().memory.samples().is_empty() {
+            return slot
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .id("memory-chart-empty")
+                        .test_support()
+                        .text_size(font::BODY)
+                        .text_color(Hsla::from(t.text_muted))
+                        .child(EMPTY_TEXT),
+                )
+                .into_any_element();
+        }
+        slot.child(
+            self.chart
+                .clone()
+                .cached(StyleRefinement::default().size_full()),
+        )
+        .into_any_element()
+    }
+
+    fn render_tooltip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let t = *cx.tokens();
+        let (text, at) = self.tip.clone()?;
+        let offset = layout::TOOLTIP_OFFSET;
+        Some(
+            deferred(
+                anchored()
+                    .position(at + point(offset, offset))
+                    .snap_to_window_with_margin(space::S8)
+                    .child(
+                        div()
+                            .id("memory-chart-tooltip")
+                            .test_support()
+                            .aria_label(SharedString::from(text.clone()))
+                            .px(space::S8)
+                            .py(space::S4)
+                            .rounded(radius::CONTROL)
+                            .bg(Hsla::from(t.elevated))
+                            .border_1()
+                            .border_color(Hsla::from(t.border))
+                            .text_size(font::LABEL)
+                            .text_color(Hsla::from(t.text))
+                            .child(text),
+                    ),
             )
-            .into_any_element()
+            .with_priority(1)
+            .into_any_element(),
+        )
     }
 
     fn empty(
@@ -369,12 +437,17 @@ impl Render for MemoryView {
         div()
             .id("memory-view")
             .test_support()
+            .key_context(LANES_CONTEXT)
             .track_focus(&self.focus)
             .size_full()
             .flex()
             .flex_col()
+            .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.key_zoom(KeyZoom::In, cx)))
+            .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.key_zoom(KeyZoom::Out, cx)))
+            .on_action(cx.listener(|this, _: &ZoomToFit, _, cx| this.key_zoom(KeyZoom::Fit, cx)))
             .child(self.render_chart_slot(cx))
             .child(self.render_tabs(cx))
             .child(self.render_body(cx))
+            .children(self.render_tooltip(cx))
     }
 }

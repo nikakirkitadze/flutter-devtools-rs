@@ -413,7 +413,8 @@ impl TimelineView {
         let nothing = snap.frames.is_empty()
             && snap.logs.is_empty()
             && snap.net.is_empty()
-            && snap.timeline.slice_count() == 0;
+            && snap.timeline.slice_count() == 0
+            && snap.memory.gcs().is_empty();
         self.visible = if nothing {
             Vec::new()
         } else {
@@ -1761,7 +1762,11 @@ mod tests {
         let (tip, _) = hover(&v, cx, LaneKind::Navigation, &|_| true);
         assert!(tip.unwrap().starts_with("/route/"));
         let (tip, _) = hover(&v, cx, LaneKind::Gc, &|_| true);
-        assert_eq!(tip.as_deref(), Some("Garbage collection \u{b7} 6 ms"));
+        assert!(
+            tip.as_deref()
+                .is_some_and(|t| t.ends_with(", longest 6 ms")),
+            "{tip:?}"
+        );
         // A cell of log lines is counted in the background.
         let (x, y, hit) = point_of(&v, cx, LaneKind::Logs, |_| true);
         let LaneHit::LogCell(cell) = hit else {

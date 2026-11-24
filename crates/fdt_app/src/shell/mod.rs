@@ -228,6 +228,9 @@ impl MainWindow {
                 window,
                 move |this, _, e: &OpenLocation, w, cx| open(this, e, w, cx),
             ),
+            cx.subscribe_in(&memory, window, move |this, _, e: &OpenLocation, w, cx| {
+                open(this, e, w, cx)
+            }),
         ];
         let host_wait = (!cx.has_global::<CaptureHost>()).then(|| {
             cx.observe_global_in::<CaptureHost>(window, |this, window, cx| {
@@ -615,8 +618,8 @@ impl MainWindow {
             && self.network.update(cx, |net, cx| net.close_details(cx))
     }
 
-    /// Hands a zoom command to the current page's canvas: the Timeline lanes, or the Raw trace or
-    /// flame chart on the Performance page.
+    /// Hands a zoom command to the current page's canvas: the Timeline lanes, the Raw trace or
+    /// flame chart on the Performance page, or the memory chart.
     fn key_zoom(&mut self, z: KeyZoom, cx: &mut Context<Self>) {
         match self.current().page {
             Page::Tool(Tool::Timeline) if self.timeline_routed(cx) => {
@@ -624,6 +627,9 @@ impl MainWindow {
             }
             Page::Tool(Tool::Performance) if self.frames_routed(cx) => {
                 self.performance.update(cx, |p, cx| p.key_zoom(z, cx))
+            }
+            Page::Tool(Tool::Memory) if self.memory_routed(cx) => {
+                self.memory.update(cx, |m, cx| m.key_zoom(z, cx))
             }
             _ => {}
         }

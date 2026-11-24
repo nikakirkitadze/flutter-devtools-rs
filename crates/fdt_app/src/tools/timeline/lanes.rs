@@ -82,11 +82,9 @@ impl LaneKind {
             LaneKind::Network => !snap.net.is_empty(),
             LaneKind::Logs => !snap.logs.is_empty(),
             LaneKind::Navigation => !snap.logs.navigation().is_empty(),
-            LaneKind::Gc => snap
-                .timeline
-                .gc_lod()
-                .level(0)
-                .is_some_and(|l| !l.is_empty()),
+            LaneKind::Gc => [snap.memory.gc_lod(), snap.timeline.gc_lod()]
+                .iter()
+                .any(|lod| lod.level(0).is_some_and(|l| !l.is_empty())),
             // The session's worst frame, from the coarsest cells: no frame is read.
             LaneKind::Findings => {
                 let all = TimeRange::new(SessionTime(0), SessionTime(u64::MAX));
@@ -526,10 +524,20 @@ pub fn logs_lane(snap: &Snapshot, vp: Viewport, width: f32, budget: usize) -> La
     )
 }
 
+/// The garbage collections the GC lane shows: the memory sampler's GC events when the session
+/// has any (they belong to the app's isolates only), else the timeline's GC slices.
+pub fn gc_source(snap: &Snapshot) -> &fdt_store::frames::LodSnapshot {
+    if snap.memory.gcs().is_empty() {
+        snap.timeline.gc_lod()
+    } else {
+        snap.memory.gc_lod()
+    }
+}
+
 /// Cells of the garbage collections.
 pub fn gc_lane(snap: &Snapshot, vp: Viewport, width: f32, budget: usize) -> LaneGeometry {
     cells_lane(
-        snap.timeline.gc_lod(),
+        gc_source(snap),
         vp,
         width,
         budget,
@@ -793,24 +801,15 @@ pub fn tooltip_text(snap: &Snapshot, hit: &LaneHit) -> Option<String> {
             let row = snap.logs.get_row(seq as usize)?;
             Some(first_line(row.text))
         }
-        LaneHit::Gc(range) => {
-            let worst_us = lod_cells(snap.timeline.gc_lod(), range, 1)
-                .iter()
-                .map(|c| c.max_us)
-                .max()?;
-            Some(format!(
-                "Garbage collection \u{b7} {}",
-                format_duration_ns(u64::from(worst_us) * 1_000)
-            ))
-        }
-        LaneHit::LogCell(_)
+        LaneHit::Gc(_)
+        | LaneHit::LogCell(_)
         | LaneHit::RequestCell(_)
         | LaneHit::FrameCell(_)
         | LaneHit::FindingCell(_) => None,
     }
 }
 
-/// The hover text of a cell of requests or log lines, which counts them in the cell's range. Runs
+/// The hover text of a cell of requests, log lines or garbage collections, which counts them in the cell's range. Runs
 /// off the UI thread. `None` for any other hit.
 pub fn cell_tooltip(snap: &Snapshot, hit: &LaneHit) -> Option<String> {
     match *hit {
@@ -839,6 +838,19 @@ pub fn cell_tooltip(snap: &Snapshot, hit: &LaneHit) -> Option<String> {
                 "{} ({failed} failed)",
                 plural(seqs.len() as u64, "request", "requests")
             ))
+        }
+        LaneHit::Gc(range) => {
+            let cells = lod_cells(gc_source(snap), range, 1);
+            let n: u64 = cells.iter().map(|c| u64::from(c.count)).sum();
+            let worst_us = cells.iter().map(|c| c.max_us).max().filter(|&us| us > 0);
+            let count = plural(n, "garbage collection", "garbage collections");
+            Some(match worst_us {
+                Some(us) => format!(
+                    "{count}, longest {}",
+                    format_duration_ns(u64::from(us) * 1_000)
+                ),
+                None => count,
+            })
         }
         _ => None,
     }
@@ -1497,9 +1509,10 @@ mod tests {
         );
         assert_eq!(tip(LaneHit::Navigation(0)).as_deref(), Some("/checkout"));
         let cell = TimeRange::new(SessionTime(0), SessionTime(100 * MS));
+        assert_eq!(tip(LaneHit::Gc(cell)).as_deref(), None);
         assert_eq!(
-            tip(LaneHit::Gc(cell)).as_deref(),
-            Some("Garbage collection \u{b7} 4 ms")
+            cell_tooltip(&snap, &LaneHit::Gc(cell)).as_deref(),
+            Some("1 garbage collection, longest 4 ms")
         );
         // Cells need a count of their records, which is done in the background.
         assert_eq!(tip(LaneHit::LogCell(cell)), None);
@@ -1513,6 +1526,66 @@ mod tests {
             Some("1 request (0 failed)")
         );
         assert_eq!(tip(LaneHit::Frame(5)), None);
+    }
+
+    #[test]
+    fn gc_lane_prefers_gc_records_and_falls_back() {
+        use fdt_store::memory::{GcKind, GcReason, GcRecord};
+        let slice_only = snapshot(|w, run| {
+            let name = w.intern_name("GC");
+            let id = w.timeline_track(run, TrackKind::Thread, 1, "gc");
+            let slice = Slice {
+                start: SessionTime(10 * MS),
+                dur_ns: 4 * MS,
+                name,
+                cat: SliceCat::Gc,
+            };
+            w.push_slice(id, 0, slice, false);
+        });
+        let record = GcRecord {
+            time: SessionTime(2_000 * MS),
+            dur_us: Some(7_000),
+            kind: GcKind::Scavenge,
+            reason: GcReason::NewSpace,
+            heap_used: 1,
+            heap_capacity: 2,
+            external: 0,
+        };
+        let records_only = snapshot(|w, run| w.push_gc(run, record));
+        let both = snapshot(|w, run| {
+            let name = w.intern_name("GC");
+            let id = w.timeline_track(run, TrackKind::Thread, 1, "gc");
+            let slice = Slice {
+                start: SessionTime(10 * MS),
+                dur_ns: 4 * MS,
+                name,
+                cat: SliceCat::Gc,
+            };
+            w.push_slice(id, 0, slice, false);
+            w.push_gc(run, record);
+        });
+        let vp = Viewport::fit(0, 3_000 * MS);
+        let quads = |snap: &Snapshot| lane_geometry(LaneKind::Gc, snap, vp, 300.0, 100, None).quads;
+        // A session with only timeline slices still shows the lane, as M3 did.
+        assert!(LaneKind::Gc.has_data(&slice_only));
+        assert_eq!(quads(&slice_only).len(), 1);
+        assert!(quads(&slice_only)[0].rect.x < 5.0);
+        assert!(LaneKind::Gc.has_data(&records_only));
+        assert!(!LaneKind::Gc.has_data(&snapshot(|_, _| {})));
+        // With records, the lane is theirs alone: the slice at 10 ms is not drawn.
+        let q = quads(&both);
+        assert_eq!(q.len(), 1);
+        assert!((q[0].rect.x - 200.0).abs() < 2.0, "{:?}", q[0].rect);
+        // The tooltip counts the records of the cell and names the longest.
+        let cell = TimeRange::new(SessionTime(0), SessionTime(3_000 * MS));
+        assert_eq!(
+            cell_tooltip(&both, &LaneHit::Gc(cell)).as_deref(),
+            Some("1 garbage collection, longest 7 ms")
+        );
+        assert_eq!(
+            cell_tooltip(&slice_only, &LaneHit::Gc(cell)).as_deref(),
+            Some("1 garbage collection, longest 4 ms")
+        );
     }
 
     #[test]

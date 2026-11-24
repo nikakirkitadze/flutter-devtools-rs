@@ -130,6 +130,8 @@ pub mod alpha {
     pub const SCRIM_LIGHT: u8 = 0x33;
     /// Opacity of a control that cannot be used.
     pub const DISABLED: f32 = 0.5;
+    /// Opacity of an area under a chart line, applied to its colour.
+    pub const AREA: f32 = 0.25;
     /// Opacity of a frame phase bar, applied to `accent`: build, layout, paint, composite, and
     /// finalize/other, from the strongest to the faintest.
     pub const PHASE: [u8; 5] = [0xFF, 0xC0, 0x99, 0x73, 0x4D];
@@ -267,6 +269,12 @@ pub mod layout {
     /// Height of one flame chart row.
     pub const FLAME_ROW: Pixels = px(18.);
     pub const FRAME_CHART_HEIGHT: Pixels = px(140.);
+    /// Height of the memory chart.
+    pub const MEMORY_CHART_HEIGHT: Pixels = px(160.);
+    /// Length of the tick a garbage collection leaves on the memory chart's top edge.
+    pub const GC_TICK_HEIGHT: Pixels = px(6.);
+    /// The same for a major garbage collection.
+    pub const GC_MAJOR_TICK_HEIGHT: Pixels = px(12.);
     pub const FRAME_BAR_WIDTH: Pixels = px(6.);
     pub const FRAME_BAR_MIN_WIDTH: Pixels = px(1.);
     /// Height of one phase bar in a frame's breakdown.
@@ -530,5 +538,13 @@ mod tests {
         assert_eq!(table::COL_FUNCTION, px(360.));
         assert_eq!(table::COL_WIDGET, px(280.));
         assert_eq!(super::alpha::PHASE, [0xFF, 0xC0, 0x99, 0x73, 0x4D]);
+    }
+
+    #[test]
+    fn m4_tokens_match_spec() {
+        assert_eq!(layout::MEMORY_CHART_HEIGHT, px(160.));
+        assert_eq!(layout::GC_TICK_HEIGHT, px(6.));
+        assert_eq!(layout::GC_MAJOR_TICK_HEIGHT, px(12.));
+        assert_eq!(super::alpha::AREA, 0.25);
     }
 }
