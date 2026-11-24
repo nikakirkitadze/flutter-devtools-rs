@@ -229,6 +229,11 @@ impl SnapshotBuilder {
         self.objects.len() as u32
     }
 
+    /// Sets an object's shallow size.
+    pub fn set_shallow(&mut self, o: u32, shallow: u64) {
+        self.objects[o as usize - 1].shallow = shallow;
+    }
+
     pub fn set_refs(&mut self, o: u32, refs: &[u32]) {
         self.objects[o as usize - 1].refs = refs.to_vec();
     }

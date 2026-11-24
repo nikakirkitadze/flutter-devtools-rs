@@ -261,7 +261,11 @@ fn fixture_finds_the_leaky_state() {
             .iter()
             .any(|(c, _)| name(*c) == "TextEditingController")
     );
-    eprintln!("{}", path_text(s, &f.path));
+    assert_eq!(
+        path_text(s, &f.path),
+        "Root → static instance → AppEvents._listeners → _List[0] → _Closure (closure context) \
+         → Context (captured 0) → _LeakyScreenState"
+    );
     eprintln!("retained {}, keeps {:?}", f.retained, f.keeps);
     assert_eq!(f.retained, a.index.retained(f.node));
     assert!(s.http.is_none() || s.http.unwrap().requests == 0);

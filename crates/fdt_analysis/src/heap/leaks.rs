@@ -6,16 +6,17 @@
 //! forward references still exist. Everything that needs node ids or retained sizes is filled
 //! in afterwards by [`finalize`], once the held index has renumbered the objects.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::File;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use fdt_store::heap::{
     Check, Edge, HeapIndex, HeapSummary, HttpHeld, LeakChecks, LeakFinding, LeakKind,
-    LifecycleKind, MAX_PATH_HOPS, PathHop, Tracked,
+    LifecycleKind, PathHop, Tracked,
 };
 
+use super::details::labelled_path;
 use super::format::{ClassDef, Graph, HeapError, Kind, read_object};
 use super::sdk::SdkFields;
 use crate::user_code::is_user_library;
@@ -169,14 +170,11 @@ pub fn edge(g: &Graph, from: u32, pos: usize, root_name: Option<&str>) -> Edge {
 
 // ---- the scan ----
 
+/// A leaked object; paths are built in [`finalize`], for the largest only.
 #[derive(Debug)]
 pub struct RawFinding {
     pub kind: LeakKind,
     pub object: u32,
-    /// Root first; each entry's edge reaches the next. At most [`MAX_PATH_HOPS`] long.
-    pub path: Vec<(u32, Edge)>,
-    /// An index into `path`.
-    pub culprit: Option<u16>,
 }
 
 #[derive(Debug)]
@@ -186,9 +184,8 @@ pub struct Scan {
     /// By class id.
     pub lifecycle: Vec<Option<LifecycleKind>>,
     pub checks: LeakChecks,
-    /// At most [`MAX_FINDINGS`], the lowest object ids.
+    /// Every leaked object (8 B each).
     pub findings: Vec<RawFinding>,
-    pub total: u32,
     /// `(class, identity hash, object)` of reachable user and lifecycle objects with a hash.
     pub tracked: Vec<(u32, u32, u32)>,
     pub http_objects: Vec<u32>,
@@ -203,12 +200,12 @@ fn cancelled(cancel: &AtomicBool) -> Result<(), HeapError> {
     }
 }
 
-/// The text of a string object, read from the file.
-fn read_text(g: &Graph, file: &File, object: u32) -> Option<String> {
-    read_object(file, &g.offsets, g.mint_class, object)
-        .ok()?
-        .value
-        .text()
+/// The text of a string object, read from the file. An I/O or decode failure is an error: it
+/// must never read as "not defunct".
+fn read_text(g: &Graph, file: &File, object: u32) -> Result<Option<String>, HeapError> {
+    let rec = read_object(file, &g.offsets, g.mint_class, object)
+        .map_err(|e| HeapError::Io(e.kind().to_string()))?;
+    Ok(rec.value.text())
 }
 
 /// The first row whose base class for `class` exists in the snapshot.
@@ -225,12 +222,12 @@ fn first_row<'a>(
 
 /// Runs the level-1 scan over reachable objects (`retainers[o] != 0 || o == 1`).
 ///
-/// `file` is only used for strings the graph does not keep (root slice names, the lifecycle
-/// enum's names); without it those are skipped.
+/// `file` is read for the strings the graph does not keep (the lifecycle enum's names); a read
+/// failure fails the scan.
 pub fn scan(
     g: &Graph,
     retainers: &[u32],
-    file: Option<&File>,
+    file: &File,
     rows: &[&SdkFields],
     root_package: Option<&str>,
     cancel: &AtomicBool,
@@ -276,7 +273,30 @@ pub fn scan(
         }
     };
     let states = decide(state.map(|s| s.1), &[state_field.map_or("", |s| s.0)]);
-    let elements = decide(element.map(|e| e.1), &[life_name, widget_name]);
+    // Either signal is decisive on its own (`unmount()` sets both): the lifecycle enum's name,
+    // or a null `_widget`. The check is undecidable only when neither can run.
+    let enum_cid = element.and_then(|(r, _)| g.find_class(r.element.3, r.framework_uri));
+    let widget_ok = element.is_some_and(|(_, c)| g.field_index(c, widget_name).is_some());
+    let name_pos_in_enum = element
+        .zip(enum_cid)
+        .and_then(|((r, _), e)| g.field_index(e, r.element.4));
+    let life_ok = element.is_some_and(|(_, c)| g.field_index(c, life_name).is_some())
+        && name_pos_in_enum.is_some();
+    let elements = match element {
+        None => Check::NotFound,
+        Some(_) if widget_ok || life_ok => Check::Done,
+        Some((r, c)) => {
+            let mut missing = vec![widget_name];
+            if g.field_index(c, life_name).is_none() {
+                missing.push(life_name);
+            } else if enum_cid.is_none() {
+                missing.push(r.element.3);
+            } else {
+                missing.push(r.element.4);
+            }
+            Check::Undecidable(missing.join(", ").into())
+        }
+    };
     // Without the debug-only flag a disposed notifier looks like one never listened to.
     let notifiers = match decide(notifier.map(|e| e.1), &[disposed_name]) {
         Check::Undecidable(_) => Check::Undecidable(Arc::from("profile")),
@@ -285,16 +305,19 @@ pub fn scan(
 
     // Which objects are the lifecycle enum's `defunct`.
     let mut defunct: HashSet<u32> = HashSet::new();
-    if elements == Check::Done
-        && let (Some((row, _)), Some(file)) = (element, file)
-        && let Some(enum_cid) = g.find_class(row.element.3, row.framework_uri)
-        && let Some(name_pos) = g.field_index(enum_cid, row.element.4)
+    if life_ok
+        && let Some((row, _)) = element
+        && let Some(enum_cid) = enum_cid
+        && let Some(name_pos) = name_pos_in_enum
     {
         for o in 1..=n as u32 {
+            if o as usize & CANCEL_MASK == 0 {
+                cancelled(cancel)?;
+            }
             if g.class_of[o as usize] == enum_cid
                 && let Some(&s) = g.refs_of(o).get(name_pos)
                 && s != 0
-                && read_text(g, file, s).as_deref() == Some(row.element.5)
+                && read_text(g, file, s)?.as_deref() == Some(row.element.5)
             {
                 defunct.insert(o);
             }
@@ -312,11 +335,12 @@ pub fn scan(
             _ => None,
         })
         .collect();
-    let element_pos: Vec<Option<(usize, usize)>> = (0..g.classes.len())
+    let element_pos: Vec<Option<(Option<usize>, Option<usize>)>> = (0..g.classes.len())
         .map(|c| match lifecycle[c] {
-            Some(LifecycleKind::Element) if elements == Check::Done => {
-                g_pos(g, c, life_name).zip(g_pos(g, c, widget_name))
-            }
+            Some(LifecycleKind::Element) if elements == Check::Done => Some((
+                g_pos(g, c, life_name).filter(|_| life_ok),
+                g_pos(g, c, widget_name).filter(|_| widget_ok),
+            )),
             _ => None,
         })
         .collect();
@@ -330,7 +354,6 @@ pub fn scan(
     let http_cid = rows.iter().find_map(|r| g.find_class(r.http.0, r.http.1));
 
     let mut findings: Vec<RawFinding> = Vec::new();
-    let mut total = 0u32;
     let mut tracked = Vec::new();
     let mut http_objects = Vec::new();
     let is_null = |r: Option<&u32>| r.is_some_and(|&r| r != 0 && g.kind[r as usize] == Kind::Null);
@@ -347,8 +370,11 @@ pub fn scan(
         let kind = if let Some(pos) = state_pos[cid] {
             is_null(refs.get(pos)).then_some(LeakKind::UnmountedState)
         } else if let Some((life, widget)) = element_pos[cid] {
-            let by_name = refs.get(life).is_some_and(|r| defunct.contains(r));
-            (by_name || is_null(refs.get(widget))).then_some(LeakKind::DefunctElement)
+            let by_name = life
+                .and_then(|p| refs.get(p))
+                .is_some_and(|r| defunct.contains(r));
+            let no_widget = widget.is_some_and(|p| is_null(refs.get(p)));
+            (by_name || no_widget).then_some(LeakKind::DefunctElement)
         } else if let Some(pos) = notifier_pos[cid] {
             refs.get(pos)
                 .is_some_and(|&r| r != 0 && g.kind[r as usize] == Kind::True)
@@ -357,15 +383,7 @@ pub fn scan(
             None
         };
         if let Some(kind) = kind {
-            total = total.saturating_add(1);
-            if findings.len() < MAX_FINDINGS {
-                findings.push(RawFinding {
-                    kind,
-                    object: o,
-                    path: Vec::new(),
-                    culprit: None,
-                });
-            }
+            findings.push(RawFinding { kind, object: o });
         }
         let hash = g.identity_hash.get(o as usize).copied().unwrap_or(0);
         if hash != 0 && (user[cid] || lifecycle[cid].is_some()) {
@@ -389,58 +407,6 @@ pub fn scan(
         }
     }
 
-    // Paths and culprits, while the forward references exist.
-    let mut root_names: HashMap<u32, Arc<str>> = HashMap::new();
-    for f in &mut findings {
-        let mut chain = vec![f.object];
-        while chain.len() < MAX_PATH_HOPS {
-            let at = *chain.last().expect("a chain starts with one object");
-            let parent = retainers[at as usize];
-            if at == 1 || parent == 0 {
-                break;
-            }
-            chain.push(parent);
-        }
-        chain.reverse();
-        let mut path = Vec::with_capacity(chain.len());
-        for w in chain.windows(2) {
-            let (from, to) = (w[0], w[1]);
-            let pos = g.refs_of(from).iter().position(|&r| r == to);
-            let hop_edge = match pos {
-                None => Edge::Internal(0),
-                Some(pos) => {
-                    let name = if from == 1 {
-                        match (file, root_names.get(&to)) {
-                            (_, Some(name)) => Some(name.clone()),
-                            (Some(file), None) => read_text(g, file, to).map(|t| {
-                                let name: Arc<str> = t.into();
-                                root_names.insert(to, name.clone());
-                                name
-                            }),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
-                    edge(g, from, pos, name.as_deref())
-                }
-            };
-            path.push((from, hop_edge));
-        }
-        path.push((f.object, Edge::None));
-        let before = path.len() - 1;
-        f.culprit = path[..before]
-            .iter()
-            .rposition(|(o, _)| user[g.class_of[*o as usize] as usize])
-            .or_else(|| {
-                path[..before]
-                    .iter()
-                    .position(|(_, e)| matches!(e, Edge::Static(_)))
-            })
-            .and_then(|i| u16::try_from(i).ok());
-        f.path = path;
-    }
-
     Ok(Scan {
         user,
         lifecycle,
@@ -450,7 +416,6 @@ pub fn scan(
             notifiers,
         },
         findings,
-        total,
         tracked,
         http_objects,
         http_lists,
@@ -466,45 +431,66 @@ pub struct Finalized {
     pub http: Option<HttpHeld>,
 }
 
+/// The culprit of a path: the last hop before the leaked object whose class is a user class,
+/// else the first `Static` hop.
+fn culprit_of(summary: &HeapSummary, path: &[PathHop]) -> Option<u16> {
+    let before = path.len().checked_sub(1)?;
+    path[..before]
+        .iter()
+        .rposition(|h| {
+            summary
+                .classes
+                .get(h.class as usize)
+                .is_some_and(|c| c.user)
+        })
+        .or_else(|| {
+            path[..before]
+                .iter()
+                .position(|h| matches!(h.edge, Edge::Static(_)))
+        })
+        .and_then(|i| u16::try_from(i).ok())
+}
+
 /// Fills in node ids, retained sizes and what each finding keeps alive. `node_of` maps an
-/// object to its node, `u32::MAX` if unreachable.
-pub fn finalize(scan: Scan, index: &HeapIndex, node_of: &[u32]) -> Finalized {
+/// object to its node, `u32::MAX` if unreachable. Only the [`MAX_FINDINGS`] largest findings
+/// get a path, labelled from the snapshot file; `summary` supplies the class names and fields
+/// (its own findings are ignored).
+pub fn finalize(
+    scan: Scan,
+    index: &HeapIndex,
+    node_of: &[u32],
+    summary: &HeapSummary,
+) -> Result<Finalized, HeapError> {
     let node = |o: u32| node_of.get(o as usize).copied().filter(|&n| n != u32::MAX);
-    let mut findings: Vec<LeakFinding> = scan
+    let mut leaked: Vec<(LeakKind, u32)> = scan
         .findings
+        .iter()
+        .filter_map(|f| Some((f.kind, node(f.object)?)))
+        .collect();
+    let total = u32::try_from(leaked.len()).unwrap_or(u32::MAX);
+    leaked.sort_by_key(|&(_, n)| (std::cmp::Reverse(index.retained(n)), n));
+    leaked.truncate(MAX_FINDINGS);
+    let findings = leaked
         .into_iter()
-        .filter_map(|f| {
-            let leaked = node(f.object)?;
-            let path: Option<Vec<PathHop>> = f
-                .path
-                .into_iter()
-                .map(|(o, edge)| {
-                    let n = node(o)?;
-                    Some(PathHop {
-                        node: n,
-                        class: index.class_of(n),
-                        retained: index.retained(n),
-                        edge,
-                    })
-                })
-                .collect();
+        .map(|(kind, n)| {
+            let path = labelled_path(index, summary, n)
+                .map_err(|e| HeapError::Io(e.kind().to_string()))?;
             let keeps: Vec<(u32, u64)> = index
-                .children(leaked)
+                .children(n)
                 .take(KEEPS)
                 .map(|c| (index.class_of(c), index.retained(c)))
                 .collect();
-            Some(LeakFinding {
-                kind: f.kind,
-                node: leaked,
-                class: index.class_of(leaked),
-                retained: index.retained(leaked),
-                path: path?.into(),
-                culprit: f.culprit,
+            Ok(LeakFinding {
+                kind,
+                node: n,
+                class: index.class_of(n),
+                retained: index.retained(n),
+                culprit: culprit_of(summary, &path),
+                path: path.into(),
                 keeps: keeps.into(),
             })
         })
-        .collect();
-    findings.sort_by_key(|f| (std::cmp::Reverse(f.retained), f.node));
+        .collect::<Result<Vec<_>, HeapError>>()?;
 
     let mut raw = scan.tracked;
     raw.sort_unstable();
@@ -544,12 +530,12 @@ pub fn finalize(scan: Scan, index: &HeapIndex, node_of: &[u32]) -> Finalized {
         bytes: held(&scan.http_objects) + held(&scan.http_lists),
         requests: scan.http_objects.len() as u64,
     });
-    Finalized {
+    Ok(Finalized {
         findings,
-        total: scan.total,
+        total,
         tracked,
         http,
-    }
+    })
 }
 
 // ---- path text ----
@@ -594,6 +580,7 @@ mod tests {
     use crate::heap::format::{Value, parse};
     use crate::heap::sdk;
     use fdt_store::heap::HeapFile;
+    use fdt_store::heap::MAX_PATH_HOPS;
     use fdt_store::run::Mode;
 
     const FW: &str = "package:flutter/src/widgets/framework.dart";
@@ -1007,7 +994,7 @@ mod tests {
     fn missing_field_marks_undecidable() {
         let mut b = SnapshotBuilder::new();
         b.class("State", FW, &["type_arguments", "_widget"]);
-        b.class("Element", FW, &["_parent", "_widget"]);
+        b.class("Element", FW, &["_parent"]);
         let (_d, a) = run_snapshot(b, None, None);
         assert_eq!(
             a.summary.checks.states,
@@ -1015,7 +1002,7 @@ mod tests {
         );
         assert_eq!(
             a.summary.checks.elements,
-            Check::Undecidable("_lifecycleState".into())
+            Check::Undecidable("_widget, _lifecycleState".into())
         );
         assert_eq!(a.summary.checks.notifiers, Check::NotFound);
     }
@@ -1233,5 +1220,160 @@ mod tests {
         assert_eq!(f.path.len(), MAX_PATH_HOPS);
         assert_ne!(f.path[0].node, 0);
         assert!(path_text(&a.summary, &f.path).starts_with("… → Link.next"));
+    }
+
+    /// An element class with the given fields, and optionally the lifecycle enum.
+    fn element_snapshot(fields: &[&str], enum_class: bool) -> Analysis {
+        let mut b = SnapshotBuilder::new();
+        let nul = b.class("Null", "dart:core", &[]);
+        let string = b.class("_OneByteString", "dart:core", &[]);
+        let list = b.class("_List", "dart:core", &["type_arguments", "length_"]);
+        let element = b.class("Element", FW, fields);
+        let null = b.object(nul, 0, Value::Null, &[]);
+        let widget = b.object(list, 16, Value::Length(0), &[0, 0]);
+        let mut items = Vec::new();
+        let refs = |life: u32, w: u32| -> Vec<u32> {
+            fields
+                .iter()
+                .map(|f| match *f {
+                    "_lifecycleState" => life,
+                    "_widget" => w,
+                    _ => 0,
+                })
+                .collect()
+        };
+        if enum_class {
+            let lc = b.class("_ElementLifecycle", FW, &["index", "_name"]);
+            let text = |b: &mut SnapshotBuilder, s: &str| {
+                b.object(
+                    string,
+                    16,
+                    Value::Latin1 {
+                        len: s.len() as u32,
+                        bytes: s.as_bytes().to_vec(),
+                    },
+                    &[],
+                )
+            };
+            let (dn, an) = (text(&mut b, "defunct"), text(&mut b, "active"));
+            let defunct = b.object(lc, 16, Value::None, &[0, dn]);
+            let active = b.object(lc, 16, Value::None, &[0, an]);
+            items.push(b.object(element, 40, Value::None, &refs(defunct, widget)));
+            items.push(b.object(element, 40, Value::None, &refs(active, widget)));
+            items.push(b.object(element, 40, Value::None, &refs(active, null)));
+        } else {
+            items.push(b.object(element, 40, Value::None, &refs(0, widget)));
+            items.push(b.object(element, 40, Value::None, &refs(0, null)));
+        }
+        let mut held_refs = vec![0, 0];
+        held_refs.extend(&items);
+        let held = b.object(list, 32, Value::Length(items.len() as u64), &held_refs);
+        b.static_field("elements", held);
+        let (dir, a) = run_snapshot(b, None, None);
+        std::mem::forget(dir);
+        a
+    }
+
+    #[test]
+    fn element_check_runs_on_the_null_widget_alone() {
+        // The enum class is missing, but `_widget` exists.
+        let a = element_snapshot(&["_parent", "_lifecycleState", "_widget"], false);
+        assert_eq!(a.summary.checks.elements, Check::Done);
+        assert_eq!(a.summary.findings_total, 1, "only the null-widget element");
+    }
+
+    #[test]
+    fn element_check_runs_on_the_enum_name_alone() {
+        // `_widget` is missing, but the enum works.
+        let a = element_snapshot(&["_parent", "_lifecycleState"], true);
+        assert_eq!(a.summary.checks.elements, Check::Done);
+        assert_eq!(
+            a.summary.findings_total, 1,
+            "only the defunct-by-name element"
+        );
+        // With both signals, each unmounted element is found and the healthy one is not.
+        let both = element_snapshot(&["_parent", "_lifecycleState", "_widget"], true);
+        assert_eq!(both.summary.findings_total, 2);
+    }
+
+    #[test]
+    fn element_check_is_undecidable_when_neither_signal_runs() {
+        // No `_widget`, and the enum class is missing.
+        let a = element_snapshot(&["_parent", "_lifecycleState"], false);
+        assert_eq!(
+            a.summary.checks.elements,
+            Check::Undecidable("_widget, _ElementLifecycle".into())
+        );
+        assert_eq!(a.summary.findings_total, 0);
+    }
+
+    #[test]
+    fn a_missing_snapshot_file_is_an_io_error_not_a_clean_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = AnalyzeInput {
+            file: Arc::new(HeapFile::new(dir.path().join("gone.dartheap"))),
+            flutter_version: None,
+            mode: Mode::Profile,
+            root_package: None,
+        };
+        let got = analyze(&input, &AtomicBool::new(false), &mut |_| {});
+        assert!(matches!(got, Err(HeapError::Io(_))), "{:?}", got.err());
+    }
+
+    #[test]
+    fn a_failed_read_during_the_scan_fails_it() {
+        // The scan reads the enum's names from the file; a file that cannot serve them is an
+        // error, never "not defunct".
+        let mut lab = Lab::new(false, NOTIFIER);
+        let name = lab.text("defunct");
+        lab.b.object(lab.lifecycle, 16, Value::None, &[0, name]);
+        let bytes = encode_full(&lab.b.finish());
+        let g = parse(
+            bytes.as_slice(),
+            bytes.len() as u64,
+            &AtomicBool::new(false),
+            &mut |_| {},
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.dartheap");
+        std::fs::write(&path, b"").unwrap();
+        let file = File::open(&path).unwrap();
+        let rows = sdk::rows_for(None);
+        let retainers = vec![1u32; g.object_count() + 1];
+        let got = scan(&g, &retainers, &file, &rows, None, &AtomicBool::new(false));
+        assert!(got.is_err(), "{:?}", got.err());
+    }
+
+    #[test]
+    fn the_cap_keeps_the_largest_findings() {
+        let mut lab = Lab::new(false, NOTIFIER);
+        let class = lab.user_state_class("_Leaked");
+        // 300 unmounted states whose retained size differs: `_text` has a varied size.
+        let sizes: Vec<u64> = (0..300u64).map(|i| 16 + 8 * ((i * 37) % 300)).collect();
+        let states: Vec<u32> = sizes
+            .iter()
+            .map(|&size| {
+                let text = lab.text("t");
+                lab.b.set_shallow(text, size);
+                let null = lab.null;
+                lab.b.object(class, 32, Value::None, &[0, 0, null, text])
+            })
+            .collect();
+        lab.list_static("states", &states);
+        let (_d, a) = lab.run(None, Some("jank_lab"));
+        let s = &a.summary;
+        assert_eq!(s.findings_total, 300);
+        assert_eq!(s.findings.len(), MAX_FINDINGS);
+        let got: Vec<u64> = s.findings.iter().map(|f| f.retained).collect();
+        let mut want: Vec<u64> = sizes.iter().map(|z| z + 32).collect();
+        want.sort_unstable_by(|a, b| b.cmp(a));
+        want.truncate(MAX_FINDINGS);
+        assert_eq!(got, want, "the 200 largest, descending");
+        assert!(
+            s.findings
+                .iter()
+                .all(|f| f.path[0].node == 0 && f.path.len() == 4)
+        );
     }
 }

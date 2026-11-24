@@ -494,11 +494,11 @@ pub fn analyze(
 
     // The scan hook: the forward references still exist, the predecessor lists do not yet.
     let rows = sdk::rows_for(input.flutter_version.as_deref());
-    let scan_file = File::open(input.file.path()).ok();
+    let scan_file = File::open(input.file.path()).map_err(io_error)?;
     let scan = leaks::scan(
         &g,
         &retainers,
-        scan_file.as_ref(),
+        &scan_file,
         &rows,
         input.root_package.as_deref(),
         cancel,
@@ -541,12 +541,11 @@ pub fn analyze(
 
     // The synthetic classes (1-5) name their objects in the data; a handful are reachable.
     let mut names = Vec::new();
-    if let Ok(f) = File::open(input.file.path()) {
-        for &o in &d.vertex[1..] {
-            if (1..=5).contains(&d.class_of[o as usize])
-                && let Ok(rec) = read_object(&f, &d.offsets, d.mint_class, o)
-                && let Value::Name(name) = rec.value
-            {
+    let f = File::open(input.file.path()).map_err(io_error)?;
+    for &o in &d.vertex[1..] {
+        if (1..=5).contains(&d.class_of[o as usize]) {
+            let rec = read_object(&f, &d.offsets, d.mint_class, o).map_err(io_error)?;
+            if let Value::Name(name) = rec.value {
                 names.push((o, Arc::<str>::from(name.as_str())));
             }
         }
@@ -559,9 +558,7 @@ pub fn analyze(
         d.header.external_size,
     );
     let (index, node_of) = build_index(d, retainers, names, input.file.clone());
-    let found = leaks::finalize(scan, &index, &node_of);
-    drop(node_of);
-    let summary = HeapSummary {
+    let mut summary = HeapSummary {
         objects,
         reachable,
         unreachable_bytes: total_bytes.saturating_sub(reachable_bytes),
@@ -572,12 +569,18 @@ pub fn analyze(
         mode: input.mode,
         root_package: input.root_package.as_deref().map(Arc::from),
         classes: classes.into(),
-        findings: found.findings.into(),
-        findings_total: found.total,
+        findings: Arc::from([]),
+        findings_total: 0,
         checks,
-        http: found.http,
-        tracked: found.tracked.into(),
+        http: None,
+        tracked: Arc::from([]),
     };
+    let found = leaks::finalize(scan, &index, &node_of, &summary)?;
+    drop(node_of);
+    summary.findings = found.findings.into();
+    summary.findings_total = found.total;
+    summary.http = found.http;
+    summary.tracked = found.tracked.into();
     progress(HeapStage::Ready);
     Ok(Analysis { summary, index })
 }
