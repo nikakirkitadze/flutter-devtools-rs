@@ -5,6 +5,9 @@
 //! cargo run -p fdt_vm --example record_jank_lab -- --uri ws://127.0.0.1:PORT/TOKEN/ws --out file.jsonl [--mode perf]
 //! ```
 //!
+//! `--mode heap` (profile builds only) writes one redacted heap snapshot, taken after the leaky
+//! screen was opened and closed, to `--out` as a `.dartheap` file instead of a transcript.
+//!
 //! `--mode perf` (profile builds only) records timeline, tracing-stream and CPU-sample traffic
 //! instead of the logs and network session.
 //!
@@ -17,7 +20,7 @@ use std::time::{Duration, Instant};
 use fdt_vm::flutter::PROFILE_WIDGET_BUILDS;
 use fdt_vm::rpc::{ConnectOptions, RpcClient, RpcError, connect};
 use fdt_vm::service::VmService;
-use fdt_vm::tap::Tap;
+use fdt_vm::tap::{Tap, mask_snapshot_secrets};
 use serde_json::{Value, json};
 use tokio::time::sleep;
 
@@ -72,6 +75,10 @@ async fn call(client: &RpcClient, method: &str, params: Value) -> Option<Value> 
 async fn main() {
     let uri = url::Url::parse(&arg("--uri")).expect("--uri must be a URL");
     let out = arg("--out");
+    if opt_arg("--mode").as_deref() == Some("heap") {
+        record_heap(&uri, &out).await;
+        return;
+    }
     let tap = Tap::create(&out).expect("create output file");
     let opts = ConnectOptions {
         tap: Some(tap),
@@ -281,6 +288,82 @@ async fn main() {
 }
 
 /// Calls the extension `ext.jank_lab.run` and waits for the app to react.
+/// The `--mode heap` session. The VM-service token is the first path segment of the URI.
+async fn record_heap(uri: &url::Url, out: &str) {
+    use std::sync::atomic::AtomicBool;
+
+    let token = uri
+        .path_segments()
+        .and_then(|mut s| s.next())
+        .unwrap_or_default()
+        .to_string();
+    // No tap: this session's frames must not be written anywhere.
+    let (client, _notes) = connect(uri, ConnectOptions::default())
+        .await
+        .expect("connect");
+    let vm = call(&client, "getVM", json!({})).await.expect("getVM");
+    let main_id = vm["isolates"]
+        .as_array()
+        .and_then(|a| a.iter().find(|i| i["name"] == "main"))
+        .and_then(|i| i["id"].as_str())
+        .expect("no main isolate")
+        .to_string();
+    let isolate = call(&client, "getIsolate", json!({"isolateId": main_id}))
+        .await
+        .expect("getIsolate");
+    assert!(
+        !isolate["extensionRPCs"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|e| e == "ext.flutter.reassemble")),
+        "--mode heap needs a profile build"
+    );
+
+    // A window that draws no frames never builds the pushed route, so drive them by hand.
+    for action in ["goto_leaks", "pump_frames"] {
+        act(&client, &main_id, action, Duration::from_secs(1)).await;
+    }
+    for action in ["home", "pump_frames"] {
+        act(&client, &main_id, action, Duration::from_secs(1)).await;
+    }
+
+    let svc = VmService::new(client.clone());
+    svc.stream_listen("HeapSnapshot")
+        .await
+        .expect("streamListen HeapSnapshot");
+    let mut chunks = client.heap_chunks();
+    svc.request_heap_snapshot(&main_id, Duration::from_secs(120))
+        .await
+        .expect("requestHeapSnapshot");
+    // The reply follows the last chunk, so every chunk is already queued.
+    let mut bytes = Vec::new();
+    let mut saw_last = false;
+    while let Ok(chunk) = chunks.try_recv() {
+        bytes.extend_from_slice(&chunk.payload);
+        saw_last |= chunk.last;
+    }
+    assert!(saw_last, "the snapshot's last chunk never arrived");
+
+    let parse = |b: &[u8]| {
+        let cancel = AtomicBool::new(false);
+        let g = fdt_analysis::heap::format::parse(b, b.len() as u64, &cancel, &mut |_| {})
+            .expect("the snapshot parses");
+        (g.object_count(), g.refs.len(), g.classes.len())
+    };
+    let before = parse(&bytes);
+    mask_snapshot_secrets(&mut bytes, &token);
+    let after = parse(&bytes);
+    assert_eq!(before, after, "masking changed the snapshot's shape");
+    std::fs::write(out, &bytes).expect("write the snapshot");
+    eprintln!(
+        "recorded {out} (heap): {} bytes, {} objects, {} refs, {} classes",
+        bytes.len(),
+        after.0,
+        after.1,
+        after.2
+    );
+    client.close();
+}
+
 async fn act(client: &RpcClient, main_id: &str, action: &str, settle: Duration) {
     call(
         client,

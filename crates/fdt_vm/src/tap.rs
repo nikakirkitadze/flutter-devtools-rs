@@ -118,6 +118,71 @@ fn mask_user_names(bytes: &mut [u8]) {
     }
 }
 
+/// Widens ASCII text to UTF-16LE bytes.
+fn utf16le(text: &str) -> Vec<u8> {
+    text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
+/// Overwrites the user name in every UTF-16LE `/Users/<name>/` and `/home/<name>/` of `bytes`
+/// with `x`. Same length; a name ends at a separator, a quote, a control unit or a non-ASCII unit.
+fn mask_user_names_utf16(bytes: &mut [u8]) {
+    for prefix in ["/Users/", "/home/"] {
+        let prefix = utf16le(prefix);
+        let mut i = 0;
+        while i + prefix.len() <= bytes.len() {
+            if bytes[i..i + prefix.len()] != prefix[..] {
+                i += 1;
+                continue;
+            }
+            let start = i + prefix.len();
+            let mut end = start;
+            while end + 1 < bytes.len()
+                && bytes[end + 1] == 0
+                && !matches!(bytes[end], b'/' | b'\\' | b'"')
+                && bytes[end] >= 0x20
+                && bytes[end] < 0x80
+            {
+                end += 2;
+            }
+            for at in (start..end).step_by(2) {
+                bytes[at] = b'x';
+            }
+            i = end.max(start);
+        }
+    }
+}
+
+/// Overwrites every occurrence of `needle` in `bytes` with `fill`, repeated to the same length.
+fn overwrite_all(bytes: &mut [u8], needle: &[u8], fill: &[u8]) {
+    if needle.is_empty() {
+        return;
+    }
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if bytes[i..i + needle.len()] == *needle {
+            for (k, b) in bytes[i..i + needle.len()].iter_mut().enumerate() {
+                *b = fill[k % fill.len()];
+            }
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Removes personal data from raw heap-snapshot bytes without changing their length, so every
+/// offset and LEB128 length stays valid. User names in `/Users/<name>/` and `/home/<name>/`
+/// become `x`, and every occurrence of the VM-service auth `token` becomes `.`, each in both
+/// the 1-byte and the UTF-16LE form (snapshots store strings either way).
+pub fn mask_snapshot_secrets(bytes: &mut [u8], token: &str) {
+    mask_user_names(bytes);
+    mask_user_names_utf16(bytes);
+    if !token.is_empty() {
+        overwrite_all(bytes, token.as_bytes(), b".");
+        overwrite_all(bytes, &utf16le(token), &[b'.', 0]);
+    }
+}
+
 /// Redacts one base64 blob: decodes it, masks user names, re-encodes. A string that does not
 /// decode is returned unchanged.
 fn redact_blob(b64: &str) -> String {
@@ -241,5 +306,54 @@ mod tests {
         );
         assert_eq!(redact(r"C:\Users\jane\dev"), r"C:\Users\~\dev");
         assert_eq!(redact(r"C:\\Users\\jane\\dev"), r"C:\\Users\\~\\dev");
+    }
+
+    fn has(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn mask_snapshot_secrets_cases() {
+        let token = "AbCdEf123456_-xyz=";
+        let dots = ".".repeat(token.len());
+        let mut raw = Vec::new();
+        raw.extend_from_slice(
+            b"http://127.0.0.1:1/AbCdEf123456_-xyz=/ file:///Users/jane/dev/a.dart ",
+        );
+        raw.extend_from_slice(b"/Users/janet/q /home/bob\"");
+        // Odd offset on purpose: the UTF-16 forms are found at any alignment.
+        raw.push(7);
+        raw.extend_from_slice(&utf16le(
+            "/Users/jane/dev/b.dart /home/al/ http://h/AbCdEf123456_-xyz=/",
+        ));
+        raw.extend_from_slice(&utf16le("/Users/jane"));
+        raw.extend_from_slice(&[0xff, 0xff]);
+        let mut masked = raw.clone();
+        mask_snapshot_secrets(&mut masked, token);
+        assert_eq!(masked.len(), raw.len());
+
+        let text = String::from_utf8_lossy(&masked).into_owned();
+        assert!(
+            text.contains(&format!("http://127.0.0.1:1/{dots}/ ")),
+            "{text}"
+        );
+        assert!(text.contains("file:///Users/xxxx/dev/a.dart"), "{text}");
+        // A longer name is masked whole: `/Users/janet` is never left as `jane` plus a tail.
+        assert!(text.contains("/Users/xxxxx/q /home/xxx\""), "{text}");
+        assert!(has(&masked, &utf16le("/Users/xxxx/dev/b.dart /home/xx/ ")));
+        assert!(has(&masked, &utf16le(&format!("http://h/{dots}/"))));
+        assert!(has(&masked, &utf16le("/Users/xxxx")));
+        assert!(masked.ends_with(&[0xff, 0xff]));
+        for secret in [&b"jane"[..], b"bob", token.as_bytes()] {
+            assert!(!has(&masked, secret));
+        }
+        for secret in ["jane", "al/", token] {
+            assert!(!has(&masked, &utf16le(secret)));
+        }
+
+        // An empty token changes nothing more, and masking twice is stable.
+        let mut again = masked.clone();
+        mask_snapshot_secrets(&mut again, "");
+        assert_eq!(again, masked);
     }
 }

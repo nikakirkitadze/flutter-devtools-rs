@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:developer' as developer;
 
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/widgets.dart';
 
 /// Navigator of the fixture app, so automation can push routes without a
@@ -17,6 +18,8 @@ const List<String> jankBuiltins = [
   'goto_network',
   'goto_jank',
   'goto_rebuilds',
+  'goto_leaks',
+  'pump_frames',
   'home',
   'pop',
   'list',
@@ -48,6 +51,22 @@ void registerJankLabExtension() {
   );
 }
 
+/// Drives 30 frames, 16 ms apart, without awaiting them. A window that is
+/// asleep or covered draws none, so a heap snapshot taken for a fixture would
+/// miss the screens' builds and disposals. A frame runs only while the
+/// scheduler is idle, so it never nests inside one the engine started.
+void pumpFrames() {
+  final binding = SchedulerBinding.instance;
+  var remaining = 30;
+  Timer.periodic(const Duration(milliseconds: 16), (timer) {
+    if (binding.schedulerPhase == SchedulerPhase.idle) {
+      binding.handleBeginFrame(Duration(microseconds: developer.Timeline.now));
+      binding.handleDrawFrame();
+    }
+    if (--remaining <= 0) timer.cancel();
+  });
+}
+
 /// Runs [action] and answers as the service extension does. The action is not
 /// awaited, so a long one returns at once. Exported for tests.
 Future<developer.ServiceExtensionResponse> handleJankLabRun(
@@ -62,6 +81,10 @@ Future<developer.ServiceExtensionResponse> handleJankLabRun(
       navKey.currentState?.pushNamed('/jank');
     case 'goto_rebuilds':
       navKey.currentState?.pushNamed('/rebuilds');
+    case 'goto_leaks':
+      navKey.currentState?.pushNamed('/leaks');
+    case 'pump_frames':
+      pumpFrames();
     case 'home':
       navKey.currentState?.popUntil((route) => route.isFirst);
     case 'pop':

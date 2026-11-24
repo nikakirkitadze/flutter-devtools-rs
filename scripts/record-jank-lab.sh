@@ -1,24 +1,30 @@
 #!/usr/bin/env bash
 # Records a redacted VM service transcript of fixtures/jank_lab.
 #
-#   scripts/record-jank-lab.sh <debug|profile|perf>
+#   scripts/record-jank-lab.sh <debug|profile|perf|heap>
 #
 # Runs `flutter run --machine` for the fixture, reads the VM service URL from the daemon's
 # `app.debugPort` event, runs the recorder against it, then stops only the app it started
 # (daemon `app.stop`, then that process group on timeout). Output goes to
 # fixtures/recordings/jank_lab-<mode>.jsonl. `perf` runs the app in profile mode and records
-# timeline, tracing-stream and CPU-sample traffic.
+# timeline, tracing-stream and CPU-sample traffic. `heap` runs it in profile mode too, opens
+# and closes the leaky screen, and writes one redacted heap snapshot to
+# fixtures/heap/jank_lab-profile-after-leaks.dartheap.
 set -euo pipefail
 
 mode="${1:-}"
 case "$mode" in
   debug) mode_flags=() ;;
-  profile|perf) mode_flags=(--profile) ;;
-  *) echo "usage: $0 <debug|profile|perf>" >&2; exit 2 ;;
+  profile|perf|heap) mode_flags=(--profile) ;;
+  *) echo "usage: $0 <debug|profile|perf|heap>" >&2; exit 2 ;;
 esac
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-out="$root/fixtures/recordings/jank_lab-$mode.jsonl"
+if [ "$mode" = heap ]; then
+  out="$root/fixtures/heap/jank_lab-profile-after-leaks.dartheap"
+else
+  out="$root/fixtures/recordings/jank_lab-$mode.jsonl"
+fi
 # Keep the macOS window above others: a covered window draws no frames.
 export JANK_LAB_FLOAT=1
 case "$(uname -s)" in

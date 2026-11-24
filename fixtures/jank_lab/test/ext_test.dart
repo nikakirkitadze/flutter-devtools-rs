@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:jank_lab/ext.dart';
 import 'package:jank_lab/main.dart';
+import 'package:jank_lab/scenarios/leaks.dart';
 import 'package:jank_lab/scenarios/rebuilds.dart';
 
 void main() {
@@ -10,6 +11,8 @@ void main() {
     'goto_network',
     'goto_jank',
     'goto_rebuilds',
+    'goto_leaks',
+    'pump_frames',
     'home',
     'pop',
     'list',
@@ -118,5 +121,29 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(seconds: 1));
     expect(find.byType(ProductTile), findsNothing);
+  });
+
+  testWidgets('goto_leaks pushes the leaky screen and home pops it', (
+    tester,
+  ) async {
+    await tester.pumpWidget(const JankLabApp());
+    expect(find.byType(LeakyScreen), findsNothing);
+    expect((await handleJankLabRun('goto_leaks')).isError(), isFalse);
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 1));
+    expect(find.byType(LeakyScreen), findsOneWidget);
+    await handleJankLabRun('home');
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 1));
+    expect(find.byType(LeakyScreen), findsNothing);
+  });
+
+  testWidgets('pump_frames returns ok at once and is listed', (tester) async {
+    await tester.pumpWidget(const JankLabApp());
+    final response = await handleJankLabRun('pump_frames');
+    expect(response.isError(), isFalse);
+    expect(jankLabAvailable(), contains('pump_frames'));
+    // Let its 30 timer ticks run out, so no timer is left pending.
+    await tester.pump(const Duration(seconds: 1));
   });
 }
