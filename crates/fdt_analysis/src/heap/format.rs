@@ -327,6 +327,17 @@ impl<'a, R: Read> Src<'a, R> {
         Ok(true)
     }
 
+    /// Fails when bytes follow the last section: the file is more than one snapshot.
+    fn end_of_input(&mut self) -> Result<(), HeapError> {
+        if self.fill()? {
+            return Err(HeapError::OutOfRange {
+                what: "trailing bytes",
+                at: self.offset(),
+            });
+        }
+        Ok(())
+    }
+
     fn byte(&mut self) -> Result<u8, HeapError> {
         if !self.fill()? {
             return Err(HeapError::Truncated { at: self.offset() });
@@ -746,6 +757,7 @@ pub fn parse<R: Read>(
         for _ in 0..n {
             identity_hash.push(s.u32("identity hash")?);
         }
+        s.end_of_input()?;
     } else {
         identity_hash.resize(n + 1, 0);
     }
@@ -810,6 +822,7 @@ pub fn decode_full(bytes: &[u8]) -> Result<FullSnapshot, HeapError> {
         for _ in 0..object_count {
             h.push(s.u32("identity hash")?);
         }
+        s.end_of_input()?;
         Some(h)
     } else {
         None
@@ -863,6 +876,37 @@ pub fn read_object(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bytes_after_the_last_section_are_an_error() {
+        let mut b = SnapshotBuilder::new();
+        let o = b.object(1, 8, Value::None, &[]);
+        b.hash(o, 5);
+        let one = encode_full(&b.finish());
+        let cancel = AtomicBool::new(false);
+        let at = one.len() as u64;
+        let trailing = |e: HeapError| {
+            e == HeapError::OutOfRange {
+                what: "trailing bytes",
+                at,
+            }
+        };
+        // The snapshot alone is fine; one more byte, or a whole second snapshot, is not.
+        parse(&one[..], at, &cancel, &mut |_| {}).unwrap();
+        decode_full(&one).unwrap();
+        let mut extra = one.clone();
+        extra.push(0);
+        assert!(trailing(
+            parse(&extra[..], at, &cancel, &mut |_| {}).unwrap_err()
+        ));
+        assert!(trailing(decode_full(&extra).unwrap_err()));
+        let mut two = one.clone();
+        two.extend_from_slice(&one);
+        assert!(trailing(
+            parse(&two[..], at, &cancel, &mut |_| {}).unwrap_err()
+        ));
+        assert!(trailing(decode_full(&two).unwrap_err()));
+    }
+
     use super::*;
     use crate::heap::encode::{SnapshotBuilder, encode_full, put_str, put_uleb};
     use std::io::Write;

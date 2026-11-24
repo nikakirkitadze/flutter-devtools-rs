@@ -399,6 +399,11 @@ impl SessionWriter {
         self.dirty |= self.memory.set_analysed(id, summary, index);
     }
 
+    /// Drops the record's hold on its file, for a snapshot that will never be analysed.
+    pub fn drop_heap_file(&mut self, id: HeapId) {
+        self.dirty |= self.memory.drop_file(id);
+    }
+
     pub fn set_heap_diff(&mut self, id: HeapId, diff: Option<Arc<HeapDiff>>) {
         self.dirty |= self.memory.set_diff(id, diff);
     }

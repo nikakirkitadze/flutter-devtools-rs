@@ -446,19 +446,21 @@ impl Session {
             }
             Ingest::Failed { message, details } => return self.on_failed(message, details),
             Ingest::Closed => return self.on_closed(),
-            Ingest::HeapStage(id, stage) => return self.heap_stage(id, stage),
+            Ingest::HeapStage(session, id, stage) => return self.heap_stage(session, id, stage),
             Ingest::HeapFailed {
+                session,
                 id,
                 message,
                 details,
-            } => return self.heap_failed(id, message, &details),
+            } => return self.heap_failed(session, id, message, &details),
             Ingest::HeapReceived {
+                session,
                 id,
                 time,
                 bytes,
                 file,
                 root_package,
-            } => return self.heap_received(id, time, bytes, file, root_package),
+            } => return self.heap_received(session, id, time, bytes, file, root_package),
             _ => {}
         }
         let recording = self.life.recording;

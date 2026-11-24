@@ -42,7 +42,9 @@ struct Take {
     cancel: watch::Receiver<bool>,
 }
 
-type Cancels = Arc<Mutex<HashMap<HeapId, watch::Sender<bool>>>>;
+/// Keyed by session too: ids restart in every session, and a transfer of the old one may still
+/// be winding down.
+type Cancels = Arc<Mutex<HashMap<(u32, HeapId), watch::Sender<bool>>>>;
 
 /// The connection's memory commands.
 pub(crate) struct MemoryControl {
@@ -67,7 +69,7 @@ impl MemoryControl {
     /// ids restart in every session.
     pub(crate) fn take(&self, id: HeapId, session: u32) {
         let (tx, cancel) = watch::channel(false);
-        self.cancels.lock().unwrap().insert(id, tx);
+        self.cancels.lock().unwrap().insert((session, id), tx);
         let _ = self.tx.send(Msg::Take(Take {
             id,
             session,
@@ -77,8 +79,8 @@ impl MemoryControl {
 
     /// Stops receiving snapshot `id`: the file is deleted, and chunks are ignored until the
     /// last one. The app's pause is not shortened.
-    pub(crate) fn cancel(&self, id: HeapId) {
-        if let Some(tx) = self.cancels.lock().unwrap().get(&id) {
+    pub(crate) fn cancel(&self, session: u32, id: HeapId) {
+        if let Some(tx) = self.cancels.lock().unwrap().get(&(session, id)) {
             tx.send_replace(true);
         }
     }
@@ -294,11 +296,11 @@ fn rpc_failure(e: &RpcError) -> Outcome {
 /// One snapshot, from the request to the file. Subscribes just before it and cancels after the
 /// reply, so snapshots other tools ask for never reach fdt.
 async fn transfer(job: Job, sink: Sink, svc: VmService, cfg: MemoryConfig) {
-    let id = job.take.id;
+    let (id, session) = (job.take.id, job.take.session);
     let _turn = job.turn.lock().await;
     let mut cancel = job.take.cancel;
     if *cancel.borrow() {
-        job.cancels.lock().unwrap().remove(&id);
+        job.cancels.lock().unwrap().remove(&(session, id));
         return;
     }
     let outcome = receive(
@@ -319,6 +321,7 @@ async fn transfer(job: Job, sink: Sink, svc: VmService, cfg: MemoryConfig) {
         } => {
             cancel_stream(&svc).await;
             sink.send(Ingest::HeapReceived {
+                session,
                 id,
                 time: sink.clock.from_epoch_ms(first_ms).time,
                 bytes,
@@ -329,6 +332,7 @@ async fn transfer(job: Job, sink: Sink, svc: VmService, cfg: MemoryConfig) {
         Outcome::Failed { message, details } => {
             log::debug!("heap snapshot {} failed: {message}", id.0);
             sink.send(Ingest::HeapFailed {
+                session,
                 id,
                 message,
                 details,
@@ -337,7 +341,7 @@ async fn transfer(job: Job, sink: Sink, svc: VmService, cfg: MemoryConfig) {
         }
         Outcome::Cancelled => cancel_stream(&svc).await,
     }
-    job.cancels.lock().unwrap().remove(&id);
+    job.cancels.lock().unwrap().remove(&(session, id));
 }
 
 async fn cancel_stream(svc: &VmService) {
@@ -415,7 +419,8 @@ async fn receive(
                 let Some(c) = chunk else {
                     return if cancelled { Outcome::Cancelled } else { failed(DISCONNECTED, "chunk channel closed") };
                 };
-                if c.isolate_id != isolate {
+                // One snapshot per request: another client's, for this isolate, may follow.
+                if c.isolate_id != isolate || last {
                     continue;
                 }
                 idle.as_mut().reset(tokio::time::Instant::now() + cfg.chunk_timeout);
@@ -431,7 +436,7 @@ async fn receive(
                     chunks += 1;
                     if staged.is_none_or(|t| t.elapsed() >= STAGE_EVERY) {
                         staged = Some(Instant::now());
-                        sink.send(Ingest::HeapStage(id, HeapStage::Receiving { bytes, chunks }));
+                        sink.send(Ingest::HeapStage(session, id, HeapStage::Receiving { bytes, chunks }));
                     }
                 } else {
                     chunks += 1;

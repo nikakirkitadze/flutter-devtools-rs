@@ -368,6 +368,11 @@ impl MemoryStore {
         true
     }
 
+    /// Lets go of the record's file, which is deleted once nothing else holds it.
+    pub(crate) fn drop_file(&mut self, id: HeapId) -> bool {
+        self.heap_edit(id, |h| h.file = None)
+    }
+
     pub(crate) fn set_diff(&mut self, id: HeapId, diff: Option<Arc<HeapDiff>>) -> bool {
         self.heap_edit(id, |h| h.diff = diff)
     }

@@ -161,15 +161,15 @@ impl Session {
         };
         if hub_owned(&stage) {
             if let Some(m) = &self.memory {
-                m.cancel(id);
+                m.cancel(self.heap.session, id);
             }
             w.set_heap_stage(id, HeapStage::Cancelled);
         } else if self.heap.job.as_ref().is_some_and(|j| j.id == id) {
             // The job answers with `Cancelled` (or a result, which is dropped).
             self.heap.cancel_job();
         } else if let Some(at) = self.heap.queue.iter().position(|q| q.id == id) {
-            self.heap.queue.remove(at);
-            w.set_heap_stage(id, HeapStage::Cancelled);
+            let q = self.heap.queue.remove(at);
+            end_analysis(w, id, q.fresh, HeapStage::Cancelled);
         }
     }
 
@@ -206,7 +206,7 @@ impl Session {
         if hub_owned(&stage)
             && let Some(m) = &self.memory
         {
-            m.cancel(id);
+            m.cancel(self.heap.session, id);
         }
         if self.heap.job.as_ref().is_some_and(|j| j.id == id) {
             self.heap.cancel_job();
@@ -240,7 +240,7 @@ impl Session {
             && let Some(id) = w.busy_heap()
             && w.heap_record(id).is_some_and(|r| hub_owned(&r.stage))
         {
-            m.cancel(id);
+            m.cancel(self.heap.session, id);
         }
         self.heap.cancel_job();
         self.heap.job = None;
@@ -271,7 +271,10 @@ impl Session {
         }
     }
 
-    pub(crate) fn heap_stage(&mut self, id: HeapId, stage: HeapStage) {
+    pub(crate) fn heap_stage(&mut self, session: u32, id: HeapId, stage: HeapStage) {
+        if session != self.heap.session {
+            return;
+        }
         if let Some(w) = self.writer.as_mut()
             && w.heap_record(id).is_some_and(|r| hub_owned(&r.stage))
         {
@@ -279,7 +282,10 @@ impl Session {
         }
     }
 
-    pub(crate) fn heap_failed(&mut self, id: HeapId, message: &str, details: &str) {
+    pub(crate) fn heap_failed(&mut self, session: u32, id: HeapId, message: &str, details: &str) {
+        if session != self.heap.session {
+            return;
+        }
         if let Some(w) = self.writer.as_mut()
             && w.heap_record(id).is_some_and(|r| hub_owned(&r.stage))
         {
@@ -293,16 +299,22 @@ impl Session {
         }
     }
 
-    /// The file is whole. A record that was cancelled or removed meanwhile drops it here, which
-    /// deletes it.
+    /// The file is whole. A snapshot of an older session, or of a record that was cancelled or
+    /// removed meanwhile, drops it here, which deletes it.
     pub(crate) fn heap_received(
         &mut self,
+        session: u32,
         id: HeapId,
         time: fdt_store::time::SessionTime,
         bytes: u64,
         file: Arc<HeapFile>,
         root_package: Option<String>,
     ) {
+        // Ids restart in every session: a snapshot of an older one is not this one's, and its
+        // file goes as `file` drops.
+        if session != self.heap.session {
+            return;
+        }
         let Some(w) = self.writer.as_mut() else {
             return;
         };
@@ -452,7 +464,7 @@ impl Session {
                     return self.next_analysis();
                 }
                 if job.cancel.load(Ordering::Relaxed) {
-                    w.set_heap_stage(id, HeapStage::Cancelled);
+                    end_analysis(w, id, job.fresh, HeapStage::Cancelled);
                     return self.next_analysis();
                 }
                 w.set_heap_analysed(id, Arc::new(*summary), Arc::new(*index));
@@ -467,27 +479,25 @@ impl Session {
                 self.next_analysis();
             }
             HeapMsg::Cancelled(id) => {
-                if self.finish_job(id).is_some()
+                if let Some(job) = self.finish_job(id)
                     && let Some(w) = self.writer.as_mut()
                     && w.heap_record(id).is_some_and(|r| analysing(&r.stage))
                 {
-                    w.set_heap_stage(id, HeapStage::Cancelled);
+                    end_analysis(w, id, job.fresh, HeapStage::Cancelled);
                 }
                 self.next_analysis();
             }
             HeapMsg::Failed { id, details } => {
-                if self.finish_job(id).is_some()
+                if let Some(job) = self.finish_job(id)
                     && let Some(w) = self.writer.as_mut()
                     && w.heap_record(id).is_some_and(|r| analysing(&r.stage))
                 {
                     log::debug!("heap snapshot {} could not be analysed", id.0);
-                    w.set_heap_stage(
-                        id,
-                        HeapStage::Failed {
-                            message: UNREADABLE.into(),
-                            details: details.into(),
-                        },
-                    );
+                    let failed = HeapStage::Failed {
+                        message: UNREADABLE.into(),
+                        details: details.into(),
+                    };
+                    end_analysis(w, id, job.fresh, failed);
                 }
                 self.next_analysis();
             }
@@ -501,6 +511,18 @@ impl Session {
         } else {
             None
         }
+    }
+}
+
+/// An analysis ended without a result. A snapshot just taken has nothing but its file, which
+/// goes (the record stays, to say what happened). One that was opened again is still a good
+/// record, so it goes back to `Ready`; only the held index stays as it was.
+fn end_analysis(w: &mut fdt_store::SessionWriter, id: HeapId, fresh: bool, stage: HeapStage) {
+    if fresh {
+        w.drop_heap_file(id);
+        w.set_heap_stage(id, stage);
+    } else {
+        w.set_heap_stage(id, HeapStage::Ready);
     }
 }
 
