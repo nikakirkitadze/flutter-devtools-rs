@@ -101,6 +101,16 @@ pub struct PerformanceView {
     _subs: Vec<Subscription>,
 }
 
+/// What the shown tab offers for focus.
+enum Canvas {
+    /// A tab with no canvas.
+    None,
+    /// A canvas whose result is still computing; a request for it waits.
+    Computing,
+    /// A canvas, and whether it has data and is drawn.
+    Target(FocusHandle, bool),
+}
+
 impl EventEmitter<OpenLocation> for PerformanceView {}
 impl EventEmitter<ReplaceLocation> for PerformanceView {}
 
@@ -324,30 +334,34 @@ impl PerformanceView {
         }
     }
 
-    /// The shown tab's canvas and whether it is drawn: the frame chart, the Raw trace, or the
-    /// CPU tab's flame chart (the CPU tab focuses its own tree). `None` for a tab with no
-    /// canvas to focus. Focus on a canvas that is not drawn would leave the keys with nowhere to
-    /// go, so a canvas that is not drawn is never given it.
-    fn canvas_target(&self, cx: &Context<Self>) -> Option<(FocusHandle, bool)> {
+    /// The shown tab's canvas: the frame chart, the Raw trace, or the CPU tab's flame chart (the
+    /// CPU tab focuses its own tree). Focus on a canvas that is not drawn would leave the keys
+    /// with nowhere to go, so a canvas with no data to draw is never given it.
+    fn canvas_target(&self, cx: &Context<Self>) -> Canvas {
         match self.tab {
-            PerfTab::Frames => Some((
+            PerfTab::Frames => Canvas::Target(
                 self.chart.read(cx).focus_handle().clone(),
                 !self.session.read(cx).snapshot().frames.is_empty(),
-            )),
+            ),
             PerfTab::Trace => {
                 let trace = self.trace.read(cx);
-                Some((trace.focus_handle().clone(), !trace.is_empty()))
+                Canvas::Target(trace.focus_handle().clone(), !trace.is_empty())
             }
             PerfTab::Cpu => {
                 let cpu = self.cpu.read(cx);
-                (cpu.mode() == super::cpu_tab::CpuMode::Flame).then(|| {
-                    (
+                if cpu.mode() != super::cpu_tab::CpuMode::Flame {
+                    Canvas::None
+                } else if cpu.sample_count(cx) > 0 && !cpu.flame_shown(cx) {
+                    // The result is still computing: the request waits for it.
+                    Canvas::Computing
+                } else {
+                    Canvas::Target(
                         cpu.flame().read(cx).focus_handle().clone(),
                         cpu.flame_shown(cx),
                     )
-                })
+                }
             }
-            PerfTab::Rebuilds => None,
+            PerfTab::Rebuilds => Canvas::None,
         }
     }
 
@@ -630,10 +644,11 @@ impl Render for PerformanceView {
         }
         if self.page_active {
             match self.canvas_target(cx) {
-                Some((canvas, drawn)) => {
+                Canvas::Target(canvas, drawn) => {
                     self.focus_pending.take(window, cx, &canvas, drawn);
                 }
-                None => self.focus_pending.cancel(),
+                Canvas::Computing => {}
+                Canvas::None => self.focus_pending.cancel(),
             }
         }
         if self.tab != PerfTab::Cpu {

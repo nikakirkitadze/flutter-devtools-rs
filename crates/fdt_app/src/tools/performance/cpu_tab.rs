@@ -1242,7 +1242,9 @@ impl Render for CpuTab {
             self.render_tree(cx)
         };
         let tree_shown = samples > 0 && self.has_result() && self.mode != CpuMode::Flame;
-        if self.focus_pending.due(window, cx, tree_shown) {
+        // A result still computing keeps the request; only a tab with no samples drops it.
+        let computing = samples > 0 && !self.has_result();
+        if !computing && self.focus_pending.due(window, cx, tree_shown) {
             self.focus_tree(window, cx);
         } else if !tree_shown {
             let to = self.focus.clone();
@@ -1326,6 +1328,35 @@ mod tests {
         frame(cx);
         let tab = shell.read_with(cx, |s, cx| s.performance_view().read(cx).cpu().clone());
         (shell, tab, cx)
+    }
+
+    /// Entering the CPU tab asks for the tree's focus before its result is computed; the first
+    /// frames, drawn while it computes, must not drop the request.
+    #[gpui_kit::test]
+    fn the_tree_takes_focus_when_its_result_arrives_after_the_first_frame(cx: &mut TestAppContext) {
+        let (shell, cx) = open_shell_snapshot(cx, cpu_snapshot());
+        cx.dispatch_action(crate::actions::ShowPerformance);
+        cx.run_until_parked();
+        frame(cx);
+        let tab = shell.read_with(cx, |s, cx| s.performance_view().read(cx).cpu().clone());
+        // Switch tabs and draw at once, without letting the background compute finish.
+        shell.update(cx, |s, cx| {
+            s.performance_view().update(cx, |v, cx| {
+                v.set_tab(crate::tools::performance::PerfTab::Cpu, cx)
+            })
+        });
+        frame(cx);
+        assert!(
+            !tab.read_with(cx, |t, _| t.has_result()),
+            "the first frame is drawn before the result"
+        );
+        cx.run_until_parked();
+        frame(cx);
+        assert!(tab.read_with(cx, |t, _| t.has_result()));
+        assert!(
+            tab.read_with(cx, |t, _| t.tree_focus),
+            "the tree took the focus once drawn"
+        );
     }
 
     fn labels(tab: &Entity<CpuTab>, cx: &mut VisualTestContext) -> Vec<String> {
