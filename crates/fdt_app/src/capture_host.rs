@@ -5,6 +5,7 @@
 
 use fdt_capture::{Capture, CaptureConfig, CaptureRuntime, ConnStatus, Target};
 use fdt_store::Snapshot;
+use fdt_store::heap::HeapId;
 use fdt_store::net::{BodyKind, BodyLimits};
 use fdt_store::time::EntryId;
 use fdt_vm::devices::{Candidate, DeviceWatch, DeviceWatchConfig, WatchStatus};
@@ -31,6 +32,15 @@ pub trait CaptureControl: 'static {
     fn fetch_cpu_samples(&self);
     /// Fetches the allocation profile; `gc` collects garbage first ("Live objects only").
     fn fetch_allocation_profile(&self, gc: bool);
+    /// Takes a heap snapshot of the app and analyses it. The app pauses while it is written.
+    fn take_heap_snapshot(&self);
+    /// Cancels the snapshot being received or analysed.
+    fn cancel_heap_snapshot(&self);
+    /// Analyses an older snapshot again, so it becomes the held one.
+    fn open_heap_snapshot(&self, id: HeapId);
+    fn remove_heap_snapshot(&self, id: HeapId);
+    /// Chooses what the held snapshot is compared with; `None` means the previous snapshot.
+    fn set_heap_baseline(&self, id: Option<HeapId>);
     fn set_trace_widget_builds(&self, on: bool);
     /// The "Trace widget builds by default" setting changed: the next connection starts with it.
     fn set_trace_default(&self, on: bool);
@@ -68,6 +78,21 @@ impl CaptureControl for Capture {
     }
     fn fetch_allocation_profile(&self, gc: bool) {
         Capture::fetch_allocation_profile(self, gc);
+    }
+    fn take_heap_snapshot(&self) {
+        Capture::take_heap_snapshot(self);
+    }
+    fn cancel_heap_snapshot(&self) {
+        Capture::cancel_heap_snapshot(self);
+    }
+    fn open_heap_snapshot(&self, id: HeapId) {
+        Capture::open_heap_snapshot(self, id);
+    }
+    fn remove_heap_snapshot(&self, id: HeapId) {
+        Capture::remove_heap_snapshot(self, id);
+    }
+    fn set_heap_baseline(&self, id: Option<HeapId>) {
+        Capture::set_heap_baseline(self, id);
     }
     fn set_trace_widget_builds(&self, on: bool) {
         Capture::set_trace_widget_builds(self, on);
@@ -403,6 +428,28 @@ mod tests {
             vec![
                 "alloc_profile false".to_string(),
                 "alloc_profile true".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn fake_capture_logs_heap_commands() {
+        let (fake, handle) = crate::test_support::fake_capture();
+        CaptureControl::take_heap_snapshot(&fake);
+        CaptureControl::cancel_heap_snapshot(&fake);
+        CaptureControl::open_heap_snapshot(&fake, HeapId(1));
+        CaptureControl::remove_heap_snapshot(&fake, HeapId(2));
+        CaptureControl::set_heap_baseline(&fake, Some(HeapId(3)));
+        CaptureControl::set_heap_baseline(&fake, None);
+        assert_eq!(
+            handle.commands(),
+            vec![
+                "heap_take".to_string(),
+                "heap_cancel".to_string(),
+                "heap_open 1".to_string(),
+                "heap_remove 2".to_string(),
+                "heap_baseline 3".to_string(),
+                "heap_baseline none".to_string(),
             ]
         );
     }

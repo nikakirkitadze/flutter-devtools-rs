@@ -3,40 +3,52 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use fdt_store::heap::{HeapFile, HeapId, HeapStage};
 use fdt_store::memory::{GcKind, GcReason, GcRecord};
 use fdt_store::time::RunId;
 use fdt_vm::events::{GcEvent, HeapSpace};
 use fdt_vm::rpc::RpcError;
 use fdt_vm::service::VmService;
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::{mpsc, watch};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::MissedTickBehavior;
 
-use super::{Ingest, SharedSink};
+use super::{Ingest, SharedSink, Sink};
 
 /// What the memory task needs, from `CaptureConfig`.
 #[derive(Clone, Debug)]
 pub(crate) struct MemoryConfig {
     pub(crate) poll: Duration,
     pub(crate) profile_timeout: Duration,
-    /// Used by the heap snapshot transfer.
-    #[allow(dead_code)]
+    /// A heap snapshot request gives up after this long.
     pub(crate) request_timeout: Duration,
-    #[allow(dead_code)]
+    /// A heap snapshot gives up when no chunk arrives for this long.
     pub(crate) chunk_timeout: Duration,
-    #[allow(dead_code)]
     pub(crate) heap_dir: PathBuf,
 }
 
 enum Msg {
     FetchProfile(bool),
+    Take(Take),
 }
+
+/// One snapshot to take.
+struct Take {
+    id: HeapId,
+    session: u32,
+    cancel: watch::Receiver<bool>,
+}
+
+type Cancels = Arc<Mutex<HashMap<HeapId, watch::Sender<bool>>>>;
 
 /// The connection's memory commands.
 pub(crate) struct MemoryControl {
     tx: mpsc::UnboundedSender<Msg>,
+    target: Arc<Mutex<Target>>,
+    cancels: Cancels,
 }
 
 impl MemoryControl {
@@ -44,6 +56,31 @@ impl MemoryControl {
     /// every client sees; the caller passes it only when the user switched it on.
     pub(crate) fn fetch_profile(&self, gc: bool) {
         let _ = self.tx.send(Msg::FetchProfile(gc));
+    }
+
+    /// The isolate a snapshot taken now would cover.
+    pub(crate) fn main_isolate(&self) -> String {
+        self.target.lock().unwrap().main.clone()
+    }
+
+    /// Takes the snapshot `id` of the main isolate. `session` goes into the file name, because
+    /// ids restart in every session.
+    pub(crate) fn take(&self, id: HeapId, session: u32) {
+        let (tx, cancel) = watch::channel(false);
+        self.cancels.lock().unwrap().insert(id, tx);
+        let _ = self.tx.send(Msg::Take(Take {
+            id,
+            session,
+            cancel,
+        }));
+    }
+
+    /// Stops receiving snapshot `id`: the file is deleted, and chunks are ignored until the
+    /// last one. The app's pause is not shortened.
+    pub(crate) fn cancel(&self, id: HeapId) {
+        if let Some(tx) = self.cancels.lock().unwrap().get(&id) {
+            tx.send_replace(true);
+        }
     }
 }
 
@@ -58,6 +95,7 @@ pub(crate) struct MemoryHub {
     tx: mpsc::UnboundedSender<Msg>,
     task: JoinHandle<()>,
     target: Arc<Mutex<Target>>,
+    cancels: Cancels,
 }
 
 impl MemoryHub {
@@ -68,17 +106,33 @@ impl MemoryHub {
         cfg: MemoryConfig,
         main: String,
         group: String,
-        _root_package: Option<String>,
+        root_package: Option<String>,
     ) -> MemoryHub {
         let (tx, rx) = mpsc::unbounded_channel();
         let target = Arc::new(Mutex::new(Target { main, group }));
-        let task = tokio::spawn(run(sink, svc, cfg, rx, target.clone()));
-        MemoryHub { tx, task, target }
+        let cancels = Cancels::default();
+        let task = tokio::spawn(run(
+            sink,
+            svc,
+            cfg,
+            rx,
+            target.clone(),
+            cancels.clone(),
+            root_package,
+        ));
+        MemoryHub {
+            tx,
+            task,
+            target,
+            cancels,
+        }
     }
 
     pub(crate) fn control(&self) -> Arc<MemoryControl> {
         Arc::new(MemoryControl {
             tx: self.tx.clone(),
+            target: self.target.clone(),
+            cancels: self.cancels.clone(),
         })
     }
 
@@ -102,12 +156,19 @@ async fn run(
     cfg: MemoryConfig,
     mut rx: mpsc::UnboundedReceiver<Msg>,
     target: Arc<Mutex<Target>>,
+    cancels: Cancels,
+    root_package: Option<String>,
 ) {
+    // Snapshots go one at a time: the chunk receiver is the client's only one. Dropped with
+    // this task, which ends them.
+    let mut transfers = JoinSet::new();
+    let turn = Arc::new(tokio::sync::Mutex::new(()));
     let mut tick = tokio::time::interval(cfg.poll);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut rss_works = true;
     loop {
         tokio::select! {
+            Some(_) = transfers.join_next(), if !transfers.is_empty() => {}
             _ = tick.tick() => {
                 let group = target.lock().unwrap().group.clone();
                 if group.is_empty() {
@@ -154,9 +215,268 @@ async fn run(
                         }
                     });
                 }
+                Some(Msg::Take(take)) => {
+                    let isolate = target.lock().unwrap().main.clone();
+                    transfers.spawn(transfer(
+                        Job {
+                            take,
+                            isolate,
+                            root_package: root_package.clone(),
+                            turn: turn.clone(),
+                            cancels: cancels.clone(),
+                        },
+                        sink.get(),
+                        svc.clone(),
+                        cfg.clone(),
+                    ));
+                }
                 None => return,
             },
         }
+    }
+}
+
+const STREAM: &str = "HeapSnapshot";
+/// Progress reaches the session at most this often.
+const STAGE_EVERY: Duration = Duration::from_millis(100);
+/// Cancelling the stream must not hold up a result when the app has stopped answering.
+const CANCEL_WAIT: Duration = Duration::from_secs(2);
+
+const NO_SNAPSHOT: &str = "The app didn't send a snapshot.";
+const STOPPED: &str = "The app stopped sending the snapshot.";
+const DISCONNECTED: &str = "The app disconnected before the snapshot finished.";
+const REFUSED: &str = "The app couldn't take a snapshot.";
+const NOT_SAVED: &str = "The snapshot couldn't be saved.";
+
+struct Job {
+    take: Take,
+    isolate: String,
+    root_package: Option<String>,
+    turn: Arc<tokio::sync::Mutex<()>>,
+    cancels: Cancels,
+}
+
+/// The snapshot file while it is written. The handle is declared first so it closes before the
+/// file is deleted (Windows cannot delete an open file).
+struct Dest {
+    file: tokio::fs::File,
+    heap: Arc<HeapFile>,
+}
+
+enum Outcome {
+    Done {
+        heap: Arc<HeapFile>,
+        bytes: u64,
+        first_ms: i64,
+    },
+    Cancelled,
+    Failed {
+        message: &'static str,
+        details: String,
+    },
+}
+
+fn failed(message: &'static str, details: impl ToString) -> Outcome {
+    Outcome::Failed {
+        message,
+        details: details.to_string(),
+    }
+}
+
+fn rpc_failure(e: &RpcError) -> Outcome {
+    match e {
+        RpcError::Closed => failed(DISCONNECTED, e),
+        RpcError::Timeout => failed(STOPPED, e),
+        _ => failed(REFUSED, e),
+    }
+}
+
+/// One snapshot, from the request to the file. Subscribes just before it and cancels after the
+/// reply, so snapshots other tools ask for never reach fdt.
+async fn transfer(job: Job, sink: Sink, svc: VmService, cfg: MemoryConfig) {
+    let id = job.take.id;
+    let _turn = job.turn.lock().await;
+    let mut cancel = job.take.cancel;
+    if *cancel.borrow() {
+        job.cancels.lock().unwrap().remove(&id);
+        return;
+    }
+    let outcome = receive(
+        job.take.session,
+        id,
+        &job.isolate,
+        &svc,
+        &cfg,
+        &sink,
+        &mut cancel,
+    )
+    .await;
+    match outcome {
+        Outcome::Done {
+            heap,
+            bytes,
+            first_ms,
+        } => {
+            cancel_stream(&svc).await;
+            sink.send(Ingest::HeapReceived {
+                id,
+                time: sink.clock.from_epoch_ms(first_ms).time,
+                bytes,
+                file: heap,
+                root_package: job.root_package,
+            });
+        }
+        Outcome::Failed { message, details } => {
+            log::debug!("heap snapshot {} failed: {message}", id.0);
+            sink.send(Ingest::HeapFailed {
+                id,
+                message,
+                details,
+            });
+            cancel_stream(&svc).await;
+        }
+        Outcome::Cancelled => cancel_stream(&svc).await,
+    }
+    job.cancels.lock().unwrap().remove(&id);
+}
+
+async fn cancel_stream(svc: &VmService) {
+    let _ = tokio::time::timeout(CANCEL_WAIT, svc.stream_cancel(STREAM)).await;
+}
+
+async fn create(dir: &Path, session: u32, id: HeapId) -> std::io::Result<Dest> {
+    let mut dirs = tokio::fs::DirBuilder::new();
+    dirs.recursive(true);
+    #[cfg(unix)]
+    dirs.mode(0o700);
+    dirs.create(dir).await?;
+    let path = dir.join(format!(
+        "{}-{session}-{}.dartheap",
+        std::process::id(),
+        id.0
+    ));
+    let mut open = tokio::fs::OpenOptions::new();
+    open.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    open.mode(0o600);
+    let file = open.open(&path).await?;
+    Ok(Dest {
+        file,
+        heap: Arc::new(HeapFile::new(path)),
+    })
+}
+
+#[allow(clippy::too_many_arguments)] // one transfer, each argument a different thing it needs
+async fn receive(
+    session: u32,
+    id: HeapId,
+    isolate: &str,
+    svc: &VmService,
+    cfg: &MemoryConfig,
+    sink: &Sink,
+    cancel: &mut watch::Receiver<bool>,
+) -> Outcome {
+    if let Err(e) = svc.stream_listen(STREAM).await {
+        return rpc_failure(&e);
+    }
+    let mut dest = match create(&cfg.heap_dir, session, id).await {
+        Ok(d) => Some(d),
+        Err(e) => return failed(NOT_SAVED, e.kind()),
+    };
+    let mut rx = svc.client().heap_chunks();
+    // Chunks of a snapshot another client asked for in the meantime are not ours.
+    while rx.try_recv().is_ok() {}
+    let req = svc.request_heap_snapshot(isolate, cfg.request_timeout);
+    tokio::pin!(req);
+    let idle = tokio::time::sleep(cfg.chunk_timeout);
+    tokio::pin!(idle);
+    let mut reply: Option<Result<(), RpcError>> = None;
+    let mut cancelled = *cancel.borrow();
+    let mut watching = !cancelled;
+    if cancelled {
+        dest = None;
+    }
+    let (mut bytes, mut chunks, mut last, mut first_ms) = (0u64, 0u32, false, 0i64);
+    let mut staged: Option<Instant> = None;
+    loop {
+        tokio::select! {
+            biased;
+            changed = cancel.changed(), if watching => {
+                if changed.is_ok() && *cancel.borrow() {
+                    cancelled = true;
+                    watching = false;
+                    // Deleted now; the rest of the snapshot is read and thrown away.
+                    dest = None;
+                } else if changed.is_err() {
+                    watching = false;
+                }
+            }
+            chunk = rx.recv() => {
+                let Some(c) = chunk else {
+                    return if cancelled { Outcome::Cancelled } else { failed(DISCONNECTED, "chunk channel closed") };
+                };
+                if c.isolate_id != isolate {
+                    continue;
+                }
+                idle.as_mut().reset(tokio::time::Instant::now() + cfg.chunk_timeout);
+                last |= c.last;
+                if let Some(d) = dest.as_mut() {
+                    if chunks == 0 {
+                        first_ms = c.timestamp_ms;
+                    }
+                    if let Err(e) = d.file.write_all(&c.payload).await {
+                        return failed(NOT_SAVED, e.kind());
+                    }
+                    bytes += c.payload.len() as u64;
+                    chunks += 1;
+                    if staged.is_none_or(|t| t.elapsed() >= STAGE_EVERY) {
+                        staged = Some(Instant::now());
+                        sink.send(Ingest::HeapStage(id, HeapStage::Receiving { bytes, chunks }));
+                    }
+                } else {
+                    chunks += 1;
+                }
+                if cancelled && last {
+                    return Outcome::Cancelled;
+                }
+            }
+            r = &mut req, if reply.is_none() => reply = Some(r),
+            () = &mut idle => {
+                if cancelled {
+                    return Outcome::Cancelled;
+                }
+                if !last {
+                    return failed(STOPPED, "no chunk arrived in time");
+                }
+                // The data is whole; only the reply is missing.
+                reply = Some(Ok(()));
+            }
+        }
+        if reply.is_some() {
+            break;
+        }
+    }
+    // The reply follows the last chunk on one connection, so nothing is left in the queue.
+    if cancelled {
+        return Outcome::Cancelled;
+    }
+    match reply {
+        Some(Err(e)) => return rpc_failure(&e),
+        Some(Ok(())) if chunks == 0 => return failed(NO_SNAPSHOT, "no chunks"),
+        Some(Ok(())) if !last => return failed(STOPPED, "the last chunk never came"),
+        _ => {}
+    }
+    let Some(Dest { mut file, heap }) = dest else {
+        return Outcome::Cancelled;
+    };
+    if let Err(e) = file.flush().await {
+        return failed(NOT_SAVED, e.kind());
+    }
+    drop(file);
+    Outcome::Done {
+        heap,
+        bytes,
+        first_ms,
     }
 }
 

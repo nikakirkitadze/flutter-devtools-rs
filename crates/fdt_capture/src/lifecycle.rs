@@ -145,6 +145,7 @@ impl Session {
         };
         self.conn_gen += 1;
         self.life.shared = None;
+        self.fail_unfinished_heaps();
         self.perf = None;
         self.memory = None;
         self.net_restore = None;
@@ -458,6 +459,7 @@ impl Session {
         if self.writer.is_none() {
             return;
         }
+        self.new_heap_session();
         let mut w = SessionWriter::new(host_now_us());
         w.set_body_limits(self.cfg.body_limits);
         self.net.new_session();
@@ -532,6 +534,10 @@ impl Session {
             | Ingest::MemorySample { .. }
             | Ingest::Gc(..)
             | Ingest::AllocProfile { .. }
+            // A snapshot file arriving late is deleted as this drops.
+            | Ingest::HeapStage(..)
+            | Ingest::HeapReceived { .. }
+            | Ingest::HeapFailed { .. }
             | Ingest::NetRestoreReady(_)
             | Ingest::Tracing(..) => {}
             Ingest::StartRun { .. }

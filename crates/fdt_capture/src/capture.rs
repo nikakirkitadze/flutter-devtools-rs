@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use fdt_store::heap::HeapId;
 use fdt_store::net::{BodyKind, BodyLimits};
 use fdt_store::time::{EntryId, RunId};
 use fdt_store::{SessionWriter, Snapshot};
@@ -14,6 +15,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 
 use crate::config::CaptureConfig;
+use crate::heap::{HeapAnalyser, HeapMsg};
 use crate::ingest::http::{NetRestore, NetState};
 use crate::ingest::memory::MemoryControl;
 use crate::ingest::perf::{self, PerfControl};
@@ -42,6 +44,12 @@ pub(crate) enum Command {
     FetchCpuNow,
     /// An allocation profile of the main isolate; `true` collects garbage first.
     FetchAllocProfile(bool),
+    /// Takes a heap snapshot of the main isolate; ignored while one is going on.
+    TakeHeap,
+    CancelHeap,
+    OpenHeap(HeapId),
+    RemoveHeap(HeapId),
+    SetHeapBaseline(Option<HeapId>),
     SetTraceWidgetBuilds(bool),
     /// The settings' default for widget-build tracing changed.
     SetTraceDefault(bool),
@@ -53,6 +61,8 @@ pub(crate) enum SessionMsg {
     Command(Command),
     /// From the connection task of generation `.0`; stale generations are ignored.
     Ingest(u64, Ingest),
+    /// From an analysis job of session `.0`; results of an older session are dropped.
+    Heap(u32, HeapMsg),
 }
 
 /// The app's handle on capture. Cheap to use from any thread; nothing here blocks.
@@ -133,6 +143,32 @@ impl Capture {
         self.command(Command::FetchAllocProfile(gc));
     }
 
+    /// Takes a heap snapshot of the app's main isolate and analyses it. The app pauses while the
+    /// snapshot is written. Ignored while one is being taken or analysed, or with no app.
+    pub fn take_heap_snapshot(&self) {
+        self.command(Command::TakeHeap);
+    }
+
+    /// Cancels the snapshot being received or analysed. Cancelling a receive does not shorten the
+    /// app's pause.
+    pub fn cancel_heap_snapshot(&self) {
+        self.command(Command::CancelHeap);
+    }
+
+    /// Analyses an older snapshot again from its file, so it becomes the held one.
+    pub fn open_heap_snapshot(&self, id: HeapId) {
+        self.command(Command::OpenHeap(id));
+    }
+
+    pub fn remove_heap_snapshot(&self, id: HeapId) {
+        self.command(Command::RemoveHeap(id));
+    }
+
+    /// Chooses what the held snapshot is compared with; `None` goes back to the previous snapshot.
+    pub fn set_heap_baseline(&self, id: Option<HeapId>) {
+        self.command(Command::SetHeapBaseline(id));
+    }
+
     /// Traces widget builds in the app (about +30 % build time while on) and takes the timeline
     /// from the `Timeline` stream. Kept across connects and hot restarts.
     pub fn set_trace_widget_builds(&self, on: bool) {
@@ -184,6 +220,8 @@ pub(crate) struct Session {
     pub(crate) perf: Option<Arc<PerfControl>>,
     /// The live connection's memory task, for commands.
     pub(crate) memory: Option<Arc<MemoryControl>>,
+    /// Heap snapshot analysis, which outlives connections.
+    pub(crate) heap: HeapAnalyser,
     /// What to put back in the live connection's app when the user disconnects.
     pub(crate) net_restore: Option<Arc<NetRestore>>,
     /// Whether widget builds should be traced, whatever the connection (from the settings, then
@@ -222,6 +260,7 @@ impl Session {
             life: Lifecycle::new(),
             perf: None,
             memory: None,
+            heap: HeapAnalyser::new(),
             net_restore: None,
             tracing_actual: false,
         }
@@ -229,6 +268,9 @@ impl Session {
 
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<SessionMsg>) {
         let mut due: Option<Instant> = None;
+        let heap_dir = crate::heap::heap_dir(&self.cfg);
+        // Files of fdt processes that are gone; off this task, it lists a folder.
+        tokio::task::spawn_blocking(move || crate::heap::remove_stale_files(&heap_dir));
         let mut discovery = self.discovery.take();
         if let Some(d) = &discovery {
             self.life.apps = d.borrow().clone();
@@ -257,6 +299,11 @@ impl Session {
                     Some(SessionMsg::Command(c)) => self.command(c),
                     Some(SessionMsg::Ingest(g, i))
                         if g == self.conn_gen || self.ends_live_connection(g, &i) => self.ingest(i),
+                    Some(SessionMsg::Heap(s, m)) => {
+                        if s == self.heap.session {
+                            self.on_heap(m);
+                        }
+                    }
                     Some(SessionMsg::Ingest(g, i)) => {
                         log::debug!("ignoring stale connection {g}");
                         self.on_stale(i);
@@ -345,6 +392,11 @@ impl Session {
                     m.fetch_profile(gc);
                 }
             }
+            Command::TakeHeap => self.take_heap(),
+            Command::CancelHeap => self.cancel_heap(),
+            Command::OpenHeap(id) => self.open_heap(id),
+            Command::RemoveHeap(id) => self.remove_heap(id),
+            Command::SetHeapBaseline(id) => self.set_heap_baseline(id),
             Command::Disconnect => {} // handled by the run loop, which restores first
             Command::SetTraceWidgetBuilds(on) => {
                 self.wanted_tracing = on;
@@ -394,6 +446,19 @@ impl Session {
             }
             Ingest::Failed { message, details } => return self.on_failed(message, details),
             Ingest::Closed => return self.on_closed(),
+            Ingest::HeapStage(id, stage) => return self.heap_stage(id, stage),
+            Ingest::HeapFailed {
+                id,
+                message,
+                details,
+            } => return self.heap_failed(id, message, &details),
+            Ingest::HeapReceived {
+                id,
+                time,
+                bytes,
+                file,
+                root_package,
+            } => return self.heap_received(id, time, bytes, file, root_package),
             _ => {}
         }
         let recording = self.life.recording;
@@ -401,7 +466,12 @@ impl Session {
             return;
         };
         match i {
-            Ingest::StartRun { .. } | Ingest::Failed { .. } | Ingest::Closed => {}
+            Ingest::StartRun { .. }
+            | Ingest::Failed { .. }
+            | Ingest::Closed
+            | Ingest::HeapStage(..)
+            | Ingest::HeapFailed { .. }
+            | Ingest::HeapReceived { .. } => {}
             Ingest::Log(l) => {
                 if recording {
                     w.push_log(l);

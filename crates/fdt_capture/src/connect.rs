@@ -363,10 +363,7 @@ async fn connect_and_ingest(
             profile_timeout: cfg.alloc_profile_timeout,
             request_timeout: cfg.heap_request_timeout,
             chunk_timeout: cfg.heap_chunk_timeout,
-            heap_dir: cfg
-                .heap_dir
-                .clone()
-                .unwrap_or_else(|| std::env::temp_dir().join("fdt-heaps")),
+            heap_dir: crate::heap::heap_dir(cfg),
         },
         main.clone(),
         group.clone(),

@@ -53,7 +53,9 @@ impl Sim {
                         "isolateGroupId": GROUP}]})),
                 "getIsolate" => Ok(json!({"type": "Isolate", "id": iso, "name": "main",
                     "extensionRPCs": [], "rootLib": {"uri": "package:demo/main.dart"}})),
-                "streamListen" | "streamCancel" => Ok(json!({"type": "Success"})),
+                "streamListen" | "streamCancel" | "requestHeapSnapshot" => {
+                    Ok(json!({"type": "Success"}))
+                }
                 "getVMTimelineMicros" => Ok(json!({"type": "Timestamp", "timestamp": 1_000_000})),
                 "getVMTimelineFlags" => Ok(json!({"type": "TimelineFlags",
                     "availableStreams": ["Dart", "Embedder"],
@@ -453,6 +455,715 @@ fn hot_restart_moves_polling_to_the_new_group() {
                 .any(|p| p["isolateId"] == "isolates/2")
         })
         .await;
+        drop(cap);
+    });
+}
+
+// ---- Heap snapshots ----
+
+use fdt_analysis::heap::{SnapshotBuilder, Value as HeapValue, encode_full};
+use fdt_store::heap::{HeapRecord, HeapStage, LeakKind};
+use fdt_vm::heap_snapshot::encode_frame;
+
+const FW: &str = "package:flutter/src/widgets/framework.dart";
+const APP: &str = "package:demo/leaks.dart";
+
+/// A snapshot with one unmounted `State` (a finding) and `things` objects of a class of the app.
+fn heap_bytes(things: u32) -> Vec<u8> {
+    let mut b = SnapshotBuilder::new();
+    let nul = b.class("Null", "dart:core", &[]);
+    b.class("State", FW, &["type_arguments", "_widget", "_element"]);
+    let leaky = b.class(
+        "_LeakyState",
+        APP,
+        &["type_arguments", "_widget", "_element", "_text"],
+    );
+    let thing = b.class("Thing", APP, &["next"]);
+    let null = b.object(nul, 0, HeapValue::Null, &[]);
+    let st = b.object(leaky, 32, HeapValue::None, &[0, 0, null, 0]);
+    b.hash(st, 777);
+    b.static_field("instance", st);
+    for i in 0..things {
+        let t = b.object(thing, 24, HeapValue::None, &[0]);
+        b.hash(t, 1000 + i);
+        b.static_field(&format!("thing{i}"), t);
+    }
+    encode_full(&b.finish())
+}
+
+fn frames_of(bytes: &[u8], parts: usize) -> Vec<Vec<u8>> {
+    let size = bytes.len().div_ceil(parts);
+    let n = bytes.chunks(size).count();
+    bytes
+        .chunks(size)
+        .enumerate()
+        .map(|(i, c)| encode_frame("isolates/1", now_ms() + i as i64, i + 1 == n, c))
+        .collect()
+}
+
+fn script(server: &ScriptedServer, bytes: &[u8]) {
+    server.script_binary("requestHeapSnapshot", frames_of(bytes, 3));
+}
+
+fn heap_config(dir: &std::path::Path) -> CaptureConfig {
+    CaptureConfig {
+        heap_dir: Some(dir.to_path_buf()),
+        reconnect_uri_retry: Duration::from_millis(50),
+        ..config()
+    }
+}
+
+fn files(dir: &std::path::Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .map(|r| {
+            r.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+async fn heap_is(cap: &Capture, what: &str, pred: impl Fn(&HeapRecord) -> bool) -> Arc<Snapshot> {
+    common::wait_for(cap, LIMIT, what, |s| s.memory.heaps().iter().any(&pred)).await
+}
+
+fn ready(h: &HeapRecord) -> bool {
+    h.stage == HeapStage::Ready
+}
+
+fn failed_with(h: &HeapRecord, text: &str) -> bool {
+    matches!(&h.stage, HeapStage::Failed { message, .. } if &**message == text)
+}
+
+fn count_ready(s: &Snapshot) -> usize {
+    s.memory.heaps().iter().filter(|h| ready(h)).count()
+}
+
+/// The calls on the `HeapSnapshot` stream and the request, in the order they arrived.
+fn transfer_calls(server: &ScriptedServer) -> Vec<String> {
+    server
+        .received()
+        .into_iter()
+        .filter_map(|(m, p)| match m.as_str() {
+            "streamListen" | "streamCancel" if p["streamId"] == "HeapSnapshot" => {
+                Some(format!("{m} {}", p["streamId"].as_str().unwrap()))
+            }
+            "requestHeapSnapshot" => Some(format!("{m} {}", p["isolateId"].as_str().unwrap())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn take_subscribes_requests_and_cancels_in_order() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let (dir, server) = (
+            tempfile::tempdir().unwrap(),
+            Sim::new(false, false).server(),
+        );
+        script(&server, &heap_bytes(0));
+        let cap = start(&server, heap_config(dir.path()), &rt);
+        connected(&cap).await;
+        assert!(
+            transfer_calls(&server).is_empty(),
+            "nothing is subscribed until a snapshot is asked for"
+        );
+        cap.take_heap_snapshot();
+        heap_is(&cap, "a ready snapshot", ready).await;
+        common::eventually(LIMIT, "the stream cancel", || {
+            transfer_calls(&server).len() == 3
+        })
+        .await;
+        assert_eq!(
+            transfer_calls(&server),
+            [
+                "streamListen HeapSnapshot",
+                "requestHeapSnapshot isolates/1",
+                "streamCancel HeapSnapshot"
+            ]
+        );
+        drop(cap);
+    });
+}
+
+#[test]
+fn chunks_become_a_ready_record_with_findings() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let (dir, server) = (
+            tempfile::tempdir().unwrap(),
+            Sim::new(false, false).server(),
+        );
+        let bytes = heap_bytes(2);
+        script(&server, &bytes);
+        let cap = start(&server, heap_config(dir.path()), &rt);
+        connected(&cap).await;
+        cap.take_heap_snapshot();
+        let s = heap_is(&cap, "a ready snapshot", |h| ready(h) && h.index.is_some()).await;
+        let h = &s.memory.heaps()[0];
+        assert_eq!(h.bytes, bytes.len() as u64);
+        assert_eq!(&*h.isolate, "isolates/1");
+        assert_eq!(s.memory.held(), Some(h.id));
+        let sum = h.summary.as_ref().unwrap();
+        assert_eq!(sum.findings_total, 1, "{:?}", sum.checks);
+        assert_eq!(sum.findings[0].kind, LeakKind::UnmountedState);
+        assert_eq!(sum.root_package.as_deref(), Some("demo"));
+        // The file holds exactly the chunks, in order, in the heap directory.
+        let path = h.file.as_ref().unwrap().path().to_path_buf();
+        assert_eq!(path.parent(), Some(dir.path()));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(
+            name,
+            format!("{}-{}-{}.dartheap", std::process::id(), 0, h.id.0)
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "snapshots are private to the user");
+        }
+        drop(cap);
+    });
+}
+
+#[test]
+fn success_without_chunks_fails() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let (dir, server) = (
+            tempfile::tempdir().unwrap(),
+            Sim::new(false, false).server(),
+        );
+        let cap = start(&server, heap_config(dir.path()), &rt);
+        connected(&cap).await;
+        cap.take_heap_snapshot();
+        heap_is(&cap, "a failure", |h| {
+            failed_with(h, "The app didn't send a snapshot.")
+        })
+        .await;
+        common::eventually(LIMIT, "the stream cancel", || {
+            transfer_calls(&server)
+                .last()
+                .is_some_and(|c| c.starts_with("streamCancel"))
+        })
+        .await;
+        assert!(files(dir.path()).is_empty(), "the empty file is deleted");
+        // The next snapshot works.
+        script(&server, &heap_bytes(0));
+        cap.take_heap_snapshot();
+        let s = heap_is(&cap, "a ready snapshot", ready).await;
+        assert_eq!(s.memory.heaps().len(), 2);
+        drop(cap);
+    });
+}
+
+#[test]
+fn success_without_the_last_chunk_fails() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let (dir, server) = (
+            tempfile::tempdir().unwrap(),
+            Sim::new(false, false).server(),
+        );
+        let mut frames = frames_of(&heap_bytes(0), 3);
+        frames.pop();
+        server.script_binary("requestHeapSnapshot", frames);
+        let cap = start(&server, heap_config(dir.path()), &rt);
+        connected(&cap).await;
+        cap.take_heap_snapshot();
+        heap_is(&cap, "a failure", |h| {
+            failed_with(h, "The app stopped sending the snapshot.")
+        })
+        .await;
+        assert!(files(dir.path()).is_empty());
+        drop(cap);
+    });
+}
+
+#[test]
+fn unsolicited_chunks_are_ignored() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let (dir, server) = (
+            tempfile::tempdir().unwrap(),
+            Sim::new(false, false).server(),
+        );
+        let bytes = heap_bytes(0);
+        let cap = start(&server, heap_config(dir.path()), &rt);
+        connected(&cap).await;
+        // Another tool's snapshot while none of ours is in flight.
+        for f in frames_of(&bytes, 3) {
+            server.send_binary(f);
+        }
+        // During ours, a chunk of another isolate comes first.
+        let mut ours = vec![encode_frame("isolates/9", 1, true, b"not our snapshot")];
+        ours.extend(frames_of(&bytes, 3));
+        server.script_binary("requestHeapSnapshot", ours);
+        cap.take_heap_snapshot();
+        let s = heap_is(&cap, "a ready snapshot", ready).await;
+        assert_eq!(s.memory.heaps().len(), 1);
+        assert_eq!(s.memory.heaps()[0].bytes, bytes.len() as u64);
+        drop(cap);
+    });
+}
+
+#[test]
+fn second_take_while_busy_is_ignored() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let (dir, server) = (
+            tempfile::tempdir().unwrap(),
+            Sim::new(false, false).server(),
+        );
+        server.silence("requestHeapSnapshot");
+        let cap = start(&server, heap_config(dir.path()), &rt);
+        connected(&cap).await;
+        cap.take_heap_snapshot();
+        common::eventually(LIMIT, "the request", || {
+            !calls(&server, "requestHeapSnapshot").is_empty()
+        })
+        .await;
+        cap.take_heap_snapshot();
+        // The profile fetch is handled after the second take, so its arrival is the barrier.
+        cap.fetch_allocation_profile(false);
+        common::eventually(LIMIT, "the barrier", || {
+            !calls(&server, "getAllocationProfile").is_empty()
+        })
+        .await;
+        assert_eq!(calls(&server, "requestHeapSnapshot").len(), 1);
+        let s = connected(&cap).await;
+        assert_eq!(s.memory.heaps().len(), 1);
+        drop(cap);
+    });
+}
+
+#[test]
+fn chunk_timeout_fails_and_deletes_the_file() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let (dir, server) = (
+            tempfile::tempdir().unwrap(),
+            Sim::new(false, false).server(),
+        );
+        server.silence("requestHeapSnapshot");
+        let cfg = CaptureConfig {
+            heap_chunk_timeout: Duration::from_millis(300),
+            ..heap_config(dir.path())
+        };
+        let cap = start(&server, cfg, &rt);
+        connected(&cap).await;
+        cap.take_heap_snapshot();
+        common::eventually(LIMIT, "the request", || {
+            !calls(&server, "requestHeapSnapshot").is_empty()
+        })
+        .await;
+        server.send_binary(frames_of(&heap_bytes(0), 3).remove(0));
+        heap_is(&cap, "bytes received", |h| {
+            matches!(h.stage, HeapStage::Receiving { chunks: 1, .. })
+        })
+        .await;
+        assert_eq!(files(dir.path()).len(), 1);
+        heap_is(&cap, "a failure", |h| {
+            failed_with(h, "The app stopped sending the snapshot.")
+        })
+        .await;
+        assert!(files(dir.path()).is_empty());
+        drop(cap);
+    });
+}
+
+#[test]
+fn disconnect_mid_snapshot_fails_cleanly() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let (dir, server) = (
+            tempfile::tempdir().unwrap(),
+            Sim::new(false, false).server(),
+        );
+        server.silence("requestHeapSnapshot");
+        let cap = start(&server, heap_config(dir.path()), &rt);
+        connected(&cap).await;
+        cap.take_heap_snapshot();
+        common::eventually(LIMIT, "the request", || {
+            !calls(&server, "requestHeapSnapshot").is_empty()
+        })
+        .await;
+        server.send_binary(frames_of(&heap_bytes(0), 3).remove(0));
+        heap_is(&cap, "bytes received", |h| {
+            matches!(h.stage, HeapStage::Receiving { .. })
+        })
+        .await;
+        server.close_abruptly();
+        heap_is(&cap, "a failure", |h| {
+            failed_with(h, "The app disconnected before the snapshot finished.")
+        })
+        .await;
+        common::eventually(LIMIT, "the file to go", || files(dir.path()).is_empty()).await;
+        drop(cap);
+    });
+}
+
+#[test]
+fn cancel_while_receiving_and_while_analysing() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        // Receiving: the file goes at once, the rest of the snapshot is thrown away.
+        let (dir, server) = (
+            tempfile::tempdir().unwrap(),
+            Sim::new(false, false).server(),
+        );
+        server.silence("requestHeapSnapshot");
+        let cap = start(&server, heap_config(dir.path()), &rt);
+        connected(&cap).await;
+        cap.take_heap_snapshot();
+        common::eventually(LIMIT, "the request", || {
+            !calls(&server, "requestHeapSnapshot").is_empty()
+        })
+        .await;
+        let mut frames = frames_of(&heap_bytes(0), 3);
+        server.send_binary(frames.remove(0));
+        heap_is(&cap, "bytes received", |h| {
+            matches!(h.stage, HeapStage::Receiving { .. })
+        })
+        .await;
+        cap.cancel_heap_snapshot();
+        let s = heap_is(&cap, "cancelled", |h| h.stage == HeapStage::Cancelled).await;
+        assert_eq!(s.memory.busy(), None);
+        common::eventually(LIMIT, "the file to go", || files(dir.path()).is_empty()).await;
+        for f in frames {
+            server.send_binary(f);
+        }
+        common::eventually(LIMIT, "the stream cancel", || {
+            transfer_calls(&server)
+                .last()
+                .is_some_and(|c| c.starts_with("streamCancel"))
+        })
+        .await;
+        assert!(files(dir.path()).is_empty(), "later chunks write nothing");
+        let s = connected(&cap).await;
+        assert_eq!(s.memory.heaps()[0].stage, HeapStage::Cancelled);
+        drop(cap);
+
+        // Analysing: the job stops, and the file stays with its record.
+        let (dir, server) = (
+            tempfile::tempdir().unwrap(),
+            Sim::new(false, false).server(),
+        );
+        let big =
+            fdt_analysis::heap::synth::flutter_heap(1, 400_000, fdt_store::run::Mode::Profile);
+        server.script_binary("requestHeapSnapshot", frames_of(&big, 8));
+        let cap = start(&server, heap_config(dir.path()), &rt);
+        connected(&cap).await;
+        cap.take_heap_snapshot();
+        heap_is(&cap, "analysing", |h| {
+            matches!(h.stage, HeapStage::Parsing { .. })
+        })
+        .await;
+        cap.cancel_heap_snapshot();
+        let s = heap_is(&cap, "cancelled", |h| h.stage == HeapStage::Cancelled).await;
+        assert_eq!(s.memory.held(), None);
+        assert_eq!(
+            files(dir.path()).len(),
+            1,
+            "analysis never deletes the file"
+        );
+        drop(cap);
+    });
+}
+
+#[test]
+fn new_session_drops_late_results_and_deletes_files() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        // A held snapshot goes with the session.
+        let (dir, server) = (
+            tempfile::tempdir().unwrap(),
+            Sim::new(false, false).server(),
+        );
+        script(&server, &heap_bytes(0));
+        let cap = start(&server, heap_config(dir.path()), &rt);
+        connected(&cap).await;
+        cap.take_heap_snapshot();
+        heap_is(&cap, "a ready snapshot", |h| ready(h) && h.index.is_some()).await;
+        assert_eq!(files(dir.path()).len(), 1);
+        cap.new_session();
+        common::wait_for(&cap, LIMIT, "an empty session", |s| {
+            s.memory.heaps().is_empty()
+        })
+        .await;
+        common::eventually(LIMIT, "the file to go", || files(dir.path()).is_empty()).await;
+        drop(cap);
+
+        // One still arriving is stopped, and what comes later is thrown away.
+        let (dir, server) = (
+            tempfile::tempdir().unwrap(),
+            Sim::new(false, false).server(),
+        );
+        server.silence("requestHeapSnapshot");
+        let cap = start(&server, heap_config(dir.path()), &rt);
+        connected(&cap).await;
+        cap.take_heap_snapshot();
+        common::eventually(LIMIT, "the request", || {
+            !calls(&server, "requestHeapSnapshot").is_empty()
+        })
+        .await;
+        let mut frames = frames_of(&heap_bytes(0), 3);
+        server.send_binary(frames.remove(0));
+        heap_is(&cap, "bytes received", |h| {
+            matches!(h.stage, HeapStage::Receiving { .. })
+        })
+        .await;
+        cap.new_session();
+        common::eventually(LIMIT, "the file to go", || files(dir.path()).is_empty()).await;
+        for f in frames {
+            server.send_binary(f);
+        }
+        common::eventually(LIMIT, "the stream cancel", || {
+            transfer_calls(&server)
+                .last()
+                .is_some_and(|c| c.starts_with("streamCancel"))
+        })
+        .await;
+        let s = connected(&cap).await;
+        assert!(s.memory.heaps().is_empty());
+        assert!(files(dir.path()).is_empty());
+        drop(cap);
+
+        // One being analysed: its result is dropped and its file deleted.
+        let (dir, server) = (
+            tempfile::tempdir().unwrap(),
+            Sim::new(false, false).server(),
+        );
+        let big =
+            fdt_analysis::heap::synth::flutter_heap(2, 400_000, fdt_store::run::Mode::Profile);
+        server.script_binary("requestHeapSnapshot", frames_of(&big, 8));
+        let cap = start(&server, heap_config(dir.path()), &rt);
+        connected(&cap).await;
+        cap.take_heap_snapshot();
+        heap_is(&cap, "analysing", |h| {
+            matches!(h.stage, HeapStage::Parsing { .. })
+        })
+        .await;
+        cap.new_session();
+        common::eventually(LIMIT, "the file to go", || files(dir.path()).is_empty()).await;
+        let s = connected(&cap).await;
+        assert!(s.memory.heaps().is_empty());
+        assert_eq!(s.memory.held(), None);
+        drop(cap);
+    });
+}
+
+#[test]
+fn reconnect_keeps_records_and_allows_a_new_take() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let (dir, server) = (
+            tempfile::tempdir().unwrap(),
+            Sim::new(false, false).server(),
+        );
+        script(&server, &heap_bytes(1));
+        let cap = start(&server, heap_config(dir.path()), &rt);
+        connected(&cap).await;
+        cap.take_heap_snapshot();
+        heap_is(&cap, "a ready snapshot", ready).await;
+        server.close_abruptly();
+        common::wait_for(&cap, LIMIT, "the old snapshot to stay", |s| {
+            s.memory.heaps().len() == 1
+        })
+        .await;
+        // The app comes back (the scripted server accepts again): same VM, same run.
+        let s = connected(&cap).await;
+        assert!(ready(&s.memory.heaps()[0]));
+        assert_eq!(files(dir.path()).len(), 1);
+        cap.take_heap_snapshot();
+        let s = common::wait_for(&cap, LIMIT, "two snapshots", |s| count_ready(s) == 2).await;
+        let (a, b) = (&s.memory.heaps()[0], &s.memory.heaps()[1]);
+        assert_eq!(a.run, b.run);
+        // The first was compared with by the second.
+        let d = b.diff.as_ref().expect("a diff against the first snapshot");
+        assert_eq!(d.baseline, a.id);
+        assert!(d.comparable.is_ok());
+        drop(cap);
+    });
+}
+
+#[test]
+fn stale_files_from_dead_processes_are_removed() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        // Too large for a process id on any system: it is dead.
+        let dead = dir.path().join("4000000000-3-1.dartheap");
+        let mine = dir
+            .path()
+            .join(format!("{}-0-9.dartheap", std::process::id()));
+        let other = dir.path().join("notes.txt");
+        let odd = dir.path().join("abc-1-1.dartheap");
+        for f in [&dead, &mine, &other, &odd] {
+            std::fs::write(f, b"x").unwrap();
+        }
+        let server = Sim::new(false, false).server();
+        let cap = start(&server, heap_config(dir.path()), &rt);
+        common::eventually(LIMIT, "the stale file to go", || !dead.exists()).await;
+        connected(&cap).await;
+        assert!(mine.exists(), "a live process's file stays");
+        assert!(other.exists() && odd.exists(), "other files stay");
+        drop(cap);
+    });
+}
+
+#[test]
+fn open_makes_an_older_snapshot_held() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let (dir, server) = (
+            tempfile::tempdir().unwrap(),
+            Sim::new(false, false).server(),
+        );
+        let cap = start(&server, heap_config(dir.path()), &rt);
+        connected(&cap).await;
+        for n in [1, 3] {
+            script(&server, &heap_bytes(n));
+            cap.take_heap_snapshot();
+            common::wait_for(&cap, LIMIT, "a ready snapshot", |s| {
+                count_ready(s) == n.div_ceil(2) as usize && s.memory.busy().is_none()
+            })
+            .await;
+        }
+        let s = connected(&cap).await;
+        let (first, second) = (s.memory.heaps()[0].id, s.memory.heaps()[1].id);
+        assert_eq!(s.memory.held(), Some(second));
+        assert!(s.memory.heaps()[0].index.is_none(), "one index is held");
+        cap.open_heap_snapshot(first);
+        let s = common::wait_for(&cap, LIMIT, "the first held", |s| {
+            s.memory.held() == Some(first) && s.memory.busy().is_none()
+        })
+        .await;
+        assert!(s.memory.heaps()[0].index.is_some());
+        assert!(s.memory.heaps()[1].index.is_none());
+        assert!(ready(&s.memory.heaps()[0]) && ready(&s.memory.heaps()[1]));
+        drop(cap);
+    });
+}
+
+#[test]
+fn remove_held_clears_it() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let (dir, server) = (
+            tempfile::tempdir().unwrap(),
+            Sim::new(false, false).server(),
+        );
+        script(&server, &heap_bytes(1));
+        let cap = start(&server, heap_config(dir.path()), &rt);
+        connected(&cap).await;
+        cap.take_heap_snapshot();
+        let s = heap_is(&cap, "a held snapshot", |h| ready(h) && h.index.is_some()).await;
+        let id = s.memory.heaps()[0].id;
+        drop(s);
+        cap.remove_heap_snapshot(id);
+        let s = common::wait_for(&cap, LIMIT, "the snapshot to go", |s| {
+            s.memory.heaps().is_empty()
+        })
+        .await;
+        assert_eq!(s.memory.held(), None);
+        drop(s);
+        common::eventually(LIMIT, "the file to go", || files(dir.path()).is_empty()).await;
+        drop(cap);
+    });
+}
+
+#[test]
+fn baseline_change_recomputes_the_diff() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let (dir, server) = (
+            tempfile::tempdir().unwrap(),
+            Sim::new(false, false).server(),
+        );
+        let cap = start(&server, heap_config(dir.path()), &rt);
+        connected(&cap).await;
+        for (i, n) in [1u32, 3, 5].into_iter().enumerate() {
+            script(&server, &heap_bytes(n));
+            cap.take_heap_snapshot();
+            common::wait_for(&cap, LIMIT, "a ready snapshot", |s| {
+                count_ready(s) == i + 1 && s.memory.busy().is_none()
+            })
+            .await;
+        }
+        let s = common::wait_for(&cap, LIMIT, "the last diff", |s| {
+            s.memory.heaps()[2].diff.is_some()
+        })
+        .await;
+        let (a, b) = (s.memory.heaps()[0].id, s.memory.heaps()[1].id);
+        assert_eq!(s.memory.heaps()[2].diff.as_ref().unwrap().baseline, b);
+        cap.set_heap_baseline(Some(a));
+        let s = common::wait_for(&cap, LIMIT, "a diff against the first", |s| {
+            s.memory.heaps()[2]
+                .diff
+                .as_ref()
+                .is_some_and(|d| d.baseline == a)
+        })
+        .await;
+        assert_eq!(s.memory.baseline(), Some(a));
+        assert!(
+            s.memory.heaps()[2]
+                .diff
+                .as_ref()
+                .unwrap()
+                .comparable
+                .is_ok()
+        );
+        // Removing the baseline goes back to the previous snapshot.
+        cap.remove_heap_snapshot(a);
+        common::wait_for(&cap, LIMIT, "a diff against the second", |s| {
+            s.memory.heaps().len() == 2
+                && s.memory.heaps()[1]
+                    .diff
+                    .as_ref()
+                    .is_some_and(|d| d.baseline == b)
+        })
+        .await;
+        drop(cap);
+    });
+}
+
+#[test]
+fn a_profile_follows_each_snapshot() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let (dir, server) = (
+            tempfile::tempdir().unwrap(),
+            Sim::new(false, false).server(),
+        );
+        script(&server, &heap_bytes(0));
+        let cap = start(&server, heap_config(dir.path()), &rt);
+        connected(&cap).await;
+        assert!(calls(&server, "getAllocationProfile").is_empty());
+        cap.take_heap_snapshot();
+        common::eventually(LIMIT, "a profile", || {
+            calls(&server, "getAllocationProfile").len() == 1
+        })
+        .await;
+        common::wait_for(&cap, LIMIT, "it stored", |s| {
+            !s.memory.profiles().is_empty()
+        })
+        .await;
+        cap.take_heap_snapshot();
+        common::eventually(LIMIT, "a second profile", || {
+            calls(&server, "getAllocationProfile").len() == 2
+        })
+        .await;
+        assert!(
+            calls(&server, "getAllocationProfile")
+                .iter()
+                .all(|p| p.get("gc").is_none()),
+            "a snapshot's profile never collects garbage"
+        );
         drop(cap);
     });
 }

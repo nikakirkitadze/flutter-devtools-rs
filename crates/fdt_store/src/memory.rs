@@ -392,6 +392,18 @@ impl MemoryStore {
         true
     }
 
+    pub(crate) fn records(&self) -> &[HeapRecord] {
+        &self.heaps
+    }
+
+    pub(crate) fn held_id(&self) -> Option<HeapId> {
+        self.held
+    }
+
+    pub(crate) fn baseline_id(&self) -> Option<HeapId> {
+        self.baseline
+    }
+
     pub(crate) fn snapshot(&mut self) -> MemorySnapshot {
         let profiles = self
             .profiles_cache

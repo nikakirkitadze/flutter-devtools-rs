@@ -1171,6 +1171,11 @@ impl crate::capture_host::CaptureControl for LiveFeed {
     fn set_body_limits(&self, _: fdt_store::net::BodyLimits) {}
     fn fetch_cpu_samples(&self) {}
     fn fetch_allocation_profile(&self, _gc: bool) {}
+    fn take_heap_snapshot(&self) {}
+    fn cancel_heap_snapshot(&self) {}
+    fn open_heap_snapshot(&self, _: fdt_store::heap::HeapId) {}
+    fn remove_heap_snapshot(&self, _: fdt_store::heap::HeapId) {}
+    fn set_heap_baseline(&self, _: Option<fdt_store::heap::HeapId>) {}
     fn set_trace_widget_builds(&self, _on: bool) {}
     fn set_trace_default(&self, _on: bool) {}
     fn status(&self) -> tokio::sync::watch::Receiver<ConnStatus> {

@@ -7,6 +7,7 @@ pub mod bench_support;
 mod capture;
 mod config;
 mod connect;
+mod heap;
 mod ingest;
 mod lifecycle;
 mod runtime;

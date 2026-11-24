@@ -100,6 +100,23 @@ pub(crate) enum Ingest {
         gc: bool,
         profile: Box<fdt_vm::memory::AllocationProfile>,
     },
+    /// Bytes of a heap snapshot arrived (progress; the session ignores it once the record is
+    /// no longer receiving).
+    HeapStage(fdt_store::heap::HeapId, fdt_store::heap::HeapStage),
+    /// A snapshot is whole on disk. Dropping this deletes the file.
+    HeapReceived {
+        id: fdt_store::heap::HeapId,
+        time: fdt_store::time::SessionTime,
+        bytes: u64,
+        file: Arc<fdt_store::heap::HeapFile>,
+        root_package: Option<String>,
+    },
+    /// A snapshot could not be taken.
+    HeapFailed {
+        id: fdt_store::heap::HeapId,
+        message: &'static str,
+        details: String,
+    },
     /// An isolate exited (a hot restart, or the app ending it): its unfinished requests end.
     IsolateExit {
         isolate: String,

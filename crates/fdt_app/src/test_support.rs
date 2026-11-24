@@ -207,6 +207,24 @@ impl CaptureControl for FakeCapture {
     fn fetch_allocation_profile(&self, gc: bool) {
         self.record(format!("alloc_profile {gc}"));
     }
+    fn take_heap_snapshot(&self) {
+        self.record("heap_take");
+    }
+    fn cancel_heap_snapshot(&self) {
+        self.record("heap_cancel");
+    }
+    fn open_heap_snapshot(&self, id: fdt_store::heap::HeapId) {
+        self.record(format!("heap_open {}", id.0));
+    }
+    fn remove_heap_snapshot(&self, id: fdt_store::heap::HeapId) {
+        self.record(format!("heap_remove {}", id.0));
+    }
+    fn set_heap_baseline(&self, id: Option<fdt_store::heap::HeapId>) {
+        match id {
+            Some(id) => self.record(format!("heap_baseline {}", id.0)),
+            None => self.record("heap_baseline none"),
+        }
+    }
     fn set_trace_widget_builds(&self, on: bool) {
         self.record(format!("trace_builds {on}"));
     }

@@ -1765,12 +1765,14 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "criterion",
+ "dirs 6.0.0",
  "fdt_analysis",
  "fdt_store",
  "fdt_vm",
  "log",
  "regex",
  "serde_json",
+ "tempfile",
  "tokio",
  "url",
 ]

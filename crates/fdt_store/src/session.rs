@@ -5,7 +5,7 @@ use crate::cpu::{CpuSample, CpuSnapshot, CpuStatus, CpuStore, FunctionId, NodeId
 use crate::frames::{
     DEFAULT_BUDGET_US, FrameInput, FrameStore, FramesSnapshot, RasterPhase, UiPhases, budget_us,
 };
-use crate::heap::{HeapDiff, HeapFile, HeapId, HeapIndex, HeapStage, HeapSummary};
+use crate::heap::{HeapDiff, HeapFile, HeapId, HeapIndex, HeapRecord, HeapStage, HeapSummary};
 use crate::logs::{LOG_CHUNK, LogInput, LogStore, LogsSnapshot};
 use crate::memory::{
     AllocClassId, AllocProfile, GcRecord, MemorySample, MemorySnapshot, MemoryStore,
@@ -329,6 +329,39 @@ impl SessionWriter {
         let at = p.time;
         self.memory.push_profile(p);
         self.touch(at);
+    }
+
+    /// The heap-snapshot records, oldest first.
+    pub fn heap_records(&self) -> &[HeapRecord] {
+        self.memory.records()
+    }
+
+    pub fn heap_record(&self, id: HeapId) -> Option<&HeapRecord> {
+        self.memory.records().iter().find(|h| h.id == id)
+    }
+
+    /// The snapshot whose index is held.
+    pub fn held_heap(&self) -> Option<HeapId> {
+        self.memory.held_id()
+    }
+
+    /// The baseline the user chose, if any.
+    pub fn heap_baseline(&self) -> Option<HeapId> {
+        self.memory.baseline_id()
+    }
+
+    /// The newest snapshot still being taken or analysed.
+    pub fn busy_heap(&self) -> Option<HeapId> {
+        self.memory
+            .records()
+            .iter()
+            .rev()
+            .find(|h| h.stage.is_busy())
+            .map(|h| h.id)
+    }
+
+    pub fn run_info(&self, id: RunId) -> Option<&RunInfo> {
+        self.runs.iter().find(|r| r.id == id)
     }
 
     /// Starts the record of a heap snapshot asked for at `at`.
