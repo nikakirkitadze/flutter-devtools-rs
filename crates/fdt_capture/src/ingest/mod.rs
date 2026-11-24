@@ -7,6 +7,7 @@ pub(crate) mod flutter_error;
 pub(crate) mod frames;
 pub(crate) mod http;
 pub(crate) mod logs;
+pub(crate) mod memory;
 pub(crate) mod perf;
 pub(crate) mod sockets;
 pub(crate) mod stdout;
@@ -83,6 +84,22 @@ pub(crate) enum Ingest {
     NetRestoreReady(Arc<http::NetRestore>),
     /// Whether widget-build tracing is on in the run's app, as the app answered.
     Tracing(RunId, bool),
+    /// The connection's memory controls, for commands.
+    MemoryReady(Arc<memory::MemoryControl>),
+    /// One poll of the app's heap; the session stamps it when it stores it.
+    MemorySample {
+        run: RunId,
+        usage: fdt_vm::memory::MemoryUsage,
+        rss: Option<u64>,
+    },
+    Gc(RunId, fdt_store::memory::GcRecord),
+    /// An allocation profile the user asked for.
+    AllocProfile {
+        run: RunId,
+        isolate: String,
+        gc: bool,
+        profile: Box<fdt_vm::memory::AllocationProfile>,
+    },
     /// An isolate exited (a hot restart, or the app ending it): its unfinished requests end.
     IsolateExit {
         isolate: String,
@@ -166,9 +183,14 @@ pub(crate) struct Router {
     last_ts: [i64; 2],
     net: http::NetHub,
     perf: perf::PerfHub,
+    memory: memory::MemoryHub,
+    /// The app's isolate group: GC events of other groups are not the app's.
+    group: String,
+    gcs: memory::GcTracker,
 }
 
 impl Router {
+    #[allow(clippy::too_many_arguments)] // one hub per concern; a config struct would only rename them
     pub(crate) fn new(
         sink: SharedSink,
         svc: VmService,
@@ -177,6 +199,8 @@ impl Router {
         string_fetch_timeout: Duration,
         net: http::NetHub,
         perf: perf::PerfHub,
+        memory: memory::MemoryHub,
+        group: String,
     ) -> Router {
         let logging = logs::spawn_worker(sink.clone(), svc.clone(), string_fetch_timeout);
         Router {
@@ -189,6 +213,9 @@ impl Router {
             last_ts: [0; 2],
             net,
             perf,
+            memory,
+            group,
+            gcs: memory::GcTracker::default(),
         }
     }
 
@@ -272,6 +299,10 @@ impl Router {
                     sink.send(Ingest::Tracing(sink.run, false));
                 }
                 self.perf.set_main_isolate(&isolate.id);
+                if let Some(g) = &isolate.isolate_group_id {
+                    self.memory.set_main(&isolate.id, g);
+                    self.group = g.clone();
+                }
                 self.main_isolate = isolate.id;
             }
             StreamEvent::ServiceExtensionAdded { isolate, rpc }
@@ -283,6 +314,12 @@ impl Router {
                 self.net.start(&isolate.id);
             }
             StreamEvent::TimelineEvents { events } => self.perf.events(events),
+            StreamEvent::Gc(g) if !self.group.is_empty() && g.isolate_group == self.group => {
+                let sink = self.sink.get();
+                if let Some((run, rec)) = self.gcs.record(&sink, &g) {
+                    sink.send(Ingest::Gc(run, rec));
+                }
+            }
             _ => {}
         }
     }

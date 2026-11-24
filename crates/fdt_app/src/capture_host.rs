@@ -29,6 +29,8 @@ pub trait CaptureControl: 'static {
     fn set_free_app_http_memory(&self, on: bool);
     fn set_body_limits(&self, limits: BodyLimits);
     fn fetch_cpu_samples(&self);
+    /// Fetches the allocation profile; `gc` collects garbage first ("Live objects only").
+    fn fetch_allocation_profile(&self, gc: bool);
     fn set_trace_widget_builds(&self, on: bool);
     /// The "Trace widget builds by default" setting changed: the next connection starts with it.
     fn set_trace_default(&self, on: bool);
@@ -63,6 +65,9 @@ impl CaptureControl for Capture {
     }
     fn fetch_cpu_samples(&self) {
         Capture::fetch_cpu_samples(self);
+    }
+    fn fetch_allocation_profile(&self, gc: bool) {
+        Capture::fetch_allocation_profile(self, gc);
     }
     fn set_trace_widget_builds(&self, on: bool) {
         Capture::set_trace_widget_builds(self, on);
@@ -386,6 +391,20 @@ mod tests {
         let (fake, handle) = crate::test_support::fake_capture();
         CaptureControl::fetch_cpu_samples(&fake);
         assert_eq!(handle.commands(), vec!["fetch_cpu".to_string()]);
+    }
+
+    #[test]
+    fn fake_capture_logs_an_allocation_profile_fetch() {
+        let (fake, handle) = crate::test_support::fake_capture();
+        CaptureControl::fetch_allocation_profile(&fake, false);
+        CaptureControl::fetch_allocation_profile(&fake, true);
+        assert_eq!(
+            handle.commands(),
+            vec![
+                "alloc_profile false".to_string(),
+                "alloc_profile true".to_string()
+            ]
+        );
     }
 
     #[test]

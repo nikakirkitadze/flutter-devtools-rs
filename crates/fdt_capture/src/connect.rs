@@ -18,16 +18,18 @@ use tokio::sync::{mpsc, oneshot};
 use crate::capture::{SessionMsg, Target};
 use crate::config::CaptureConfig;
 use crate::ingest::http::{BodyFetcher, ENABLE_RPC, NetHub, NetRestore, PollerConfig};
+use crate::ingest::memory::{MemoryConfig, MemoryHub};
 use crate::ingest::perf::{PerfConfig, PerfHub};
 use crate::ingest::{Ingest, Router};
 
-const STREAMS: [&str; 6] = [
+const STREAMS: [&str; 7] = [
     "Logging",
     "Stdout",
     "Stderr",
     "Extension",
     "Isolate",
     "Service",
+    "GC",
 ];
 
 struct Fail {
@@ -347,6 +349,30 @@ async fn connect_and_ingest(
         main.clone(),
     );
     sink.get().send(Ingest::PerfReady(perf.control()));
+    let group = vm
+        .isolates
+        .iter()
+        .find(|i| i.id == main)
+        .and_then(|i| i.isolate_group_id.clone())
+        .unwrap_or_default();
+    let memory = MemoryHub::new(
+        sink.clone(),
+        svc.clone(),
+        MemoryConfig {
+            poll: cfg.memory_poll,
+            profile_timeout: cfg.alloc_profile_timeout,
+            request_timeout: cfg.heap_request_timeout,
+            chunk_timeout: cfg.heap_chunk_timeout,
+            heap_dir: cfg
+                .heap_dir
+                .clone()
+                .unwrap_or_else(|| std::env::temp_dir().join("fdt-heaps")),
+        },
+        main.clone(),
+        group.clone(),
+        package_name(&isolate),
+    );
+    sink.get().send(Ingest::MemoryReady(memory.control()));
     let mut router = Router::new(
         sink,
         svc,
@@ -355,6 +381,8 @@ async fn connect_and_ingest(
         cfg.string_fetch_timeout,
         hub,
         perf,
+        memory,
+        group,
     );
     loop {
         let flush = router.next_flush();

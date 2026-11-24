@@ -14,11 +14,13 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 
 use crate::config::CaptureConfig;
-use crate::ingest::Ingest;
 use crate::ingest::http::{NetRestore, NetState};
+use crate::ingest::memory::MemoryControl;
 use crate::ingest::perf::{self, PerfControl};
+use crate::ingest::{Ingest, memory};
 use crate::lifecycle::Lifecycle;
 use crate::status::ConnStatus;
+use fdt_store::memory::{AllocProfile, AllocRow, MemorySample};
 
 /// What to connect to.
 #[derive(Clone)]
@@ -38,6 +40,8 @@ pub(crate) enum Command {
     SetFreeAppHttpMemory(bool),
     SetBodyLimits(BodyLimits),
     FetchCpuNow,
+    /// An allocation profile of the main isolate; `true` collects garbage first.
+    FetchAllocProfile(bool),
     SetTraceWidgetBuilds(bool),
     /// The settings' default for widget-build tracing changed.
     SetTraceDefault(bool),
@@ -122,6 +126,13 @@ impl Capture {
         self.command(Command::FetchCpuNow);
     }
 
+    /// Fetches the allocation profile of the app's main isolate. With `gc`, the VM collects
+    /// garbage first, which every client sees and which pauses the app: pass it only when the
+    /// user asked for live objects only.
+    pub fn fetch_allocation_profile(&self, gc: bool) {
+        self.command(Command::FetchAllocProfile(gc));
+    }
+
     /// Traces widget builds in the app (about +30 % build time while on) and takes the timeline
     /// from the `Timeline` stream. Kept across connects and hot restarts.
     pub fn set_trace_widget_builds(&self, on: bool) {
@@ -171,6 +182,8 @@ pub(crate) struct Session {
     pub(crate) life: Lifecycle,
     /// The live connection's timeline task, for commands.
     pub(crate) perf: Option<Arc<PerfControl>>,
+    /// The live connection's memory task, for commands.
+    pub(crate) memory: Option<Arc<MemoryControl>>,
     /// What to put back in the live connection's app when the user disconnects.
     pub(crate) net_restore: Option<Arc<NetRestore>>,
     /// Whether widget builds should be traced, whatever the connection (from the settings, then
@@ -208,6 +221,7 @@ impl Session {
             free_app_memory,
             life: Lifecycle::new(),
             perf: None,
+            memory: None,
             net_restore: None,
             tracing_actual: false,
         }
@@ -326,6 +340,11 @@ impl Session {
                     p.fetch_now();
                 }
             }
+            Command::FetchAllocProfile(gc) => {
+                if let Some(m) = &self.memory {
+                    m.fetch_profile(gc);
+                }
+            }
             Command::Disconnect => {} // handled by the run loop, which restores first
             Command::SetTraceWidgetBuilds(on) => {
                 self.wanted_tracing = on;
@@ -402,6 +421,67 @@ impl Session {
                     p.set_tracing(true);
                 }
                 self.perf = Some(p);
+            }
+            Ingest::MemoryReady(m) => self.memory = Some(m),
+            Ingest::MemorySample { run, usage, rss } => {
+                if recording {
+                    let time = crate::lifecycle::session_time(w);
+                    w.push_memory_sample(
+                        run,
+                        MemorySample {
+                            time,
+                            heap_used: usage.heap_usage,
+                            heap_capacity: usage.heap_capacity,
+                            external: usage.external_usage,
+                            rss,
+                        },
+                    );
+                }
+            }
+            Ingest::Gc(run, rec) => {
+                if recording {
+                    w.push_gc(run, rec);
+                }
+            }
+            // Always stored: the user asked for it.
+            Ingest::AllocProfile {
+                run,
+                isolate,
+                gc,
+                profile,
+            } => {
+                let time = crate::lifecycle::session_time(w);
+                let rows: Vec<AllocRow> = profile
+                    .members
+                    .iter()
+                    .map(|c| {
+                        let location = c
+                            .location
+                            .as_ref()
+                            .map(|l| memory::location_text(&l.script_uri, l.line));
+                        let class = w.intern_alloc_class(
+                            run,
+                            &isolate,
+                            &c.class_id,
+                            &c.name,
+                            c.library_uri.as_deref(),
+                            location.as_deref(),
+                        );
+                        AllocRow {
+                            class,
+                            instances: c.instances,
+                            bytes: c.bytes,
+                        }
+                    })
+                    .collect();
+                w.push_alloc_profile(AllocProfile {
+                    time,
+                    run,
+                    isolate: isolate.into(),
+                    gc,
+                    heap_used: profile.memory.heap_usage,
+                    rows: rows.into(),
+                });
             }
             Ingest::NetRestoreReady(n) => self.net_restore = Some(n),
             Ingest::Tracing(run, on) => {

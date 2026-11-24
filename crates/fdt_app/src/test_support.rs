@@ -204,6 +204,9 @@ impl CaptureControl for FakeCapture {
     fn fetch_cpu_samples(&self) {
         self.record("fetch_cpu");
     }
+    fn fetch_allocation_profile(&self, gc: bool) {
+        self.record(format!("alloc_profile {gc}"));
+    }
     fn set_trace_widget_builds(&self, on: bool) {
         self.record(format!("trace_builds {on}"));
     }

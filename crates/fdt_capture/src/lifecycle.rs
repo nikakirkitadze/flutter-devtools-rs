@@ -146,6 +146,7 @@ impl Session {
         self.conn_gen += 1;
         self.life.shared = None;
         self.perf = None;
+        self.memory = None;
         self.net_restore = None;
         if let Some(w) = &mut self.writer {
             let at = session_time(w);
@@ -527,6 +528,10 @@ impl Session {
             | Ingest::Cpu(_)
             | Ingest::CpuStatus(..)
             | Ingest::PerfReady(_)
+            | Ingest::MemoryReady(_)
+            | Ingest::MemorySample { .. }
+            | Ingest::Gc(..)
+            | Ingest::AllocProfile { .. }
             | Ingest::NetRestoreReady(_)
             | Ingest::Tracing(..) => {}
             Ingest::StartRun { .. }

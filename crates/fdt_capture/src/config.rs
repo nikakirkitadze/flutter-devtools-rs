@@ -39,6 +39,16 @@ pub struct CaptureConfig {
     pub string_fetch_timeout: Duration,
     pub reconnect_uri_retry: Duration,
     pub reconnect_uri_give_up: Duration,
+    /// How often the app's heap and the process's memory are read.
+    pub memory_poll: Duration,
+    /// One `getAllocationProfile` call gives up after this long.
+    pub alloc_profile_timeout: Duration,
+    /// A heap snapshot request gives up after this long.
+    pub heap_request_timeout: Duration,
+    /// A heap snapshot gives up when no chunk arrives for this long.
+    pub heap_chunk_timeout: Duration,
+    /// Where heap snapshots are written; `None` is a folder in the system's temp directory.
+    pub heap_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for CaptureConfig {
@@ -64,6 +74,11 @@ impl Default for CaptureConfig {
             string_fetch_timeout: Duration::from_secs(2),
             reconnect_uri_retry: Duration::from_secs(1),
             reconnect_uri_give_up: Duration::from_secs(30),
+            memory_poll: Duration::from_millis(500),
+            alloc_profile_timeout: Duration::from_secs(10),
+            heap_request_timeout: Duration::from_secs(120),
+            heap_chunk_timeout: Duration::from_secs(30),
+            heap_dir: None,
         }
     }
 }
@@ -71,6 +86,14 @@ impl Default for CaptureConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_is_polled_every_500_ms_by_default() {
+        assert_eq!(
+            CaptureConfig::default().memory_poll,
+            Duration::from_millis(500)
+        );
+    }
 
     #[test]
     fn cpu_samples_are_fetched_every_15_s_by_default() {
