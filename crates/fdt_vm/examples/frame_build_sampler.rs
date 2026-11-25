@@ -33,6 +33,15 @@ async fn main() {
         std::process::exit(2);
     };
     let uri = url::Url::parse(&uri).expect("--uri must be a URL");
+    // Anything but `on` or `off` is a typo, not "off".
+    let trace = arg("--trace");
+    if let Some(t) = &trace
+        && t != "on"
+        && t != "off"
+    {
+        eprintln!("--trace takes `on` or `off`, not `{t}`");
+        std::process::exit(2);
+    }
     let want: usize = arg("--frames").and_then(|v| v.parse().ok()).unwrap_or(600);
     // `--long-ms N`: also print the wall-clock time (epoch ms) of every frame whose build took
     // at least N ms, so long frames can be matched against when something else did its work.
@@ -47,7 +56,7 @@ async fn main() {
     // `--act NAME` (jank_lab only) runs `ext.jank_lab.run` first, e.g. `goto_jank`;
     // `--trace on|off` sets `ext.flutter.profileUserWidgetBuilds`, as fdt's "Trace widget builds"
     // switch does. Both settle for two seconds before frames count.
-    if arg("--act").is_some() || arg("--trace").is_some() {
+    if arg("--act").is_some() || trace.is_some() {
         let vm = client.call("getVM", json!({})).await.expect("getVM");
         let iso = vm["isolates"][0]["id"]
             .as_str()
@@ -59,7 +68,7 @@ async fn main() {
                 .await
                 .expect("ext.jank_lab.run");
         }
-        if let Some(t) = arg("--trace") {
+        if let Some(t) = &trace {
             client
                 .call(
                     "ext.flutter.profileUserWidgetBuilds",

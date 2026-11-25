@@ -530,11 +530,10 @@ mod tests {
     fn hostile_queries_are_bounded() {
         let t = Instant::now();
         let r = compile_query(r"(\w{200}){50}", true);
-        assert!(
-            t.elapsed() < std::time::Duration::from_millis(500),
-            "{:?}",
-            t.elapsed()
-        );
+        let compile = t.elapsed();
+        crate::budget::check(compile < std::time::Duration::from_millis(500), || {
+            format!("compiling a hostile query took {compile:?}")
+        });
         assert!(r.is_err(), "the size limit rejects it");
         let long = "a".repeat(MAX_QUERY_CHARS + 1);
         for regex in [false, true] {
@@ -551,7 +550,10 @@ mod tests {
         let text = format!("{}b", "a".repeat(100_000));
         let t = Instant::now();
         assert!(match_ranges(&text, &q).is_empty());
-        assert!(t.elapsed() < std::time::Duration::from_secs(2));
+        let scan = t.elapsed();
+        crate::budget::check(scan < std::time::Duration::from_secs(2), || {
+            format!("scanning with a hostile query took {scan:?}")
+        });
     }
 
     #[test]

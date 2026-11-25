@@ -218,6 +218,10 @@ The ledger's rulings, with their reasons and costs.
 
 **Observed in this verification, and bearing on a ruling:** the Task 18 ruling (3) risk came true once in five live runs (run 2, "one unmounted _LeakyScreenState", left 0, right 1, at the 1 s unmount sequence). **The cause is unknown.** The raw output shows only the assertion at `crates/fdt_capture/tests/jank_lab_live.rs:810` (left 0, right 1). It may be the 1 s unmount timing the ruling accepted, or a real unmount or leak-detection problem in the app or the capture; one failure in five cannot tell them apart. It happened on a Mac at load 4. Run 3's "jank (tracing): only 0 judged frames" (`jank_lab_live.rs:192`) is the same: cause unknown (M3's first live run failed the same way and passed on its second; that is not an explanation).
 
+## Final-review fixes
+
+The final whole-branch review's fix wave changed the following since the checks above were recorded: snapshot files are deleted on quit and on a signal exit, every capture in a process names its files uniquely, the live test waits for the leaky screen to mount and unmount, and a few smaller items (growth selection, open queueing, palette focus, the Leaks stage, the live-objects note, a timing assert moved to the budget check, `--trace` validation). No `pkill -f 'flutter run'` is in any script or document in the repository; the one the review mentions was an interactive command during the verification runs. The live test script stops only the app it started, by process group.
+
 ## Open decisions for the author
 
 Numbers 1 to 4, 8 and 10 carry M3's unresolved decisions (M3's 1 to 4, 8, 6 and 7, and 9 as 9); M4's misses are 3 to 7. M3's decision 5 is closed.
