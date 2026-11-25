@@ -21,8 +21,8 @@ answer the questions directly: why did this frame jank, what is rebuilding too m
 happened around this failed request. Everything is tied together on one time axis, and it stays
 smooth with a million log lines.
 
-**Status: early development.** The Connect page, Logs, Network, Performance and Timeline tools
-work today. Still to come: Memory (leaks and heap snapshots), the widget inspector, an optional
+**Status: early development.** The Connect page, Logs, Network, Performance, Memory and Timeline tools
+work today. Still to come: the widget inspector, an optional
 in-app probe package, saved sessions, and signed installers. Daily use happens on macOS; Windows
 and Linux are built and tested in CI.
 
@@ -37,6 +37,10 @@ and Linux are built and tested in CI.
   findings on the same time axis. Click anything to jump to the same moment in the other tools.
   Drag across the page to set the time range; double-click its ruler to clear it. The UI and
   raster threads themselves are on the Performance tool's Raw trace tab.
+- **Memory**: a live chart of the app's heap, capacity, external memory and RSS with its garbage
+  collections; class counts on demand; and heap snapshots you take yourself (the app pauses while
+  one is written) that fdt analyses for leaked objects with the path that keeps each one alive,
+  and compares with an earlier snapshot to show what grew.
 - **Finds your apps**: apps started with `flutter run` or `flutter attach` show up on the Connect
   page by themselves. So do apps you open on a booted iOS simulator or an Android device, without
   `flutter run`. Apps on a physical iPhone appear only when started with `flutter run` or

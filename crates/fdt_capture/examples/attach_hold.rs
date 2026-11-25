@@ -48,7 +48,10 @@ fn main() {
         .await
         .expect("never connected")
         .expect("status closed");
-        println!("connected");
+        let at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        println!("connected at_epoch_ms={at_ms}");
         tokio::time::sleep(Duration::from_secs(seconds)).await;
         let snap = cap.snapshots().borrow().clone();
         println!(

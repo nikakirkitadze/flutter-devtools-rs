@@ -223,6 +223,17 @@ Save screenshots next to this file as `m3-<os>-<theme>-<view>.png`.
 
 ## Pending verification
 
+**Update, 25 November 2026 (M4 verification, `docs/milestones/m4-review.md`).** Done there, on a machine with load 2 to 5 and a display that went to sleep twice:
+
+- **bench-ui, the misses again:** `trace-zoom` 3.49 ms and `strip-drag` 2.78 and 3.63 ms now meet 4 ms; `net-filter` meets in one of two passes (3.96 and 4.38); `logs-search` (6.9 to 7.2), `tool-switch` (9.9) and `frame-details` (5.11) still miss. M3's decisions 1 and 2 stay open.
+- **CPU poll at 15 s:** the fetch is the cause of the long frame, confirmed. Two runs with the connect time and the wall-clock time of each long frame: four frames of 129 to 157 ms at 15.2 and 30.2 s after connect, and nothing else in 3,000 frames. With the real window, `/jank`, 6 rounds of 150 frames: paired median delta +10.5 us, p99 delta +21 us, and one 156 to 168 ms frame in 6 of 6 connected rounds. The 2 % budget is met; the rule "no build over 40 ms" is missed. Decision 4 stays open, now with the cause known.
+- **Tracing overhead, labelled:** measured on `/rebuilds` with `profileUserWidgetBuilds` toggled directly: on is slower in 5 of 6 rounds (ratios 1.21 to 1.96), but the app's build time drifts more than the effect, so it is not resolved. Decision 8 stays open.
+- **Idle memory and CPU of the connected window, drawing:** 172.1 to 172.6 MiB (against 153.3 MiB for the locked window) and about 2 % CPU in `top`; both miss (150 MB, 1 %). Decision 3 stays open, worse.
+- **Attach to first live data, 5 runs:** `attach_ms` 7 to 10 ms (median 8); `attach_to_data_ms` 36 to 130 ms (median 126 over the four runs that reached it). Met. Two of the five live tests failed at later steps (the unmount check; tracing judged 0 frames).
+- **The first CI run:** CI has run since 2026-11-23; its first run on Flutter 3.50 is on M4's checklist. **Windows and Linux:** still not run.
+
+The original list follows as written for M3.
+
 All on an awake, unlocked R1, with `uptime` before each batch:
 
 - **bench-ui, the misses again:** `cargo build --release -p fdt_app` then, three times each, `./target/release/fdt bench-ui <logs-search|tool-switch|strip-drag|frame-details|trace-zoom|net-filter>`.

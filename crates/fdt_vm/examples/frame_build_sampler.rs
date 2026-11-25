@@ -2,7 +2,7 @@
 //! second VM-service client (the 2 % budget in M2).
 //!
 //! ```text
-//! cargo run --release -p fdt_vm --example frame_build_sampler -- --uri ws://127.0.0.1:PORT/TOKEN/ws [--frames 600] [--timeout 120]
+//! cargo run --release -p fdt_vm --example frame_build_sampler -- --uri ws://127.0.0.1:PORT/TOKEN/ws [--frames 600] [--timeout 120] [--long-ms 40] [--act NAME] [--trace on|off]
 //! ```
 //!
 //! Subscribes to the `Extension` stream only, takes the `build` value (microseconds) of each
@@ -34,11 +34,42 @@ async fn main() {
     };
     let uri = url::Url::parse(&uri).expect("--uri must be a URL");
     let want: usize = arg("--frames").and_then(|v| v.parse().ok()).unwrap_or(600);
+    // `--long-ms N`: also print the wall-clock time (epoch ms) of every frame whose build took
+    // at least N ms, so long frames can be matched against when something else did its work.
+    let long_us: Option<i64> = arg("--long-ms")
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|ms| (ms * 1000.0) as i64);
     let timeout = Duration::from_secs(arg("--timeout").and_then(|v| v.parse().ok()).unwrap_or(120));
 
     let (client, mut notes) = connect(&uri, ConnectOptions::default())
         .await
         .expect("connect");
+    // `--act NAME` (jank_lab only) runs `ext.jank_lab.run` first, e.g. `goto_jank`;
+    // `--trace on|off` sets `ext.flutter.profileUserWidgetBuilds`, as fdt's "Trace widget builds"
+    // switch does. Both settle for two seconds before frames count.
+    if arg("--act").is_some() || arg("--trace").is_some() {
+        let vm = client.call("getVM", json!({})).await.expect("getVM");
+        let iso = vm["isolates"][0]["id"]
+            .as_str()
+            .expect("isolate")
+            .to_string();
+        if let Some(a) = arg("--act") {
+            client
+                .call("ext.jank_lab.run", json!({"isolateId": iso, "action": a}))
+                .await
+                .expect("ext.jank_lab.run");
+        }
+        if let Some(t) = arg("--trace") {
+            client
+                .call(
+                    "ext.flutter.profileUserWidgetBuilds",
+                    json!({"isolateId": iso, "enabled": t == "on"}),
+                )
+                .await
+                .expect("profileUserWidgetBuilds");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
     // The VM replays the events it kept from before the subscription, so only frames that
     // started after this timeline time count.
     let since = client
@@ -66,6 +97,17 @@ async fn main() {
             && event["extensionData"]["startTime"].as_i64().unwrap_or(0) >= since
             && let Some(build) = event["extensionData"]["build"].as_i64()
         {
+            if let Some(limit) = long_us
+                && build >= limit
+            {
+                let at_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis());
+                println!(
+                    "long number={} build_us={build} at_epoch_ms={at_ms}",
+                    event["extensionData"]["number"].as_u64().unwrap_or(0)
+                );
+            }
             builds.push(build);
             numbers.push(event["extensionData"]["number"].as_u64().unwrap_or(0));
         }
