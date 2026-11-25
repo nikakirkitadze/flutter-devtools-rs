@@ -460,8 +460,9 @@ async fn run(rt: &CaptureRuntime, vm_uri: &str) {
 
     // Memory first: it needs no drawn frames (`pump_frames`), and the later steps leave the
     // app on screens that hold their own state.
-    memory_checks(&cap, &vm, &iso, is_debug, heap_dir.path(), &app).await;
-    // The cleanup disconnected; the rest of the test runs on a new connection.
+    // The cleanup disconnects; the rest of the test runs on a new connection, whose start the
+    // attach-to-data timing counts from.
+    let t0 = memory_checks(&cap, &vm, &iso, is_debug, heap_dir.path(), &app).await;
 
     // Logs. `emit_levels` is called as soon as the status is Connected, so the first live
     // record also gives `attach_to_data_ms`.
@@ -533,6 +534,18 @@ async fn run(rt: &CaptureRuntime, vm_uri: &str) {
     act(&vm, &iso, "pop").await;
     // Let the pop finish before pushing, as a person would.
     sleep(Duration::from_millis(500)).await;
+    // The reconnect re-reads the app's whole HTTP profile, so the memory checks' own
+    // `/v2/products?page=3` request (same URL) reappears. Wait until the store stops growing,
+    // and match only requests after that point.
+    let mut net_before = cap.snapshots().borrow().net.len();
+    loop {
+        sleep(Duration::from_secs(1)).await;
+        let now = cap.snapshots().borrow().net.len();
+        if now == net_before {
+            break;
+        }
+        net_before = now;
+    }
     act(&vm, &iso, "goto_network").await;
     act(&vm, &iso, "load_products").await;
     act(&vm, &iso, "place_order").await;
@@ -540,24 +553,26 @@ async fn run(rt: &CaptureRuntime, vm_uri: &str) {
     act(&vm, &iso, "open_socket").await;
     let snap = common::wait_for(&cap, WAIT, "network requests", |s| {
         let done = |tail: &str| {
-            (0..s.net.len()).map(|i| s.net.request(i)).any(|r| {
-                r.url.ends_with(tail)
-                    && r.end.is_some()
-                    && !matches!(r.response_body, BodyState::Pending)
-                    && !matches!(r.request_body, BodyState::Pending)
-            })
+            (net_before..s.net.len())
+                .map(|i| s.net.request(i))
+                .any(|r| {
+                    r.url.ends_with(tail)
+                        && r.end.is_some()
+                        && !matches!(r.response_body, BodyState::Pending)
+                        && !matches!(r.request_body, BodyState::Pending)
+                })
         };
         done("/v2/products?page=3")
             && done("/v2/orders")
             && done("http://127.0.0.1:1/")
-            && (0..s.net.len()).any(|i| {
+            && (net_before..s.net.len()).any(|i| {
                 let r = s.net.request(i);
                 r.websocket && s.net.socket_for(r.id).is_some()
             })
     })
     .await;
     let find = |tail: &str| {
-        (0..snap.net.len())
+        (net_before..snap.net.len())
             .map(|i| &**snap.net.request(i))
             .find(|r| r.url.ends_with(tail))
             .unwrap_or_else(|| panic!("no request ending in {tail}"))
@@ -725,20 +740,20 @@ async fn memory_checks(
     is_debug: bool,
     heap_dir: &std::path::Path,
     app: &DiscoveredApp,
-) {
-    // 1. Samples: at least 3 within 2 s, with the process's RSS.
+) -> Instant {
+    // 1. Samples: three new ones within 10 s, each with the process's RSS. Unchanged samples
+    // are not stored, so the wait is for three stored ones, not for a cadence.
     let from = cap.snapshots().borrow().memory.samples().len();
-    let s = common::wait_for(cap, Duration::from_secs(2), "3 memory samples", |s| {
+    let s = common::wait_for(cap, WAIT, "3 memory samples", |s| {
         s.memory.samples().len() >= from + 3
     })
     .await;
-    let last = s
-        .memory
-        .samples()
-        .get(s.memory.samples().len() - 1)
-        .unwrap();
-    assert!(last.rss.is_some(), "samples carry rss");
-    assert!(last.heap_used > 0);
+    for i in from..from + 3 {
+        let m = s.memory.samples().get(i).unwrap();
+        assert!(m.rss.is_some(), "sample {i} carries rss: {m:?}");
+        assert!(m.heap_used > 0);
+    }
+    let last = s.memory.samples().get(from + 2).unwrap();
     println!(
         "memory: samples ok heap_used={} rss={:?}",
         last.heap_used, last.rss
@@ -835,7 +850,11 @@ async fn memory_checks(
             .iter()
             .position(|h| h.edge == Edge::Static("controllers".into()));
         let i = i.unwrap_or_else(|| panic!("through static controllers: {text}"));
-        assert_eq!(name(d.path[i + 1].class), "_GrowableList", "{text}");
+        let next = d
+            .path
+            .get(i + 1)
+            .unwrap_or_else(|| panic!("a hop after static controllers: {text}"));
+        assert_eq!(name(next.class), "_GrowableList", "{text}");
     }
 
     // 7. Level 2: the diff against snapshot 1.
@@ -854,7 +873,11 @@ async fn memory_checks(
     assert_eq!(user.new_objects, 1);
     let sc = grown(&diff.lifecycle, "ScrollController").expect("lifecycle ScrollController");
     assert_eq!(sc.new_objects, 1);
-    let p = &sc.samples[0].2;
+    let p = &sc
+        .samples
+        .first()
+        .unwrap_or_else(|| panic!("ScrollController growth has a sample path: {sc:?}"))
+        .2;
     let text = fdt_analysis::heap::leaks::path_text(&sum, p);
     println!("path (diff ScrollController): {text}");
     assert!(
@@ -865,7 +888,11 @@ async fn memory_checks(
     let tc =
         grown(&diff.lifecycle, "TextEditingController").expect("lifecycle TextEditingController");
     assert_eq!(tc.new_objects, 1);
-    let p = &tc.samples[0].2;
+    let p = &tc
+        .samples
+        .first()
+        .unwrap_or_else(|| panic!("TextEditingController growth has a sample path: {tc:?}"))
+        .2;
     let text = fdt_analysis::heap::leaks::path_text(&sum, p);
     println!("path (diff TextEditingController): {text}");
     let n = p.len();
@@ -894,7 +921,7 @@ async fn memory_checks(
     act(vm, iso, "pump_frames").await;
     sleep(Duration::from_millis(500)).await;
 
-    // 9. Cleanup: disconnecting as the user would empties the heap directory.
+    // 9. Cleanup: the user disconnects, then starts a new session, which deletes the files.
     cap.disconnect();
     let mut status = cap.status();
     tokio::time::timeout(
@@ -918,6 +945,7 @@ async fn memory_checks(
     println!("memory: cleanup ok");
 
     // The rest of the test needs a connection.
+    let t_reconnect = Instant::now();
     cap.connect(Target::Discovered(app.clone()));
     let mut status = cap.status();
     tokio::time::timeout(
@@ -927,4 +955,5 @@ async fn memory_checks(
     .await
     .expect("reconnect")
     .unwrap();
+    t_reconnect
 }
