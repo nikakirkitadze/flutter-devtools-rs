@@ -229,7 +229,15 @@ impl MainWindow {
             cx.subscribe_in(
                 &timeline,
                 window,
-                move |this, _, e: &OpenLocation, w, cx| open(this, e, w, cx),
+                move |this, _, e: &OpenLocation, w, cx| {
+                    open(this, e, w, cx);
+                    // The findings lane's leak marker opens the Leaks tab, where the snapshot's
+                    // findings are.
+                    if matches!(e.0.selection, Some(Selection::Heap(_))) {
+                        this.memory
+                            .update(cx, |m, cx| m.set_tab(MemoryTab::Leaks, cx));
+                    }
+                },
             ),
             cx.subscribe_in(&memory, window, move |this, _, e: &OpenLocation, w, cx| {
                 open(this, e, w, cx)
@@ -2320,7 +2328,7 @@ mod tests {
         let (_shell, cx) = open_shell_snapshot(cx, snap);
         press(cx, "cmd-3", "ctrl-3");
         assert!(exists(cx, "memory-view"));
-        assert!(exists(cx, "memory-leaks-placeholder"));
+        assert!(exists(cx, "leaks-snapshots"));
     }
 
     #[gpui_kit::test]

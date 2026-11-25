@@ -85,8 +85,12 @@ impl LaneKind {
             LaneKind::Gc => [snap.memory.gc_lod(), snap.timeline.gc_lod()]
                 .iter()
                 .any(|lod| lod.level(0).is_some_and(|l| !l.is_empty())),
-            // The session's worst frame, from the coarsest cells: no frame is read.
+            // The session's worst frame, from the coarsest cells: no frame is read. Or a heap
+            // snapshot with leak suspects.
             LaneKind::Findings => {
+                if snap.memory.heaps().iter().any(|h| h.suspects() > 0) {
+                    return true;
+                }
                 let all = TimeRange::new(SessionTime(0), SessionTime(u64::MAX));
                 let janky = 2 * u64::from(snap.latest_budget_us());
                 lod_cells(snap.frames.lod(), all, 1)
@@ -117,6 +121,8 @@ pub enum LaneHit {
     Gc(TimeRange),
     /// A janky frame, by index into the frames.
     Finding(usize),
+    /// A heap snapshot with leak suspects.
+    Leak(fdt_store::heap::HeapId),
     /// The frames of a pixel column; the page looks up the worst of them under the pointer
     /// ([`worst_frame`]), so the layout never reads individual frames in cell mode.
     FrameCell(TimeRange),
@@ -549,15 +555,15 @@ pub fn gc_lane(snap: &Snapshot, vp: Viewport, width: f32, budget: usize) -> Lane
 /// Markers at `xs` (pixels), each with `text` if there is room before the next marker.
 /// `xs` ascending; markers in the same pixel column collapse into the first.
 fn marker_lane(
-    items: impl Iterator<Item = (f32, LaneHit, String)>,
+    items: impl Iterator<Item = (f32, LaneHit, String, Hue)>,
     width: f32,
     budget: usize,
 ) -> LaneGeometry {
     let mut g = LaneGeometry::default();
     let (top, h) = (pad(), lane_h() - 2.0 * pad());
-    let mut markers: Vec<(f32, LaneHit, String)> = Vec::new();
+    let mut markers: Vec<(f32, LaneHit, String, Hue)> = Vec::new();
     let mut last_col: Option<i64> = None;
-    for (x, hit, text) in items {
+    for (x, hit, text, hue) in items {
         if !x.is_finite() || x < 0.0 || x > width {
             continue;
         }
@@ -566,13 +572,13 @@ fn marker_lane(
             continue;
         }
         last_col = Some(col);
-        markers.push((x, hit, text));
+        markers.push((x, hit, text, hue));
         if markers.len() >= budget {
             break;
         }
     }
     let min_label = f32::from(layout::LABEL_MIN_WIDTH);
-    for (i, (x, hit, text)) in markers.iter().enumerate() {
+    for (i, (x, hit, text, hue)) in markers.iter().enumerate() {
         let left = (x - MARKER_PX / 2.0).max(0.0);
         let w = MARKER_PX.min(width - left).max(f32::MIN_POSITIVE);
         let rect = Rect {
@@ -581,10 +587,7 @@ fn marker_lane(
             w,
             h,
         };
-        g.quads.push(LaneQuad {
-            rect,
-            hue: Hue::Accent,
-        });
+        g.quads.push(LaneQuad { rect, hue: *hue });
         g.hits.push((rect, *hit));
         let lx = x + LABEL_GAP_PX;
         let next = markers.get(i + 1).map_or(width, |m| m.0 - LABEL_GAP_PX);
@@ -647,6 +650,7 @@ pub fn navigation_lane(snap: &Snapshot, vp: Viewport, width: f32, budget: usize)
             vp.x_of(row.time.0, width),
             LaneHit::Navigation(seq),
             first_line(row.text),
+            Hue::Accent,
         ))
     });
     marker_lane(items, width, budget)
@@ -654,7 +658,8 @@ pub fn navigation_lane(snap: &Snapshot, vp: Viewport, width: f32, budget: usize)
 
 /// A `Jank` marker on every pixel column that holds a janky frame: the frames' level-of-detail
 /// cells over the view, kept where the worst frame is over twice the budget. Bounded by the
-/// width, never by the data, and never a sample: every frame is in some cell.
+/// width, never by the data, and never a sample: every frame is in some cell. A heap snapshot
+/// with leak suspects adds a danger `Leak` marker at its time.
 pub fn findings_lane(snap: &Snapshot, vp: Viewport, width: f32, budget: usize) -> LaneGeometry {
     let janky = 2 * u64::from(snap.latest_budget_us());
     let cells = lane_cells(snap.frames.lod(), range_of(vp), width as usize);
@@ -667,9 +672,31 @@ pub fn findings_lane(snap: &Snapshot, vp: Viewport, width: f32, budget: usize) -
                 rect.x + rect.w / 2.0,
                 LaneHit::FindingCell(cell_range(&c)),
                 "Jank".to_string(),
+                Hue::Accent,
             ))
         });
-    marker_lane(items, width, budget)
+    let range = range_of(vp);
+    let mut all: Vec<(f32, LaneHit, String, Hue)> = snap
+        .memory
+        .heaps()
+        .iter()
+        .filter(|h| h.suspects() > 0)
+        .filter_map(|h| {
+            let at = h.time.unwrap_or(h.requested);
+            (at >= range.start && at <= range.end).then(|| {
+                (
+                    vp.x_of(at.0, width),
+                    LaneHit::Leak(h.id),
+                    "Leak".to_string(),
+                    Hue::Danger,
+                )
+            })
+        })
+        .collect();
+    all.extend(items);
+    // Stable: on a tie the leak, which comes first, wins the pixel column.
+    all.sort_by(|a, b| a.0.total_cmp(&b.0));
+    marker_lane(all.into_iter(), width, budget)
 }
 
 /// The hit at `(x, y)` in a lane, reaching a couple of pixels past a marker.
@@ -713,6 +740,10 @@ pub fn location_for(snap: &Snapshot, hit: &LaneHit, range: Option<TimeRange>) ->
         LaneHit::Navigation(seq) => {
             let row = snap.logs.get_row(seq as usize)?;
             Some(at(Tool::Logs, Some(Selection::Log(row.id))))
+        }
+        LaneHit::Leak(id) => {
+            snap.memory.heap(id)?;
+            Some(at(Tool::Memory, Some(Selection::Heap(id))))
         }
         LaneHit::Gc(_) => Some(at(Tool::Performance, None)),
         LaneHit::LogCell(_)
@@ -800,6 +831,14 @@ pub fn tooltip_text(snap: &Snapshot, hit: &LaneHit) -> Option<String> {
         LaneHit::Navigation(seq) => {
             let row = snap.logs.get_row(seq as usize)?;
             Some(first_line(row.text))
+        }
+        LaneHit::Leak(id) => {
+            let k = snap.memory.heap(id)?.suspects();
+            Some(format!(
+                "Heap snapshot #{} \u{b7} {}",
+                crate::tools::memory::heap_number(id),
+                plural(u64::from(k), "leak suspect", "leak suspects")
+            ))
         }
         LaneHit::Gc(_)
         | LaneHit::LogCell(_)
@@ -1329,6 +1368,66 @@ mod tests {
             cell_tooltip(&two, &LaneHit::RequestCell(all)).as_deref(),
             Some("2 requests (1 failed)")
         );
+    }
+
+    #[test]
+    fn findings_lane_marks_and_opens_leaks() {
+        use crate::test_support::{heap_record, heap_record_with};
+        use fdt_store::heap::{HeapId, LeakFinding, LeakKind};
+        let snap = snapshot(|w, run| {
+            // #1 has no suspects; #2 has one finding.
+            heap_record(w, run, |_| {});
+            heap_record_with(
+                w,
+                run,
+                |b| {
+                    let class = b.class("LeakyState", "package:app/leaky.dart", &[]);
+                    let o = b.object(class, 32, fdt_analysis::heap::format::Value::None, &[]);
+                    b.static_field("leaky", o);
+                },
+                |s| {
+                    s.findings = vec![LeakFinding {
+                        kind: LeakKind::UnmountedState,
+                        node: 1,
+                        class: 0,
+                        retained: 32,
+                        path: Vec::new().into(),
+                        culprit: None,
+                        keeps: Vec::new().into(),
+                    }]
+                    .into();
+                    s.findings_total = 1;
+                },
+            );
+        });
+        assert!(LaneKind::Findings.has_data(&snap));
+        let vp = Viewport::fit(0, 4_000 * MS);
+        let g = lane_geometry(LaneKind::Findings, &snap, vp, 800.0, CANVAS_MAX_QUADS, None);
+        // Snapshot #2 is at 2 s.
+        assert_eq!(g.hits.len(), 1);
+        assert_eq!(g.hits[0].1, LaneHit::Leak(HeapId(1)));
+        assert_eq!(g.quads[0].hue, Hue::Danger);
+        assert_eq!(g.labels[0].text, "Leak");
+        assert_eq!(
+            tooltip_text(&snap, &LaneHit::Leak(HeapId(1))).as_deref(),
+            Some("Heap snapshot #2 \u{b7} 1 leak suspect")
+        );
+        let loc = location_for(&snap, &LaneHit::Leak(HeapId(1)), None).unwrap();
+        assert_eq!(loc.page, Page::Tool(Tool::Memory));
+        assert_eq!(loc.selection, Some(Selection::Heap(HeapId(1))));
+        // A record that is gone opens nothing.
+        assert!(location_for(&snap, &LaneHit::Leak(HeapId(7)), None).is_none());
+        // Out of view: no marker.
+        let away = Viewport::fit(10_000 * MS, 12_000 * MS);
+        let g = lane_geometry(
+            LaneKind::Findings,
+            &snap,
+            away,
+            800.0,
+            CANVAS_MAX_QUADS,
+            None,
+        );
+        assert!(g.hits.is_empty());
     }
 
     #[test]
