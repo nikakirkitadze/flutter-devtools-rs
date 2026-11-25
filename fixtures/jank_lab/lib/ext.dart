@@ -5,6 +5,8 @@ import 'dart:developer' as developer;
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/widgets.dart';
 
+import 'scenarios/leaks.dart' show leakyScreensMounted;
+
 /// Navigator of the fixture app, so automation can push routes without a
 /// [BuildContext].
 final GlobalKey<NavigatorState> navKey = GlobalKey<NavigatorState>();
@@ -20,6 +22,7 @@ const List<String> jankBuiltins = [
   'goto_rebuilds',
   'goto_leaks',
   'pump_frames',
+  'leaky_mounted',
   'home',
   'pop',
   'list',
@@ -90,6 +93,7 @@ Future<developer.ServiceExtensionResponse> handleJankLabRun(
     case 'pop':
       navKey.currentState?.pop();
     case 'list':
+    case 'leaky_mounted':
       break;
     default:
       final fn = jankActions[action];
@@ -105,6 +109,10 @@ Future<developer.ServiceExtensionResponse> handleJankLabRun(
   // never build.
   WidgetsBinding.instance.scheduleFrame();
   return developer.ServiceExtensionResponse.result(
-    jsonEncode({'ok': true, 'available': jankLabAvailable()}),
+    jsonEncode({
+      'ok': true,
+      'available': jankLabAvailable(),
+      'leaky_mounted': leakyScreensMounted,
+    }),
   );
 }

@@ -52,6 +52,29 @@ async fn main_isolate(vm: &VmService) -> String {
         .clone()
 }
 
+/// Waits (re-pumping frames) until `LeakyScreen` has `want` mounted states.
+async fn wait_leaky_mounted(vm: &VmService, isolate: &str, want: u64) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last = None;
+    while Instant::now() < deadline {
+        act(vm, isolate, "pump_frames").await;
+        sleep(Duration::from_millis(600)).await;
+        let v = vm
+            .call_extension(
+                "ext.jank_lab.run",
+                isolate,
+                json!({"action": "leaky_mounted"}),
+            )
+            .await
+            .expect("leaky_mounted");
+        last = v["leaky_mounted"].as_u64();
+        if last == Some(want) {
+            return;
+        }
+    }
+    panic!("expected {want} mounted LeakyScreen states, last saw {last:?}");
+}
+
 /// Runs an automation action, retrying while its screen has not mounted yet.
 async fn act(vm: &VmService, isolate: &str, action: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -783,11 +806,9 @@ async fn memory_checks(
 
     // 4. Go to /leaks and back.
     act(vm, iso, "goto_leaks").await;
-    act(vm, iso, "pump_frames").await;
-    sleep(Duration::from_secs(1)).await;
+    wait_leaky_mounted(vm, iso, 1).await;
     act(vm, iso, "home").await;
-    act(vm, iso, "pump_frames").await;
-    sleep(Duration::from_secs(1)).await;
+    wait_leaky_mounted(vm, iso, 0).await;
 
     // 5. Second snapshot.
     let (b1, ready) = next_heap(cap, 1).await;
@@ -807,7 +828,19 @@ async fn memory_checks(
         .iter()
         .filter(|f| f.kind == LeakKind::UnmountedState && name(f.class) == "_LeakyScreenState")
         .collect();
-    assert_eq!(states.len(), 1, "one unmounted _LeakyScreenState");
+    let state_instances: u64 = sum
+        .classes
+        .iter()
+        .filter(|c| &*c.name == "_LeakyScreenState")
+        .map(|c| c.count)
+        .sum();
+    assert_eq!(
+        states.len(),
+        1,
+        "one unmounted _LeakyScreenState; _LeakyScreenState objects in the snapshot: \
+         {state_instances}; finding kinds: {:?}",
+        sum.findings.iter().map(|f| f.kind).collect::<Vec<_>>()
+    );
     let f = states[0];
     let text = fdt_analysis::heap::leaks::path_text(&sum, &f.path);
     println!("path (state): {text}");

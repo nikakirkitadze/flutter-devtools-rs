@@ -33,6 +33,9 @@ class LeakJar {
   static final List<ScrollController> controllers = [];
 }
 
+/// How many `LeakyScreen` states are mounted right now (initState to dispose).
+int leakyScreensMounted = 0;
+
 class LeakyScreen extends StatefulWidget {
   const LeakyScreen({super.key});
 
@@ -54,10 +57,12 @@ class _LeakyScreenState extends State<LeakyScreen> {
       if (mounted) setState(() => _pings++);
     });
     LeakJar.controllers.add(_scroll);
+    leakyScreensMounted++;
   }
 
   @override
   void dispose() {
+    leakyScreensMounted--;
     _scroll.dispose();
     super.dispose();
   }

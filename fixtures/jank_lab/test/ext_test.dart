@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:jank_lab/ext.dart';
@@ -13,6 +15,7 @@ void main() {
     'goto_rebuilds',
     'goto_leaks',
     'pump_frames',
+    'leaky_mounted',
     'home',
     'pop',
     'list',
@@ -136,6 +139,26 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(seconds: 1));
     expect(find.byType(LeakyScreen), findsNothing);
+  });
+
+  testWidgets('leaky_mounted counts the mounted leaky screens', (tester) async {
+    Future<int> mounted() async {
+      final r = await handleJankLabRun('leaky_mounted');
+      expect(r.isError(), isFalse);
+      return (jsonDecode(r.result!) as Map<String, dynamic>)['leaky_mounted']
+          as int;
+    }
+
+    await tester.pumpWidget(const JankLabApp());
+    expect(await mounted(), 0);
+    await handleJankLabRun('goto_leaks');
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 1));
+    expect(await mounted(), 1);
+    await handleJankLabRun('home');
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 1));
+    expect(await mounted(), 0);
   });
 
   testWidgets('pump_frames returns ok at once and is listed', (tester) async {
