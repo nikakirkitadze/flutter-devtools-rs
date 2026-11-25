@@ -78,6 +78,7 @@ pub fn dialog_window_actions(el: Div, shell: FocusHandle) -> Div {
 struct PaletteReturn {
     page: Page,
     tab: PerfTab,
+    memory_tab: crate::tools::memory::MemoryTab,
     session: u64,
     focused: Option<FocusHandle>,
 }
@@ -760,6 +761,7 @@ impl MainWindow {
         };
         let unchanged = before.page == self.current().page
             && before.tab == self.performance.read(cx).tab()
+            && before.memory_tab == self.memory.read(cx).tab()
             && before.session == self.session_id;
         if !unchanged {
             self.page_changed = true;
@@ -824,6 +826,7 @@ impl MainWindow {
             self.palette_return = Some(PaletteReturn {
                 page: self.current().page,
                 tab: self.performance.read(cx).tab(),
+                memory_tab: self.memory.read(cx).tab(),
                 session: self.session_id,
                 focused: window.focused(cx),
             });
@@ -2314,6 +2317,29 @@ mod tests {
         // The chart and the Leaks tab each show an empty state.
         assert!(exists(cx, "memory-chart-empty"));
         assert!(exists(cx, "memory-leaks-empty"));
+    }
+
+    #[gpui_kit::test]
+    fn a_palette_memory_tab_change_does_not_restore_the_old_tabs_focus(cx: &mut TestAppContext) {
+        let snap = snapshot(|w, run| {
+            crate::test_support::heap_record(w, run, tiny_heap);
+        });
+        let (shell, cx) = open_shell_snapshot(cx, snap);
+        press(cx, "cmd-3", "ctrl-3");
+        let mine = shell.read_with(cx, |s, _| s.focus_handle());
+        let start = memory_tab(&shell, cx);
+        let (command, tab) = if start == MemoryTab::Leaks {
+            ("Show Classes", MemoryTab::Classes)
+        } else {
+            ("Show Leaks", MemoryTab::Leaks)
+        };
+        run_command(cx, &shell, command);
+        cx.update(|window, cx| window.render_frame(cx));
+        assert_eq!(memory_tab(&shell, cx), tab);
+        assert!(
+            is_focused(cx, &mine),
+            "the page-change path puts the focus on the shell"
+        );
     }
 
     #[gpui_kit::test]
