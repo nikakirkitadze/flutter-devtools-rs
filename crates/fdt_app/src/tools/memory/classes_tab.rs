@@ -220,6 +220,8 @@ use std::time::{Duration, Instant};
 pub const REFRESH_TIP: &str = "Refreshing pauses your app briefly (about 15 ms in profile mode).";
 /// The tooltip of Refresh while no app is connected.
 pub const DISCONNECTED_TIP: &str = "Connect to an app to refresh the allocation profile.";
+/// The tooltip of Refresh while a profile is being fetched.
+pub const FETCHING_TIP: &str = "Waiting for the allocation profile.";
 pub const LIVE_ONLY_NOTE: &str = "Runs a full garbage collection in the app before counting.";
 pub const GARBAGE_NOTE: &str = "Counts include objects waiting for garbage collection.";
 const EMPTY_BODY: &str =
@@ -449,6 +451,9 @@ impl ClassesTab {
         });
         let subs = vec![
             cx.observe(&session, |this, _, cx| {
+                if !this.connected(cx) {
+                    this.clear_fetch();
+                }
                 if this.active {
                     this.sync(cx);
                 }
@@ -516,7 +521,14 @@ impl ClassesTab {
 
     /// Whether Refresh cannot be used.
     pub fn refresh_disabled(&self, cx: &App) -> bool {
-        !self.connected(cx)
+        !self.connected(cx) || self.fetching
+    }
+
+    /// Forgets a fetch in flight: it was answered, abandoned or can no longer be answered.
+    fn clear_fetch(&mut self) {
+        self.fetching = false;
+        self.skeleton = false;
+        self.fetch_timer = None;
     }
 
     /// A new session: nothing of the old one stays.
@@ -559,8 +571,8 @@ impl ClassesTab {
                 .last()
                 .is_none_or(|p| snap.latest_time().0.saturating_sub(p.time.0) > limit);
             // The answer to an earlier request may not have been published yet.
-            if stale && !self.fetching {
-                self.refresh(cx);
+            if stale {
+                self.request(false, cx);
             }
             self.sync(cx);
             cx.notify();
@@ -601,13 +613,19 @@ impl ClassesTab {
     /// Asks the app for a profile; with a full GC only when "Live objects only" is on. Without
     /// an app it does nothing.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        if !self.connected(cx) {
+        self.request(self.live_only, cx);
+    }
+
+    /// Sends one request for a profile. Only an explicit Refresh passes `gc`; the fetch on
+    /// opening never forces a collection. Ignored while a request is in flight (the timer below
+    /// bounds that) and without an app.
+    fn request(&mut self, gc: bool, cx: &mut Context<Self>) {
+        if !self.connected(cx) || self.fetching {
             return;
         }
         let snap = self.session.read(cx).snapshot().clone();
         let newest = snap.memory.profiles().last().map(|p| p.time);
         let now = cx.background_executor().now();
-        let gc = self.live_only;
         if let Some(control) = self.session.read(cx).control() {
             control.fetch_allocation_profile(gc);
         }
@@ -625,8 +643,7 @@ impl ClassesTab {
             .ok();
             cx.background_executor().timer(FETCH_GIVE_UP).await;
             this.update(cx, |this, cx| {
-                this.fetching = false;
-                this.skeleton = false;
+                this.clear_fetch();
                 cx.notify();
             })
             .ok();
@@ -656,9 +673,7 @@ impl ClassesTab {
             && self.fetching
             && key.newest != base
         {
-            self.fetching = false;
-            self.skeleton = false;
-            self.fetch_timer = None;
+            self.clear_fetch();
         }
         self.sync_history(cx);
         if self.started.as_ref() == Some(&key) {
@@ -672,12 +687,17 @@ impl ClassesTab {
                 .background_spawn(async move { class_rows(&snap.memory, range, &filter) })
                 .await;
             this.update(cx, |this, cx| {
-                if this.started.as_ref() == Some(&key) {
-                    this.apply(out, cx);
-                }
+                this.finish(&key, out, cx);
             })
             .ok();
         }));
+    }
+
+    /// Takes the rows of the job for `key`, unless a newer job replaced it.
+    fn finish(&mut self, key: &Key, out: ClassRows, cx: &mut Context<Self>) {
+        if self.started.as_ref() == Some(key) {
+            self.apply(out, cx);
+        }
     }
 
     fn apply(&mut self, out: ClassRows, cx: &mut Context<Self>) {
@@ -795,6 +815,22 @@ impl ClassesTab {
     }
 
     #[cfg(test)]
+    pub fn fetch_state(&self) -> (bool, bool, bool) {
+        (self.fetching, self.skeleton, self.fetch_timer.is_some())
+    }
+
+    #[cfg(test)]
+    fn set_filter(&mut self, filter: &str, cx: &mut Context<Self>) {
+        self.filter = filter.to_string();
+        self.sync(cx);
+    }
+
+    #[cfg(test)]
+    fn started_key(&self) -> Option<Key> {
+        self.started.clone()
+    }
+
+    #[cfg(test)]
     pub fn is_settled(&self, cx: &App) -> bool {
         self.started.as_ref() == Some(&self.key(cx)) && self.loaded
     }
@@ -835,13 +871,15 @@ impl ClassesTab {
         let mut refresh = Button::new("classes-refresh")
             .label("Refresh")
             .compact()
-            .tooltip(if connected {
-                REFRESH_TIP
-            } else {
+            .tooltip(if !connected {
                 DISCONNECTED_TIP
+            } else if self.fetching {
+                FETCHING_TIP
+            } else {
+                REFRESH_TIP
             })
             .on_click(cx.listener(|this, _, _, cx| this.refresh(cx)));
-        if !connected {
+        if !connected || self.fetching {
             refresh = refresh.disabled(true);
         }
         let live = Switch::new("classes-live-only")
@@ -1308,6 +1346,7 @@ mod ui_tests {
     use fdt_store::Snapshot;
     use fdt_store::memory::{AllocProfile, AllocRow, MemorySample};
     use fdt_store::time::RunId;
+    use fdt_ui::tokens::motion;
     use gpui_kit::test::TestWindowExt as _;
     use gpui_kit::{TestAppContext, VisualTestContext};
 
@@ -1454,14 +1493,194 @@ mod ui_tests {
         });
         cx.run_until_parked();
         assert_eq!(alloc_commands(&fake), ["alloc_profile true"]);
-        // The palette command takes the same switch.
+        // While it is in flight, a second Refresh (button or palette) sends nothing.
+        assert!(tab.read_with(cx, |t, cx| t.refresh_disabled(cx)));
+        cx.dispatch_action(crate::actions::RefreshAllocationProfile);
+        cx.run_until_parked();
+        assert_eq!(alloc_commands(&fake).len(), 1);
+        // The profile arrives; the palette command takes the same switch.
+        fake.snaps.send(with_profile(11_000, 12_000)).unwrap();
+        cx.run_until_parked();
         cx.dispatch_action(crate::actions::RefreshAllocationProfile);
         cx.run_until_parked();
         assert_eq!(alloc_commands(&fake).last().unwrap(), "alloc_profile true");
+        fake.snaps.send(with_profile(13_000, 14_000)).unwrap();
+        cx.run_until_parked();
         tab.update(cx, |t, cx| t.set_live_only(false, cx));
         cx.dispatch_action(crate::actions::RefreshAllocationProfile);
         cx.run_until_parked();
         assert_eq!(alloc_commands(&fake).last().unwrap(), "alloc_profile false");
+    }
+
+    #[gpui_kit::test]
+    fn opening_never_forces_a_gc(cx: &mut TestAppContext) {
+        let (shell, cx, fake) = connect(cx, with_profile(1_000, 10_000));
+        let tab = classes(&shell, cx);
+        tab.update(cx, |t, cx| t.set_live_only(true, cx));
+        show_classes(cx);
+        assert_eq!(alloc_commands(&fake), ["alloc_profile false"]);
+    }
+
+    #[gpui_kit::test]
+    fn the_wait_for_a_profile_gives_up(cx: &mut TestAppContext) {
+        let (shell, cx, fake) = connect(cx, empty_with_sample());
+        show_classes(cx);
+        let tab = classes(&shell, cx);
+        assert_eq!(
+            tab.read_with(cx, |t, _| t.fetch_state()),
+            (true, false, true)
+        );
+        cx.executor()
+            .advance_clock(motion::LOADING_DELAY + Duration::from_millis(1));
+        cx.run_until_parked();
+        assert_eq!(
+            tab.read_with(cx, |t, _| t.fetch_state()),
+            (true, true, true)
+        );
+        assert!(exists(cx, "classes-loading"));
+        cx.executor().advance_clock(FETCH_GIVE_UP);
+        cx.run_until_parked();
+        assert_eq!(
+            tab.read_with(cx, |t, _| t.fetch_state()),
+            (false, false, false)
+        );
+        assert!(exists(cx, "memory-classes-empty"));
+        // Refresh is available again, and asks again.
+        assert!(!tab.read_with(cx, |t, cx| t.refresh_disabled(cx)));
+        tab.update(cx, |t, cx| t.refresh(cx));
+        assert_eq!(alloc_commands(&fake).len(), 2);
+    }
+
+    #[gpui_kit::test]
+    fn a_new_session_leaves_no_fetch_timer(cx: &mut TestAppContext) {
+        let (shell, cx, fake) = connect(cx, empty_with_sample());
+        show_classes(cx);
+        let tab = classes(&shell, cx);
+        assert!(tab.read_with(cx, |t, _| t.fetch_state().2));
+        press(cx, "cmd-n", "ctrl-n");
+        fake.snaps.send(snapshot(|_, _| {})).unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            tab.read_with(cx, |t, _| t.fetch_state()),
+            (false, false, false)
+        );
+        // Nothing fires later.
+        cx.executor().advance_clock(FETCH_GIVE_UP * 2);
+        cx.run_until_parked();
+        assert_eq!(
+            tab.read_with(cx, |t, _| t.fetch_state()),
+            (false, false, false)
+        );
+    }
+
+    #[gpui_kit::test]
+    fn a_disconnect_ends_the_fetch_and_a_reconnect_fetches_again(cx: &mut TestAppContext) {
+        let (shell, cx, fake) = connect(cx, empty_with_sample());
+        show_classes(cx);
+        let tab = classes(&shell, cx);
+        cx.executor()
+            .advance_clock(motion::LOADING_DELAY + Duration::from_millis(1));
+        cx.run_until_parked();
+        assert_eq!(
+            tab.read_with(cx, |t, _| t.fetch_state()),
+            (true, true, true)
+        );
+        fake.status.send(fdt_capture::ConnStatus::Idle).unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            tab.read_with(cx, |t, _| t.fetch_state()),
+            (false, false, false)
+        );
+        assert!(!exists(cx, "classes-loading"));
+        fake.status.send(connected("demo", false)).unwrap();
+        cx.run_until_parked();
+        cx.dispatch_action(ShowLeaksTab);
+        cx.run_until_parked();
+        show_classes(cx);
+        assert_eq!(
+            alloc_commands(&fake).len(),
+            2,
+            "no profile exists, so opening asks again"
+        );
+    }
+
+    fn row_names(tab: &Entity<ClassesTab>, cx: &mut VisualTestContext) -> Vec<String> {
+        tab.read_with(cx, |t, cx| {
+            t.cells(cx).into_iter().map(|r| r[0].clone()).collect()
+        })
+    }
+
+    fn two_class_snapshot() -> Arc<Snapshot> {
+        snapshot(|w, run| {
+            let a =
+                w.intern_alloc_class(run, "i/1", "c/1", "Apple", Some("package:app/a.dart"), None);
+            let b = w.intern_alloc_class(
+                run,
+                "i/1",
+                "c/2",
+                "Banana",
+                Some("package:app/a.dart"),
+                None,
+            );
+            profile(w, run, 1_000, &[row(a, 1, 16), row(b, 1, 8)]);
+            profile(w, run, 9_000, &[row(a, 5, 80), row(b, 2, 16)]);
+            w.push_memory_sample(
+                run,
+                MemorySample {
+                    time: SessionTime(10_000 * MS),
+                    heap_used: 1,
+                    heap_capacity: 2,
+                    external: 0,
+                    rss: None,
+                },
+            );
+        })
+    }
+
+    #[gpui_kit::test]
+    fn only_the_newest_filter_shows(cx: &mut TestAppContext) {
+        let (shell, cx, _fake) = connect(cx, two_class_snapshot());
+        show_classes(cx);
+        let tab = classes(&shell, cx);
+        assert_eq!(row_names(&tab, cx).len(), 2);
+        // Filter A, then B, before A's job ran.
+        tab.update(cx, |t, cx| {
+            t.set_filter("apple", cx);
+            t.set_filter("banana", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(row_names(&tab, cx), ["Banana"]);
+        // A result for the earlier filter that arrives late is dropped.
+        let stale = tab.read_with(cx, |t, _| t.started_key()).unwrap();
+        tab.update(cx, |t, cx| t.set_filter("apple", cx));
+        cx.run_until_parked();
+        assert_eq!(row_names(&tab, cx), ["Apple"]);
+        let late = class_rows(&two_class_snapshot().memory, None, "banana");
+        tab.update(cx, |t, cx| t.finish(&stale, late, cx));
+        assert_eq!(row_names(&tab, cx), ["Apple"]);
+    }
+
+    #[gpui_kit::test]
+    fn a_range_or_session_change_in_flight_drops_the_older_result(cx: &mut TestAppContext) {
+        let (shell, cx, _fake) = connect(cx, two_class_snapshot());
+        show_classes(cx);
+        let tab = classes(&shell, cx);
+        let range = |a, b| Some(TimeRange::new(SessionTime(a * MS), SessionTime(b * MS)));
+        tab.update(cx, |t, cx| {
+            t.set_range(range(0, 1_500), cx);
+            t.set_range(range(0, 9_500), cx);
+        });
+        cx.run_until_parked();
+        // The two profiles are compared, not the first one alone.
+        assert_eq!(tab.read_with(cx, |t, _| t.note()), None);
+        assert_eq!(tab.read_with(cx, |t, cx| t.cells(cx)[0].len()), 6);
+        // A result from another session is dropped too.
+        let mut other = tab.read_with(cx, |t, _| t.started_key()).unwrap();
+        other.session += 1;
+        let before = tab.read_with(cx, |t, cx| t.cells(cx));
+        let late = class_rows(&two_class_snapshot().memory, None, "");
+        tab.update(cx, |t, cx| t.finish(&other, late, cx));
+        assert_eq!(tab.read_with(cx, |t, cx| t.cells(cx)), before);
     }
 
     #[gpui_kit::test]
