@@ -5,6 +5,7 @@
 //! The three tabs are placeholders that show their empty states until they are built.
 
 use super::chart::{ChartTip, EMPTY_TEXT, MemoryChart};
+use super::classes_tab::{ClassesTab, ShowInSnapshot};
 use super::{group_digits, heap_number};
 use crate::actions::TakeHeapSnapshot;
 use crate::actions::{ZoomIn, ZoomOut, ZoomToFit};
@@ -13,7 +14,7 @@ use crate::keymap::LANES_CONTEXT;
 use crate::nav::{Selection, TimeRange, Tool};
 use crate::session_model::SessionModel;
 use crate::shell::sidebar::tool_icon;
-use crate::tools::{KeyZoom, OpenLocation};
+use crate::tools::{KeyZoom, OpenLocation, ReplaceLocation};
 use fdt_capture::ConnStatus;
 use fdt_ui::empty_state::EmptyState;
 use fdt_ui::theme::TokensExt as _;
@@ -87,13 +88,18 @@ pub struct MemoryView {
     /// Whether the Memory page is the current one.
     page_active: bool,
     chart: Entity<MemoryChart>,
+    classes: Entity<ClassesTab>,
+    /// A class name the Snapshot tab should search for, set by "Show in snapshot".
+    pending_snapshot_search: Option<SharedString>,
     /// What the pointer is over on the chart, and where.
     tip: Option<(String, Point<Pixels>)>,
     _observe: Subscription,
     _chart: [Subscription; 2],
+    _classes: [Subscription; 3],
 }
 
 impl EventEmitter<OpenLocation> for MemoryView {}
+impl EventEmitter<ReplaceLocation> for MemoryView {}
 
 impl MemoryView {
     pub fn new(
@@ -111,6 +117,15 @@ impl MemoryView {
             }),
             cx.subscribe(&chart, |_, _, e: &OpenLocation, cx| cx.emit(e.clone())),
         ];
+        let classes = cx.new(|cx| ClassesTab::new(session.clone(), _window, cx));
+        let classes_subs = [
+            cx.subscribe(&classes, |_, _, e: &OpenLocation, cx| cx.emit(e.clone())),
+            cx.subscribe(&classes, |_, _, e: &ReplaceLocation, cx| cx.emit(e.clone())),
+            cx.subscribe(&classes, |this, _, e: &ShowInSnapshot, cx| {
+                this.pending_snapshot_search = Some(e.0.clone());
+                this.set_tab(MemoryTab::Snapshot, cx);
+            }),
+        ];
         Self {
             session,
             tab: MemoryTab::Leaks,
@@ -120,9 +135,12 @@ impl MemoryView {
             focus_pending: PendingFocus::default(),
             page_active: false,
             chart,
+            classes,
+            pending_snapshot_search: None,
             tip: None,
             _observe: observe,
             _chart: chart_subs,
+            _classes: classes_subs,
         }
     }
 
@@ -148,6 +166,36 @@ impl MemoryView {
         self.chart.update(cx, |c, cx| c.key_zoom(z, cx));
     }
 
+    /// The class a "Show in snapshot" asked the Snapshot tab to search for.
+    pub fn pending_snapshot_search(&self) -> Option<&SharedString> {
+        self.pending_snapshot_search.as_ref()
+    }
+
+    /// Takes the pending search, for the Snapshot tab to run.
+    pub fn take_pending_snapshot_search(&mut self) -> Option<SharedString> {
+        self.pending_snapshot_search.take()
+    }
+
+    /// Whether the Classes tab's "Live objects only" is on.
+    pub fn live_only(&self, cx: &gpui_kit::App) -> bool {
+        self.classes.read(cx).live_only()
+    }
+
+    /// Asks the app for an allocation profile, with a full GC only when "Live objects only" is
+    /// on.
+    pub fn refresh_profile(&mut self, cx: &mut Context<Self>) {
+        self.classes.update(cx, |c, cx| c.refresh(cx));
+    }
+
+    pub fn classes(&self) -> &Entity<ClassesTab> {
+        &self.classes
+    }
+
+    fn sync_classes(&mut self, cx: &mut Context<Self>) {
+        let on = self.page_active && self.tab == MemoryTab::Classes;
+        self.classes.update(cx, |c, cx| c.set_active(on, cx));
+    }
+
     pub fn selection(&self) -> Option<Selection> {
         self.selection
     }
@@ -158,14 +206,18 @@ impl MemoryView {
         self.range = None;
         self.selection = None;
         self.tip = None;
+        self.pending_snapshot_search = None;
         self.chart
             .update(cx, |c, cx| c.set_location(None, None, cx));
+        self.classes.update(cx, |c, cx| c.reset(cx));
+        self.sync_classes(cx);
         cx.notify();
     }
 
     pub fn set_tab(&mut self, tab: MemoryTab, cx: &mut Context<Self>) {
         if self.tab != tab {
             self.tab = tab;
+            self.sync_classes(cx);
             cx.notify();
         }
     }
@@ -187,9 +239,14 @@ impl MemoryView {
         self.selection = selection;
         self.chart
             .update(cx, |c, cx| c.set_location(range, selection, cx));
+        self.classes.update(cx, |c, cx| {
+            c.set_range(range, cx);
+            c.set_selection(selection, cx);
+        });
         if selected && let Some(tab) = selection.and_then(MemoryTab::showing) {
             self.tab = tab;
         }
+        self.sync_classes(cx);
         cx.notify();
     }
 
@@ -200,6 +257,7 @@ impl MemoryView {
         }
         self.page_active = active;
         self.chart.update(cx, |c, cx| c.set_active(active, cx));
+        self.sync_classes(cx);
         if active {
             self.focus_pending.request();
             cx.notify();
@@ -352,22 +410,14 @@ impl MemoryView {
         let memory = &snap.memory;
         let content = match self.tab {
             MemoryTab::Classes => {
-                if memory.profiles().is_empty() {
-                    self.empty(
-                        "memory-classes-empty",
-                        "No allocation profile yet",
-                        "Refresh the allocation profile to see which classes use the most memory.",
-                    )
-                } else {
-                    self.note(
-                        "memory-classes-placeholder",
-                        format!(
-                            "{} classes in the allocation profile.",
-                            group_digits(memory.alloc_class_count() as u64)
-                        ),
-                        cx,
-                    )
-                }
+                return div()
+                    .id("memory-tab-classes")
+                    .test_support()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(self.classes.clone())
+                    .into_any_element();
             }
             MemoryTab::Leaks => {
                 if let Some(busy) = memory.busy() {

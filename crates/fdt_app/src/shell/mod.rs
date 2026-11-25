@@ -212,6 +212,9 @@ impl MainWindow {
             cx.subscribe(&performance, move |this, _, e: &ReplaceLocation, cx| {
                 replace(this, e, cx)
             }),
+            cx.subscribe(&memory, move |this, _, e: &ReplaceLocation, cx| {
+                replace(this, e, cx)
+            }),
             cx.subscribe_in(&logs, window, move |this, _, e: &OpenLocation, w, cx| {
                 open(this, e, w, cx)
             }),
@@ -1022,7 +1025,7 @@ impl Render for MainWindow {
                 this.with_control(cx, |c| c.cancel_heap_snapshot());
             }))
             .on_action(cx.listener(|this, _: &RefreshAllocationProfile, _, cx| {
-                this.with_control(cx, |c| c.fetch_allocation_profile(false));
+                this.memory.update(cx, |m, cx| m.refresh_profile(cx));
             }))
             .on_action(cx.listener(|this, _: &UseAsBaseline, _, cx| {
                 if let Some(id) = this.target_heap(cx) {

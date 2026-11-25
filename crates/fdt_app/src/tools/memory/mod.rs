@@ -1,6 +1,8 @@
 //! The Memory tool: the memory chart, the allocation profile, leak findings and heap snapshots.
 
 pub mod chart;
+pub mod classes_tab;
+pub mod details;
 pub mod view;
 
 pub use view::{MemoryTab, MemoryView, TAKE_SNAPSHOT_TIP};
