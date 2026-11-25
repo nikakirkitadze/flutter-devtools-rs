@@ -486,6 +486,7 @@ pub fn analyze(
     let retainers = shortest_retainers(&g, &weak);
     check(cancel)?;
 
+    progress(HeapStage::Leaks);
     // The scan hook: the forward references still exist, the predecessor lists do not yet.
     let rows = sdk::rows_for(input.flutter_version.as_deref());
     let scan_file = File::open(input.file.path()).map_err(io_error)?;
@@ -1142,18 +1143,19 @@ mod tests {
         let tag = |s: &HeapStage| match s {
             HeapStage::Parsing { .. } => 0,
             HeapStage::Reachability => 1,
-            HeapStage::Dominators => 2,
-            HeapStage::Ready => 3,
+            HeapStage::Leaks => 2,
+            HeapStage::Dominators => 3,
+            HeapStage::Ready => 4,
             _ => 9,
         };
         let tags: Vec<i32> = seen.iter().map(tag).collect();
         assert!(tags.is_sorted(), "{seen:?}");
-        for want in 0..4 {
+        for want in 0..5 {
             assert!(tags.contains(&want), "stage {want} in {seen:?}");
         }
         assert_eq!(seen.last(), Some(&HeapStage::Ready));
 
-        for stop in 0..3 {
+        for stop in 0..4 {
             let cancel = AtomicBool::new(false);
             let got = analyze(&input(&file), &cancel, &mut |s| {
                 if tag(&s) == stop {
