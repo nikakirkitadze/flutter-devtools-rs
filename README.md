@@ -21,10 +21,10 @@ answer the questions directly: why did this frame jank, what is rebuilding too m
 happened around this failed request. Everything is tied together on one time axis, and it stays
 smooth with a million log lines.
 
-**Status: early development.** The Connect page, Logs, Network, Performance, Memory and Timeline tools
-work today. Still to come: the widget inspector, an optional
-in-app probe package, saved sessions, and signed installers. Daily use happens on macOS; Windows
-and Linux are built and tested in CI.
+**Status: early development.** The Connect page, Logs, Network, Performance, Memory and
+Timeline tools work today. Still to come: the widget inspector, an optional in-app probe package,
+saved sessions, and signed installers. Daily use happens on macOS; Windows and Linux are built
+and tested in CI.
 
 ## What it does
 

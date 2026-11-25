@@ -8,7 +8,7 @@ Legend: met, missed, not resolvable (the method cannot see the budget's margin),
 
 ## Summary and status
 
-M4 is built: the Memory tool (a live chart of heap used, capacity, external and RSS with GC marks; Classes, Leaks and Snapshot tabs), heap snapshots taken on request and analysed in the capture (dominators, retained sizes, shortest retaining paths, a level-1 leak scan, a diff between two snapshots, the size of the HTTP recording), the GC lane on the Timeline, the findings lane, cross-links, palette and keyboard actions, two bench-ui scenarios for the chart and the tree plus one for analysis, and a live `jank_lab` test of the whole path. All automated checks are green.
+M4 is built: the Memory tool (a live chart of heap used, capacity, external and RSS with GC marks; Classes, Leaks and Snapshot tabs), heap snapshots taken on request and analysed in the capture (dominators, retained sizes, shortest retaining paths, a level-1 leak scan, a diff between two snapshots, the size of the HTTP recording), the GC lane on the Timeline, the findings lane, cross-links, palette and keyboard actions, two bench-ui scenarios for the chart and the tree plus one for analysis, and a live `jank_lab` test of the whole path. The static checks and unit tests are green; **the live `jank_lab` test is not**: 2 of 5 profile runs failed (see below), and the cause of neither is known.
 
 What this verification found:
 
@@ -20,11 +20,11 @@ What this verification found:
   - **`memory-chart` interval p99 is 8.99 ms against 8.833** (3 of 3 runs, 8.75 / 8.99 / 9.04; the chart's own layout p99 is 0.87 ms, so our layout is not the cost) and one run had a 17.58 ms interval.
   - **`heap-tree` draw p99 is 4.31 ms against 4** (4.31, 3.45, 4.63), with 2 of 3 runs at a 13.3 ms frame interval (a display cadence of about 75 Hz), which is not ours.
   - **Draw p99 on the earlier scenarios** (by the median of 3, in either of two passes): `logs-search` 7.19 / 6.89, `tool-switch` 9.88 / 9.98 (M3: 7.08), `frame-details` 5.11 (M3: 4.51), `live-perf` 4.15, `logs-scroll` 4.20 (pass 2 only; new), and `net-scroll`, `net-filter`, `live-logs` in one pass of two.
-  - **Two of five live tests failed** (attach runs): step 6's unmount check once, and "only 0 judged frames" with tracing on once (the same as M3's first run).
+  - **Two of five live tests failed, cause unknown for both**  (attach runs): step 6's unmount check once, and "only 0 judged frames" with tracing on once (the same as M3's first run).
 - **Not measured:** idle with the window drawing on a quiet screen for every page; bench-ui pass 2 for `frame-chart` through `heap-analyse` (the display went off at 15:52:14, again at 18:10:10); the first CI run on Flutter 3.50; Windows and Linux. See "Not measured".
 - **Closed by this record:** M3's pending re-measure of the six draw misses (done: `trace-zoom` and `strip-drag` now meet; `net-filter` meets on the median; `logs-search`, `tool-switch`, `frame-details` still miss), the 15 s CPU poll (done), tracing overhead (done, labelled, unresolved), and attach (done, 5 runs). M3's "there is no CI remote" is closed: CI has run since 2026-11-23 (its first run on Flutter 3.50 is still on the checklist).
 
-## Automated checks (all green)
+## Automated checks (the live `jank_lab` test is not green)
 
 | Check | Result |
 |---|---|
@@ -139,7 +139,9 @@ Measured on `/rebuilds` by toggling `ext.flutter.profileUserWidgetBuilds` direct
 | Measure | Budget | Measured | Verdict |
 |---|---|---|---|
 | Idle RSS, connected | <= 150 MB | 176,272 to 176,720 KiB = **172.1 to 172.6 MiB (180.5 to 181.0 MB)**, flat across the 30 samples | **missed**, by 22 MiB (15 %) against 150 MiB, or by 30.5 MB (20 %) against 150 decimal MB; M3 measured 153.3 MiB with a window that drew nothing |
-| Idle CPU, connected, memory poll included | <= 1 % | `ps` shows 1.0 to 3.7 % (mean 2.0) but it decays from the start of the process, so it is not a rate; `top` over 31 one-second samples straight after: 1.8 to 2.0 % steady, mean 2.4 %, max 8.5 % (the first sample) | **missed**, about 2 %; the `sample` tool (5 s) shows the threads in `__psynch_cvwait` and `mach_msg2_trap` nearly all the time (62,575 and 7,314 of about 88,000 samples), so the burst work it caught was tiny. The two do not agree; unresolved |
+| Idle CPU, connected, memory poll included | <= 1 % | `ps` shows 1.0 to 3.7 % (mean 2.0) but it decays from the start of the process, so it is not a rate; `top` over 31 one-second samples straight after: mean 2.4 % over all 31, max 8.5 % (the fifth sample; samples 1 to 5 are 1.6, 3.6, 5.7, 6.3 and 8.5 %, higher than the band after them: samples 6 to 31 are 1.1 to 2.5 %, mean 1.9 %) | **missed**, about 2 %; the `sample` tool (5 s) shows the threads in `__psynch_cvwait` and `mach_msg2_trap` nearly all the time (62,575 and 7,314 of about 88,000 samples), so the burst work it caught was tiny. The two do not agree; unresolved |
+
+**Which RSS.** The budget is judged on `ps` RSS, as M3 did (172.1 to 172.6 MiB). `top -stats rsize` on the same pid, run right after, showed 366 to 367 MB in its first four samples and 300 to 304 MB after (appendix G), 1.7 to 2.1 times the `ps` figure. The reason is not known: `top` and `ps` count RSS differently on macOS (shared, compressed or purgeable pages are candidates), and I did not check which. If the `top` figure is the right one, the miss is larger. The `top` memory column is not used anywhere else in this record.
 
 A second set came from `fdt.app` (the bundle from `scripts/bundle-macos.sh`) started and driven through the `argent` Mac-app tools, which add their own library to the process. Because of that it is not the primary number. On the Logs page: RSS 222,432 to 222,720 KiB (217.2 MiB, 30 samples), `top` CPU 1.69 % mean, 2.7 % max. On the Memory page as the window restored it (Classes tab, a range selected): RSS 165,504 to 188,384 KiB, `top` CPU mean 11.3 %, max 25 %. A window that finds itself on the Memory page with a range, redrawing, is therefore the expensive case; the idle budget is for "nothing selected" and this was not.
 
@@ -205,6 +207,7 @@ The ledger's rulings, with their reasons and costs.
 - **Task 8:** the hash-0 rule is deferred (H12 makes it unreachable for the classes tracked). Cost: a class grown only by hash-0 objects is not listed.
 - **Task 9:** drop the stored per-node `idom` array; derive it from the contiguous child ranges (`partition_point` on `first_child`). Reason: the held index was 32.09 B per object, 0.3 % over; it is 28.1 now with the 32 B target still a hard assert. Cost: an O(log n) idom lookup in the tree reveal.
 - **Task 11:** the post-snapshot allocation profile is for fresh takes only (a re-opened old snapshot would be stamped now, not then). Cancelling or failing the analysis of an `Open` restores `Ready`; a cancelled or failed fresh take drops its file; the hub stops at the first `last` chunk and the parser rejects trailing bytes. Cost: a rare snapshot fails and must be retaken; the user cannot retry analysis of a failed fresh take's file.
+- **Task 11 (carried rulings):** a diff I/O error leaves the record `Ready` without a diff (a debug log, no paths); heap files are created with mode 0600 under `cfg(unix)`; no paths or snapshot bytes are logged. Reason: snapshot privacy (global constraints) and a failed diff should not lose a good analysis. Cost if wrong: a user sees no diff and no error for an unreadable baseline.
 - **Task 12:** command labels follow the existing Title Case convention; other copy is sentence case. Cost: relabel 8 commands.
 - **Task 14:** automatic fetches (tab open, after a snapshot) always use `gc: false`; `gc: true` only on an explicit Refresh with "Live objects only" on. Reason: a full GC is visible to every client and should follow a user act. Cost: an opened stale tab shows garbage-inclusive counts until Refresh.
 - **Task 15 (1):** a new `Selection::LeakSnapshot(HeapId)` shown on Leaks; `Heap(HeapId)` stays Snapshot. Cost: one more variant to match. **Task 15 (copy):** the empty-state shortcut renders the platform's keys; the growth pane's `new_bytes` is labelled the new objects' size, not "Retains".
@@ -213,7 +216,7 @@ The ledger's rulings, with their reasons and costs.
 - **Task 18 (step 9):** the plan's "disconnect empties the heap directory" conflicts with call 3; the test checks files survive disconnect, then New Session empties the directory. Cost: none. **Task 18 (3):** the plan's one-second unmount sequence is kept; risk recorded for CI. **Task 18 (4):** wait up to 10 s for 3 new stored samples, each with RSS; no wall-clock span assert.
 - **Task 19 (this record):** the measurement scripts gained optional flags (`--act`, `--trace`, `--long-ms` on `frame_build_sampler`; the connect time on `attach_hold`) so the fetch times and the tracing toggle could be measured; no product code changed. Cost: two small example edits.
 
-**Observed in this verification, and bearing on a ruling:** the Task 18 ruling (3) risk came true once in five live runs (run 2, "one unmounted _LeakyScreenState", left 0, right 1, at the 1 s unmount sequence). It is a flake of the live test, not of the app, and it fired on a Mac at load 4.
+**Observed in this verification, and bearing on a ruling:** the Task 18 ruling (3) risk came true once in five live runs (run 2, "one unmounted _LeakyScreenState", left 0, right 1, at the 1 s unmount sequence). **The cause is unknown.** The raw output shows only the assertion at `crates/fdt_capture/tests/jank_lab_live.rs:810` (left 0, right 1). It may be the 1 s unmount timing the ruling accepted, or a real unmount or leak-detection problem in the app or the capture; one failure in five cannot tell them apart. It happened on a Mac at load 4. Run 3's "jank (tracing): only 0 judged frames" (`jank_lab_live.rs:192`) is the same: cause unknown (M3's first live run failed the same way and passed on its second; that is not an explanation).
 
 ## Open decisions for the author
 
@@ -227,7 +230,7 @@ Numbers 1 to 4, 8 and 10 carry M3's unresolved decisions (M3's 1 to 4, 8, 6 and 
 6. **`memory-chart` interval p99 (8.99 against 8.833) and `heap-tree` draw p99 (4.31 against 4)** on a loaded machine; our layout is 0.87 ms. Re-measure on a quiet, awake R1 before deciding anything.
 7. **Heap analysis has 3 B per object of headroom on the replicated heap** (77.0 against 80). Decide whether to leave it (a new allocation on the analysis path then fails the strict budget test) or to find the margin.
 8. **Tracing overhead is not resolved** (above); the copy's "about 30 %" is still the spike figure.
-9. **Known flaky tests** (below), including one M4 test (`memory::hot_restart_moves_polling_to_the_new_group`) the ledger asked the final review to fix, and the live test's unmount step.
+9. **Known flaky tests** (below), including one M4 test (`memory::hot_restart_moves_polling_to_the_new_group`) the ledger asked the final review to fix, the live test's unmount step (`jank_lab_live.rs:810`, run 2, cause unknown), and its tracing step (`jank_lab_live.rs:192`, "only 0 judged frames", run 3, cause unknown; it was also M3's first-run failure).
 10. **Recent URLs keep the VM token in `settings.json`** (M2 decision 3), **bodies of unknown length are auto-fetched with a 10 s bound** (M2 decision 4), **new session (⌘N) discards the stored session with no confirmation and fires inside inputs** (M2 decision 7), **`fdt --connect` skips recent URLs** (M2 decision 6) and **Windows and Linux paths are read from source only** (M2 decision 5). All unchanged. M3's decision 5 (there is no CI remote) is closed: CI has run since 2026-11-23.
 11. **Heap snapshot files live in `dirs::cache_dir()/fdt/heap`** (macOS `~/Library/Caches/fdt/heap`); the Windows and Linux locations are unchecked.
 
@@ -252,7 +255,8 @@ Save screenshots next to this file as `m4-<os>-<theme>-<view>.png`.
 - [ ] Keyboard-only pass: ⌘⇧S (Ctrl+Shift+S), Back, the chart's zoom keys (⌘= ⌘- ⌘0), the Classes/Leaks/Snapshot tabs, the tree's arrow keys and search, the palette's heap items.
 - [ ] A hot restart and a full restart in profile mode: the chart's run boundary, polling moving to the new isolate group, the diff refusing snapshots of different runs, GC marks continuing.
 - [ ] **Re-measure on a quiet, awake R1** (commands below): `memory-chart`, `heap-tree`, `tool-switch`, `frame-details`, `live-perf`, `logs-scroll`, the idle RSS and CPU of a drawing window on one page, and the remaining bench-ui scenarios in pass 2.
-- [ ] Fix or accept the flaky tests listed above before relying on CI.
+- [ ] **Investigate the two live-test failures** before relying on CI: step 6 "one unmounted _LeakyScreenState" (`jank_lab_live.rs:810`, left 0, right 1, run 2) and "jank (tracing): only 0 judged frames" (`jank_lab_live.rs:192`, run 3). Run the profile live test repeatedly, with a longer unmount wait, to tell timing from a real unmount or leak-detection fault.
+- [ ] Fix or accept the other flaky tests listed above before relying on CI.
 
 ## Pending verification
 
