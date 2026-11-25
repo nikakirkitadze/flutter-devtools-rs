@@ -98,3 +98,17 @@ pub fn count(counter: Counter) -> u64 {
 pub fn snapshot() -> [u64; N] {
     COUNTS.with(|c| c.get())
 }
+
+thread_local! {
+    static LAYOUT_NANOS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Adds time spent in the memory chart's layout, for `fdt bench-ui memory-chart`.
+pub fn add_layout_time(d: std::time::Duration) {
+    LAYOUT_NANOS.with(|c| c.set(c.get().saturating_add(d.as_nanos() as u64)));
+}
+
+/// The layout time added since the last call, in nanoseconds.
+pub fn take_layout_nanos() -> u64 {
+    LAYOUT_NANOS.with(|c| c.replace(0))
+}

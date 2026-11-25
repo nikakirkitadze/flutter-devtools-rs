@@ -287,6 +287,8 @@ pub struct Measured {
     pub frames: usize,
     /// `heap-analyse`: how long the analysis took, in ms.
     pub analysis_ms: Option<f64>,
+    /// `memory-chart`: time in the chart's layout during each step, in ms.
+    pub layout_ms: Option<Vec<f64>>,
 }
 
 pub struct Report {
@@ -387,6 +389,9 @@ impl Measured {
                 None => json.push_str(&format!(",\"samples\":{{\"latency\":{}}}", l.len())),
             }
         }
+        if let Some(l) = &self.layout_ms {
+            json.push_str(&format!(",\"layout_ms\":{}", pct_json(percentiles(l))));
+        }
         if let Some(a) = self.analysis_ms {
             json.push_str(&format!(",\"analysis_ms\":{:?}", r3(a)));
         }
@@ -433,6 +438,10 @@ pub struct Outcome {
     pub last_position: Option<usize>,
     pub keystrokes: usize,
     pub samples: Vec<Sample>,
+    /// `heap-analyse`: the measured step at which the analysis was seen finished, and the one at
+    /// which the shell's snapshot showed the heap `Ready`.
+    pub finished_at: Option<usize>,
+    pub landed_at: Option<usize>,
     /// Set when the script could not do what it claims (the run then fails).
     pub error: Option<String>,
 }
@@ -474,6 +483,8 @@ pub struct Script {
     tree_len: usize,
     /// `heap-analyse`: the analysis thread's state.
     analysis: Option<Arc<AnalysisProbe>>,
+    /// `memory-chart`: layout time per step, in ms.
+    layout_ms: Vec<f64>,
     /// What the scenario did, for the end-of-run check that it did what its name says.
     seen: Seen,
     outcome: Outcome,
@@ -530,6 +541,10 @@ const TREE_STRIDE: usize = 3;
 const MEMORY_TARGET_SPAN_NS: u64 = 1_000_000_000;
 /// Levels `heap-tree` opens, and rows moved per scroll step.
 const HEAP_LEVELS: usize = 8;
+/// `heap-analyse` keeps measuring this many steps after the record lands, and gives up waiting
+/// for it after this many.
+const LANDED_FRAMES: usize = 3;
+const LANDING_CAP_STEPS: usize = 600;
 const HEAP_STRIDE: usize = 3;
 /// What `heap-tree` types into the search, one character at a time.
 const HEAP_QUERY: &str = "Leaky";
@@ -567,6 +582,7 @@ impl Script {
             levels: 0,
             tree_len: 0,
             analysis: None,
+            layout_ms: Vec::new(),
             seen: Seen {
                 followed: true,
                 ..Seen::default()
@@ -579,6 +595,10 @@ impl Script {
     pub fn with_analysis(mut self, probe: Arc<AnalysisProbe>) -> Self {
         self.analysis = Some(probe);
         self
+    }
+
+    pub fn layout_ms(&self) -> &[f64] {
+        &self.layout_ms
     }
 
     /// How long the analysis took, once it is done.
@@ -740,6 +760,7 @@ impl Script {
             | Scenario::FlameZoom
             | Scenario::MemoryChart => {
                 self.fit_span = Some(self.viewport(shell, cx).span_ns);
+                crate::perf::take_layout_nanos();
             }
             Scenario::HeapAnalyse => {
                 self.fit_span = Some(self.viewport(shell, cx).span_ns);
@@ -813,8 +834,8 @@ impl Script {
                 let probe = self.analysis.as_ref();
                 if probe.is_some_and(|a| a.failed()) {
                     Err("the analysis failed".to_string())
-                } else if self.analysis_ms().is_none() {
-                    Err("the script ended before the analysis did".to_string())
+                } else if self.analysis_ms().is_none() || self.outcome.landed_at.is_none() {
+                    Err("the script ended before the analysis landed".to_string())
                 } else if seen.min_span.is_none_or(|m| m.saturating_mul(2) > fit) {
                     Err("the chart was never zoomed in during the analysis".to_string())
                 } else {
@@ -1023,6 +1044,10 @@ impl Script {
                 panned = true;
             }
         }
+        if self.scenario == Scenario::MemoryChart {
+            self.layout_ms
+                .push(crate::perf::take_layout_nanos() as f64 / 1e6);
+        }
         let after = self.viewport(shell, cx);
         self.seen.pan_moved |= panned && after.start_ns != before.start_ns;
         self.seen.min_span = self.seen.min_span.map(|m| m.min(after.span_ns));
@@ -1033,8 +1058,37 @@ impl Script {
     /// Zooms and pans the chart until the analysis beside it is done.
     fn analyse_step(&mut self, shell: &Entity<MainWindow>, cx: &mut App) {
         self.zoom_step(shell, cx);
-        if self.analysis.as_ref().is_none_or(|a| a.finished()) {
-            self.phase = Phase::Done;
+        let Some(probe) = self.analysis.clone() else {
+            self.fail("heap-analyse has no analysis to run");
+            return;
+        };
+        if probe.failed() {
+            self.fail(&format!("the analysis failed: {}", probe.error()));
+            return;
+        }
+        if !probe.finished() {
+            return;
+        }
+        // The UI reads the thread's snapshots asynchronously: keep measuring until the shell
+        // shows the heap `Ready` (the frame that applies the big summary), then a few frames more.
+        let steps = self.outcome.steps + 1;
+        self.outcome.finished_at.get_or_insert(steps);
+        let ready = shell
+            .read(cx)
+            .session()
+            .read(cx)
+            .snapshot()
+            .memory
+            .heaps()
+            .iter()
+            .any(|h| h.stage == fdt_store::heap::HeapStage::Ready);
+        if ready {
+            let landed = *self.outcome.landed_at.get_or_insert(steps);
+            if steps >= landed + LANDED_FRAMES {
+                self.phase = Phase::Done;
+            }
+        } else if steps > self.outcome.finished_at.unwrap_or(steps) + LANDING_CAP_STEPS {
+            self.fail("the analysed heap never reached the window");
         }
     }
 
@@ -1495,6 +1549,7 @@ pub struct AnalysisProbe {
     finished: AtomicBool,
     failed: AtomicBool,
     micros: AtomicU64,
+    error: std::sync::Mutex<String>,
 }
 
 impl AnalysisProbe {
@@ -1505,6 +1560,17 @@ impl AnalysisProbe {
 
     fn finished(&self) -> bool {
         self.finished.load(Ordering::Acquire)
+    }
+
+    fn error(&self) -> String {
+        self.error.lock().map(|e| e.clone()).unwrap_or_default()
+    }
+
+    fn fail_with(&self, message: String) {
+        if let Ok(mut e) = self.error.lock() {
+            *e = message;
+        }
+        self.failed.store(true, Ordering::Release);
     }
 
     fn failed(&self) -> bool {
@@ -1529,7 +1595,19 @@ fn spawn_analysis(
     mut publish: impl FnMut(Arc<fdt_store::Snapshot>) -> bool + Send + 'static,
 ) {
     use fdt_store::heap::HeapStage;
+    /// Marks the analysis finished however the thread ends, so a panic or an error fails the run
+    /// at once instead of leaving it to wait for the timeout.
+    struct Finish(Arc<AnalysisProbe>);
+    impl Drop for Finish {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                self.0.fail_with("the analysis thread panicked".to_string());
+            }
+            self.0.finished.store(true, Ordering::Release);
+        }
+    }
     std::thread::spawn(move || {
+        let _finish = Finish(probe.clone());
         while !probe.started.load(Ordering::Acquire) {
             std::thread::sleep(Duration::from_millis(1)); // token-check: allow: start poll
         }
@@ -1552,9 +1630,8 @@ fn spawn_analysis(
                 w.set_heap_stage(id, HeapStage::Ready);
                 publish(w.publish());
             }
-            Err(_) => probe.failed.store(true, Ordering::Release),
+            Err(e) => probe.fail_with(e.to_string()),
         }
-        probe.finished.store(true, Ordering::Release);
     });
 }
 
@@ -1681,6 +1758,8 @@ impl Driver {
             refresh_source,
             frames: o.steps,
             analysis_ms: self.script.analysis_ms(),
+            layout_ms: (self.scenario == Scenario::MemoryChart)
+                .then(|| self.script.layout_ms().to_vec()),
         }
     }
 }
@@ -1956,6 +2035,7 @@ mod tests {
             refresh_source: "display",
             frames: 100,
             analysis_ms: None,
+            layout_ms: None,
         }
     }
 
@@ -2237,6 +2317,10 @@ mod tests {
             assert!(script.is_done(), "{}", scenario.name());
             assert_eq!(script.outcome().error, None, "{}", scenario.name());
             assert_eq!(script.outcome().steps, len, "{}", scenario.name());
+            if scenario == Scenario::MemoryChart {
+                assert_eq!(script.layout_ms().len(), len, "a layout time per step");
+                assert!(script.layout_ms().iter().any(|ms| *ms > 0.0));
+            }
         }
     }
 
@@ -2316,6 +2400,16 @@ mod tests {
             tx.send(snap).is_ok()
         });
         let mut script = Script::new(Scenario::HeapAnalyse, None).with_analysis(probe);
+        let ready_in_shell = |vcx: &mut gpui_kit::VisualTestContext| {
+            vcx.update(|_, cx| {
+                let snap = shell.read(cx).session().read(cx).snapshot().clone();
+                snap.memory
+                    .heaps()
+                    .iter()
+                    .any(|h| h.stage == fdt_store::heap::HeapStage::Ready)
+            })
+        };
+        let mut steps_before = 0;
         for _ in 0..3_000 {
             while let Ok(snap) = rx.try_recv() {
                 handle.snaps.send(snap).unwrap();
@@ -2325,6 +2419,14 @@ mod tests {
                 script.step(&shell, window, cx);
             });
             vcx.run_until_parked();
+            // A step counts as measured only once measuring began.
+            if script.outcome().steps > steps_before {
+                assert!(
+                    script.measuring_since().is_some(),
+                    "a step before `started`"
+                );
+                steps_before = script.outcome().steps;
+            }
             if script.is_done() {
                 break;
             }
@@ -2332,29 +2434,25 @@ mod tests {
         }
         assert!(script.is_done());
         assert_eq!(script.outcome().error, None);
-        assert!(script.outcome().steps >= 1, "frames ran while it analysed");
         assert!(script.measuring_since().is_some());
         assert!(script.analysis_ms().is_some_and(|ms| ms > 0.0));
-        // The record the thread published is Ready.
-        let mut ready = false;
-        for _ in 0..100 {
-            while let Ok(snap) = rx.try_recv() {
-                handle.snaps.send(snap).unwrap();
-            }
-            vcx.run_until_parked();
-            ready = vcx.update(|_, cx| {
-                let snap = shell.read(cx).session().read(cx).snapshot().clone();
-                snap.memory
-                    .heaps()
-                    .iter()
-                    .any(|h| h.stage == fdt_store::heap::HeapStage::Ready)
-            });
-            if ready {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5)); // token-check: allow: let it publish
-        }
-        assert!(ready, "the analysed heap was published");
+        let o = script.outcome();
+        let (finished, landed) = (o.finished_at.unwrap(), o.landed_at.unwrap());
+        assert!(finished > 1, "frames were drawn while it analysed");
+        assert!(
+            finished <= landed,
+            "the record lands after the analysis ends"
+        );
+        assert!(
+            o.steps >= landed + LANDED_FRAMES,
+            "the window ran {} steps; the record landed at {landed}",
+            o.steps
+        );
+        assert!(
+            o.steps > landed,
+            "a frame was drawn after the record landed"
+        );
+        assert!(ready_in_shell(vcx), "the shell shows the heap Ready");
     }
 
     #[gpui_kit::test]

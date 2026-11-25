@@ -738,7 +738,9 @@ impl MemoryChart {
         }
         self.laid_key = Some(key);
         self.laid_for = key.size;
+        let began = std::time::Instant::now();
         let geo = chart_layout(&self.snap.memory, self.viewport, key.size);
+        crate::perf::add_layout_time(began.elapsed());
         if *self.geo == geo {
             return false;
         }
