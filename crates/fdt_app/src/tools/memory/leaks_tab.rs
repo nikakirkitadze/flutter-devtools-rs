@@ -520,6 +520,9 @@ pub struct LeaksTab {
     details: Option<(DetailsKey, Arc<Details>)>,
     details_started: Option<DetailsKey>,
     details_job: Option<Task<()>>,
+    /// The selected growth and the diff it was picked from. A new diff (the baseline changed
+    /// by any route) makes its index mean another class, so the selection is dropped.
+    growth_diff: Option<(Selection, usize)>,
     /// Failed records whose details are open.
     failed_open: HashSet<HeapId>,
     focus: FocusHandle,
@@ -550,6 +553,7 @@ impl LeaksTab {
             details: None,
             details_started: None,
             details_job: None,
+            growth_diff: None,
             failed_open: HashSet::new(),
             focus: cx.focus_handle(),
             list_scroll: UniformListScrollHandle::new(),
@@ -647,6 +651,21 @@ impl LeaksTab {
         let snap = self.session.read(cx).snapshot().clone();
         let heap = selection.heap().and_then(|h| snap.memory.heap(h));
         let ptr = |a: Option<usize>| a.unwrap_or(0);
+        if let Selection::Growth { heap: id, .. } = selection {
+            let diff = ptr(heap
+                .and_then(|h| h.diff.as_ref())
+                .map(|d| Arc::as_ptr(d) as usize));
+            match self.growth_diff {
+                Some((s, d)) if s == selection && d != diff => {
+                    self.drop_growth(id, cx);
+                    return;
+                }
+                Some((s, _)) if s == selection => {}
+                _ => self.growth_diff = Some((selection, diff)),
+            }
+        } else {
+            self.growth_diff = None;
+        }
         let key = DetailsKey {
             session: snap.session,
             selection,
@@ -685,13 +704,20 @@ impl LeaksTab {
             control.set_heap_baseline(id);
         }
         if let Some(Selection::Growth { heap, .. }) = self.selection {
-            self.selection = Some(Selection::LeakSnapshot(heap));
-            self.details = None;
-            self.details_started = None;
-            self.details_job = None;
-            self.emit_location(Some(Selection::LeakSnapshot(heap)), true, cx);
+            self.drop_growth(heap, cx);
         }
         cx.notify();
+    }
+
+    /// Replaces a growth selection with its snapshot's.
+    fn drop_growth(&mut self, heap: HeapId, cx: &mut Context<Self>) {
+        self.selection = Some(Selection::LeakSnapshot(heap));
+        self.growth_diff = None;
+        self.details = None;
+        self.details_started = None;
+        self.details_job = None;
+        self.emit_location(Some(Selection::LeakSnapshot(heap)), true, cx);
+        self.sync_details(cx);
     }
 
     fn cancel(&mut self, cx: &mut Context<Self>) {
@@ -2061,6 +2087,32 @@ mod tests {
         assert_eq!(sel, Some(Selection::LeakSnapshot(HeapId(1))));
         tab.update(cx, |t, cx| t.set_baseline(None, cx));
         assert!(fake.commands().contains(&"heap_baseline none".to_string()));
+    }
+
+    #[gpui_kit::test]
+    fn a_new_diff_drops_a_growth_selection_from_the_palette_action(cx: &mut TestAppContext) {
+        let (shell, cx, fake) = connect(cx, two_snapshots(true));
+        let growth = Selection::Growth {
+            heap: HeapId(1),
+            index: 0,
+        };
+        go(&shell, cx, Some(growth));
+        // "Use as Baseline" from the palette or menu does not go through the tab.
+        cx.dispatch_action(crate::actions::UseAsBaseline);
+        cx.run_until_parked();
+        assert!(fake.commands().contains(&"heap_baseline 1".to_string()));
+        assert_eq!(
+            shell.read_with(cx, |s, _| s.current().selection),
+            Some(growth),
+            "nothing changes until the diff does"
+        );
+        // The capture recomputes the diff.
+        fake.snaps.send(two_snapshots(true)).unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            shell.read_with(cx, |s, _| s.current().selection),
+            Some(Selection::LeakSnapshot(HeapId(1)))
+        );
     }
 
     #[gpui_kit::test]
