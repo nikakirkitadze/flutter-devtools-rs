@@ -473,7 +473,6 @@ impl MainWindow {
             .or_else(|| self.session.read(cx).snapshot().memory.held())
     }
 
-    #[cfg(test)]
     pub(crate) fn memory_view(&self) -> &Entity<MemoryView> {
         &self.memory
     }

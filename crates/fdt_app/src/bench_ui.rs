@@ -41,6 +41,8 @@ use gpui_kit::{
 use std::cell::RefCell;
 use std::process::ExitCode;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Seed of the stress session.
@@ -60,7 +62,8 @@ const NET_QUERY: &str = "products";
 
 pub const USAGE: &str = "usage: fdt bench-ui <scenario> [--frames N]\n\
 scenarios: logs-scroll, logs-search, net-scroll, net-filter, tool-switch, strip-drag, live-logs, \
-frame-chart, frame-details, timeline-zoom, trace-zoom, flame-zoom, cpu-tree, live-perf";
+frame-chart, frame-details, timeline-zoom, trace-zoom, flame-zoom, cpu-tree, live-perf, \
+memory-chart, heap-tree, heap-analyse";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scenario {
@@ -86,10 +89,16 @@ pub enum Scenario {
     CpuTree,
     /// The Frames tab following a session that gains 2 frames with slices per publish.
     LivePerf,
+    /// Zoom the memory chart from the whole session to 1 s and back, then pan.
+    MemoryChart,
+    /// Expand the largest child of the dominator tree 8 levels, scroll it, then type a search.
+    HeapTree,
+    /// Pan and zoom the memory chart while a 5M-object heap snapshot is analysed.
+    HeapAnalyse,
 }
 
 impl Scenario {
-    pub const ALL: [Scenario; 14] = [
+    pub const ALL: [Scenario; 17] = [
         Scenario::LogsScroll,
         Scenario::LogsSearch,
         Scenario::NetScroll,
@@ -104,6 +113,9 @@ impl Scenario {
         Scenario::FlameZoom,
         Scenario::CpuTree,
         Scenario::LivePerf,
+        Scenario::MemoryChart,
+        Scenario::HeapTree,
+        Scenario::HeapAnalyse,
     ];
 
     pub fn name(self) -> &'static str {
@@ -122,6 +134,9 @@ impl Scenario {
             Scenario::FlameZoom => "flame-zoom",
             Scenario::CpuTree => "cpu-tree",
             Scenario::LivePerf => "live-perf",
+            Scenario::MemoryChart => "memory-chart",
+            Scenario::HeapTree => "heap-tree",
+            Scenario::HeapAnalyse => "heap-analyse",
         }
     }
 
@@ -134,6 +149,7 @@ impl Scenario {
         match self {
             Scenario::NetScroll | Scenario::NetFilter => Tool::Network,
             Scenario::TimelineZoom => Tool::Timeline,
+            Scenario::MemoryChart | Scenario::HeapTree | Scenario::HeapAnalyse => Tool::Memory,
             Scenario::FrameChart
             | Scenario::FrameDetails
             | Scenario::TraceZoom
@@ -159,13 +175,26 @@ impl Scenario {
             | Scenario::FlameZoom
             | Scenario::CpuTree => 300,
             Scenario::LivePerf => 600,
+            Scenario::MemoryChart => 300,
+            // Scroll steps; the levels and the keystrokes come on top.
+            Scenario::HeapTree => 300,
+            // Unused: the script runs until the analysis is done.
+            Scenario::HeapAnalyse => usize::MAX,
+        }
+    }
+
+    /// The span the zoom scenarios zoom in to.
+    fn target_span_ns(self) -> u64 {
+        match self {
+            Scenario::MemoryChart | Scenario::HeapAnalyse => MEMORY_TARGET_SPAN_NS,
+            _ => TARGET_SPAN_NS,
         }
     }
 
     /// The p99 budget of the latency samples, in ms.
     fn latency_budget_ms(self) -> Option<f64> {
         match self {
-            Scenario::LogsSearch | Scenario::NetFilter => Some(16.0),
+            Scenario::LogsSearch | Scenario::NetFilter | Scenario::HeapTree => Some(16.0),
             Scenario::ToolSwitch | Scenario::FrameDetails => Some(50.0),
             _ => None,
         }
@@ -256,6 +285,8 @@ pub struct Measured {
     pub refresh_source: &'static str,
     /// Script steps run.
     pub frames: usize,
+    /// `heap-analyse`: how long the analysis took, in ms.
+    pub analysis_ms: Option<f64>,
 }
 
 pub struct Report {
@@ -356,6 +387,9 @@ impl Measured {
                 None => json.push_str(&format!(",\"samples\":{{\"latency\":{}}}", l.len())),
             }
         }
+        if let Some(a) = self.analysis_ms {
+            json.push_str(&format!(",\"analysis_ms\":{:?}", r3(a)));
+        }
         json.push_str(&format!(
             ",\"phases_ms\":{{\"request_layout\":{},\"prepaint\":{},\"paint\":{}}}",
             pct_json(percentiles(&self.phases_ms[0])),
@@ -438,6 +472,8 @@ pub struct Script {
     /// `cpu-tree`: levels expanded so far, and the rows once expanded.
     levels: usize,
     tree_len: usize,
+    /// `heap-analyse`: the analysis thread's state.
+    analysis: Option<Arc<AnalysisProbe>>,
     /// What the scenario did, for the end-of-run check that it did what its name says.
     seen: Seen,
     outcome: Outcome,
@@ -490,6 +526,16 @@ const TREE_LEVELS: usize = 6;
 const TREE_FANOUT: usize = 4;
 /// Rows `cpu-tree` moves per step.
 const TREE_STRIDE: usize = 3;
+/// The span the memory scenarios zoom in to.
+const MEMORY_TARGET_SPAN_NS: u64 = 1_000_000_000;
+/// Levels `heap-tree` opens, and rows moved per scroll step.
+const HEAP_LEVELS: usize = 8;
+const HEAP_STRIDE: usize = 3;
+/// What `heap-tree` types into the search, one character at a time.
+const HEAP_QUERY: &str = "Leaky";
+/// Objects in the heap `heap-tree` opens, and in the one `heap-analyse` analyses.
+const HEAP_TREE_OBJECTS: u32 = 1_000_000;
+const HEAP_ANALYSE_OBJECTS: u32 = 5_000_000;
 /// The range `flame-zoom` scopes the CPU profile to.
 const FLAME_RANGE_NS: u64 = 60_000_000_000;
 
@@ -498,7 +544,9 @@ impl Script {
     /// search scenarios always type their whole query.
     pub fn new(scenario: Scenario, len: Option<usize>) -> Self {
         let len = match scenario {
-            Scenario::LogsSearch | Scenario::NetFilter => scenario.default_len(),
+            Scenario::LogsSearch | Scenario::NetFilter | Scenario::HeapAnalyse => {
+                scenario.default_len()
+            }
             _ => len.unwrap_or(scenario.default_len()),
         };
         Self {
@@ -518,12 +566,24 @@ impl Script {
             pans: 0,
             levels: 0,
             tree_len: 0,
+            analysis: None,
             seen: Seen {
                 followed: true,
                 ..Seen::default()
             },
             outcome: Outcome::default(),
         }
+    }
+
+    /// Gives `heap-analyse` the analysis it runs beside.
+    pub fn with_analysis(mut self, probe: Arc<AnalysisProbe>) -> Self {
+        self.analysis = Some(probe);
+        self
+    }
+
+    /// How long the analysis took, once it is done.
+    pub fn analysis_ms(&self) -> Option<f64> {
+        self.analysis.as_ref().and_then(|a| a.millis())
     }
 
     pub fn is_done(&self) -> bool {
@@ -565,6 +625,9 @@ impl Script {
                         self.zoom_step(shell, cx)
                     }
                     Scenario::CpuTree => self.tree_step(shell, cx),
+                    Scenario::MemoryChart => self.zoom_step(shell, cx),
+                    Scenario::HeapTree => self.heap_tree_step(shell, cx),
+                    Scenario::HeapAnalyse => self.analyse_step(shell, cx),
                 }
                 self.outcome.steps += 1;
                 if self.phase == Phase::Done && self.outcome.error.is_none() {
@@ -603,8 +666,14 @@ impl Script {
     /// Opens the Performance tab the scenario works on. The CPU mode goes first: the tab only
     /// computes once it is on screen, and then for the mode it has.
     fn prepare_tab(&mut self, shell: &Entity<MainWindow>, cx: &mut App) {
+        use crate::tools::memory::view::MemoryTab;
         use crate::tools::performance::PerfTab;
         use crate::tools::performance::cpu_tab::CpuMode;
+        if self.scenario == Scenario::HeapTree {
+            let memory = shell.read(cx).memory_view().clone();
+            memory.update(cx, |m, cx| m.set_tab(MemoryTab::Snapshot, cx));
+            return;
+        }
         let perf = shell.read(cx).performance_view().clone();
         let cpu = perf.read(cx).cpu().clone();
         let (tab, mode) = match self.scenario {
@@ -625,6 +694,10 @@ impl Script {
         match self.scenario {
             Scenario::TraceZoom => !perf.trace().read(cx).is_empty(),
             Scenario::FlameZoom | Scenario::CpuTree => perf.cpu().read(cx).is_settled(),
+            Scenario::HeapTree => {
+                let memory = shell.read(cx).memory_view().read(cx);
+                memory.snapshot().read(cx).tree_len(cx) > 0
+            }
             _ => true,
         }
     }
@@ -662,8 +735,18 @@ impl Script {
                 self.seen.bar0 = chart.read(cx).bar_px();
                 self.seen.bar_max = self.seen.bar0;
             }
-            Scenario::TimelineZoom | Scenario::TraceZoom | Scenario::FlameZoom => {
+            Scenario::TimelineZoom
+            | Scenario::TraceZoom
+            | Scenario::FlameZoom
+            | Scenario::MemoryChart => {
                 self.fit_span = Some(self.viewport(shell, cx).span_ns);
+            }
+            Scenario::HeapAnalyse => {
+                self.fit_span = Some(self.viewport(shell, cx).span_ns);
+                match &self.analysis {
+                    Some(a) => a.start(),
+                    None => self.fail("heap-analyse has no analysis to run"),
+                }
             }
             Scenario::LivePerf => {
                 self.seen.rows0 = perf.read(cx).chart().read(cx).len();
@@ -690,12 +773,16 @@ impl Script {
                     Ok(())
                 }
             }
-            Scenario::TimelineZoom | Scenario::TraceZoom | Scenario::FlameZoom => {
+            Scenario::TimelineZoom
+            | Scenario::TraceZoom
+            | Scenario::FlameZoom
+            | Scenario::MemoryChart => {
                 let fit = self.fit_span.unwrap_or(0);
+                let target = self.scenario.target_span_ns();
                 match (seen.min_span, seen.returned_span) {
-                    (Some(min), _) if min > TARGET_SPAN_NS => Err(format!(
-                        "the zoom reached only {min} ns, not {TARGET_SPAN_NS} ns"
-                    )),
+                    (Some(min), _) if min > target => {
+                        Err(format!("the zoom reached only {min} ns, not {target} ns"))
+                    }
                     (_, Some(back)) if (back as f64) < fit as f64 * RETURN_AT_LEAST => Err(
                         format!("the zoom-out came back to {back} ns of the starting {fit} ns"),
                     ),
@@ -717,6 +804,31 @@ impl Script {
                     ))
                 } else if !seen.followed || !chart.following() || !chart.at_end() {
                     Err("the chart did not follow the newest frame".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+            Scenario::HeapAnalyse => {
+                let fit = self.fit_span.unwrap_or(0);
+                let probe = self.analysis.as_ref();
+                if probe.is_some_and(|a| a.failed()) {
+                    Err("the analysis failed".to_string())
+                } else if self.analysis_ms().is_none() {
+                    Err("the script ended before the analysis did".to_string())
+                } else if seen.min_span.is_none_or(|m| m.saturating_mul(2) > fit) {
+                    Err("the chart was never zoomed in during the analysis".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+            Scenario::HeapTree => {
+                let snap = shell.read(cx).memory_view().read(cx).snapshot().read(cx);
+                if self.tree_len > 50 && seen.top_max <= 0.0 {
+                    Err("the tree was scrolled but its scroll position never moved".to_string())
+                } else if self.levels < HEAP_LEVELS {
+                    Err(format!("the tree opened only {} levels", self.levels))
+                } else if snap.match_count() == 0 {
+                    Err(format!("the search \"{HEAP_QUERY}\" matched no class"))
                 } else {
                     Ok(())
                 }
@@ -820,6 +932,13 @@ impl Script {
                 let perf = shell.read(cx).performance_view().read(cx);
                 perf.trace().read(cx).viewport()
             }
+            Scenario::MemoryChart | Scenario::HeapAnalyse => shell
+                .read(cx)
+                .memory_view()
+                .read(cx)
+                .chart()
+                .read(cx)
+                .viewport(),
             _ => {
                 let perf = shell.read(cx).performance_view().read(cx);
                 perf.cpu().read(cx).flame().read(cx).viewport()
@@ -841,6 +960,16 @@ impl Script {
                         None => t.pan_px(pan, cx),
                     })
             }
+            Scenario::MemoryChart | Scenario::HeapAnalyse => shell
+                .read(cx)
+                .memory_view()
+                .read(cx)
+                .chart()
+                .clone()
+                .update(cx, |c, cx| match zoom {
+                    Some(f) => c.zoom_about(ZOOM_X, f, cx),
+                    None => c.pan_px(pan, cx),
+                }),
             Scenario::TraceZoom => perf
                 .read(cx)
                 .trace()
@@ -868,7 +997,7 @@ impl Script {
         let span = before.span_ns;
         let fit = self.fit_span.unwrap_or(span);
         self.seen.min_span = Some(self.seen.min_span.map_or(span, |m| m.min(span)));
-        if self.zoom == ZoomPhase::In && span <= TARGET_SPAN_NS {
+        if self.zoom == ZoomPhase::In && span <= self.scenario.target_span_ns() {
             self.zoom = ZoomPhase::Out;
         }
         if self.zoom == ZoomPhase::Out && span as f64 >= fit as f64 * RETURN_TO {
@@ -899,6 +1028,58 @@ impl Script {
         self.seen.min_span = self.seen.min_span.map(|m| m.min(after.span_ns));
         self.outcome.last_position = Some(after.start_ns.min(usize::MAX as u64) as usize);
         self.next_frame();
+    }
+
+    /// Zooms and pans the chart until the analysis beside it is done.
+    fn analyse_step(&mut self, shell: &Entity<MainWindow>, cx: &mut App) {
+        self.zoom_step(shell, cx);
+        if self.analysis.as_ref().is_none_or(|a| a.finished()) {
+            self.phase = Phase::Done;
+        }
+    }
+
+    /// Opens one more level of the dominator tree per step, scrolls down it for `len` steps, then
+    /// types [`HEAP_QUERY`] a character at a time. A keystroke's result is in the model when the
+    /// call returns, so the next frame draws it and its sample is complete at once.
+    fn heap_tree_step(&mut self, shell: &Entity<MainWindow>, cx: &mut App) {
+        let tab = shell.read(cx).memory_view().read(cx).snapshot().clone();
+        if self.levels < HEAP_LEVELS {
+            self.levels += 1;
+            let depth = self.levels;
+            tab.update(cx, |t, cx| t.expand_largest_to(depth, cx));
+            return;
+        }
+        if self.frame < self.len {
+            if self.tree_len == 0 {
+                self.tree_len = tab.read(cx).tree_len(cx);
+                if self.tree_len == 0 {
+                    self.fail("the dominator tree has no rows to scroll");
+                    return;
+                }
+            }
+            let i = (self.frame * HEAP_STRIDE).min(self.tree_len - 1);
+            tab.update(cx, |t, cx| t.scroll_tree_to(i, cx));
+            self.seen.top_max = self.seen.top_max.max(tab.read(cx).tree_scroll_px(cx));
+            self.outcome.last_position = Some(i);
+            self.frame += 1;
+            return;
+        }
+        self.since_key += 1;
+        if self.since_key >= KEY_EVERY && self.outcome.keystrokes < HEAP_QUERY.len() {
+            let prefix = &HEAP_QUERY[..=self.outcome.keystrokes];
+            let at = Instant::now();
+            tab.update(cx, |t, cx| t.set_search_text(prefix, cx));
+            self.outcome.samples.push(Sample {
+                key_at: at,
+                first_seen: Instant::now(),
+                full_seen: None,
+            });
+            self.outcome.keystrokes += 1;
+            self.since_key = 0;
+        }
+        if self.outcome.keystrokes == HEAP_QUERY.len() {
+            self.phase = Phase::Done;
+        }
     }
 
     /// Opens one more level of the top-down tree per step, then scrolls down the list.
@@ -1108,7 +1289,13 @@ impl Script {
 }
 
 /// The tools `tool-switch` cycles through, starting from Logs.
-const SWITCH_CYCLE: [Tool; 4] = [Tool::Logs, Tool::Network, Tool::Performance, Tool::Timeline];
+const SWITCH_CYCLE: [Tool; 5] = [
+    Tool::Logs,
+    Tool::Network,
+    Tool::Performance,
+    Tool::Timeline,
+    Tool::Memory,
+];
 
 /// Whether `tool`'s page is showing its rows for the current filter.
 fn ready(shell: &Entity<MainWindow>, tool: Tool, cx: &App) -> bool {
@@ -1122,6 +1309,12 @@ fn ready(shell: &Entity<MainWindow>, tool: Tool, cx: &App) -> bool {
             !perf.chart().read(cx).is_empty()
         }
         Tool::Timeline => shell.read(cx).timeline_view().read(cx).is_settled(),
+        Tool::Memory => {
+            let memory = shell.read(cx).memory_view().read(cx);
+            let session = shell.read(cx).session().read(cx);
+            !memory.chart().read(cx).geometry().columns.is_empty()
+                || session.snapshot().memory.samples().is_empty()
+        }
         _ => shell.read(cx).logs_view().read(cx).is_settled(),
     }
 }
@@ -1231,6 +1424,155 @@ fn stress_status() -> ConnStatus {
     }
 }
 
+// ---- heaps ----
+
+/// Where the scenarios keep their heap files; removed before the process exits.
+fn heap_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("fdt-bench-heaps-{}", std::process::id()))
+}
+
+fn remove_heap_dir() {
+    let _ = std::fs::remove_dir_all(heap_dir());
+}
+
+/// Writes a synthetic Flutter heap of `objects` objects to a heap file.
+fn write_heap(objects: u32) -> Arc<fdt_store::heap::HeapFile> {
+    use fdt_analysis::heap::synth::flutter_heap;
+    let bytes = flutter_heap(SEED, objects, Mode::Profile);
+    std::fs::create_dir_all(heap_dir()).expect("heap directory");
+    // Tests run scenarios side by side in one process.
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let path = heap_dir().join(format!("{}.dartheap", NEXT.fetch_add(1, Ordering::Relaxed)));
+    std::fs::write(&path, &bytes).expect("heap file");
+    Arc::new(fdt_store::heap::HeapFile::new(path))
+}
+
+fn analyze_input(file: &Arc<fdt_store::heap::HeapFile>) -> fdt_analysis::heap::AnalyzeInput {
+    use fdt_analysis::heap::synth::{FLUTTER_VERSION, ROOT_PACKAGE};
+    fdt_analysis::heap::AnalyzeInput {
+        file: file.clone(),
+        flutter_version: Some(FLUTTER_VERSION.to_string()),
+        mode: Mode::Profile,
+        root_package: Some(ROOT_PACKAGE.to_string()),
+    }
+}
+
+/// Stores the record of a snapshot received five minutes into the session.
+fn receive_heap(
+    w: &mut fdt_store::SessionWriter,
+    run: RunId,
+    file: &Arc<fdt_store::heap::HeapFile>,
+) -> fdt_store::heap::HeapId {
+    let at = SessionTime(300_000_000_000);
+    let id = w.heap_requested(run, "isolates/1", at);
+    let bytes = std::fs::metadata(file.path()).map_or(0, |m| m.len());
+    w.set_heap_received(id, at, bytes, file.clone());
+    id
+}
+
+/// The stress session with a `Ready` heap of `objects` objects, analysed here (not timed).
+fn session_with_heap(objects: u32) -> Arc<fdt_store::Snapshot> {
+    let (mut w, run) = fdt_store::synth::stress_writer(SEED);
+    add_ready_heap(&mut w, run, objects);
+    w.publish()
+}
+
+/// Stores a `Ready` heap of `objects` objects in `w`.
+fn add_ready_heap(w: &mut fdt_store::SessionWriter, run: RunId, objects: u32) {
+    let file = write_heap(objects);
+    let id = receive_heap(w, run, &file);
+    let analysis =
+        fdt_analysis::heap::analyze(&analyze_input(&file), &AtomicBool::new(false), &mut |_| {})
+            .expect("the synthetic heap analyses");
+    w.set_heap_analysed(id, Arc::new(analysis.summary), Arc::new(analysis.index));
+    w.set_heap_stage(id, fdt_store::heap::HeapStage::Ready);
+}
+
+/// Shared by the thread that analyses a heap and the `heap-analyse` script.
+#[derive(Default)]
+pub struct AnalysisProbe {
+    started: AtomicBool,
+    finished: AtomicBool,
+    failed: AtomicBool,
+    micros: AtomicU64,
+}
+
+impl AnalysisProbe {
+    /// The script is measuring: the analysis may begin.
+    fn start(&self) {
+        self.started.store(true, Ordering::Release);
+    }
+
+    fn finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+
+    fn failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    /// How long the analysis took, once it is done and succeeded.
+    fn millis(&self) -> Option<f64> {
+        (self.finished() && !self.failed())
+            .then(|| self.micros.load(Ordering::Acquire) as f64 / 1e3)
+    }
+}
+
+/// Runs the analysis of `file` once the probe is started: it publishes the record's stages at
+/// most every [`LIVE_EVERY`] as the capture does, then the `Ready` record, handing each snapshot
+/// to `publish` (which says whether anyone still listens).
+fn spawn_analysis(
+    mut w: fdt_store::SessionWriter,
+    id: fdt_store::heap::HeapId,
+    file: Arc<fdt_store::heap::HeapFile>,
+    probe: Arc<AnalysisProbe>,
+    mut publish: impl FnMut(Arc<fdt_store::Snapshot>) -> bool + Send + 'static,
+) {
+    use fdt_store::heap::HeapStage;
+    std::thread::spawn(move || {
+        while !probe.started.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1)); // token-check: allow: start poll
+        }
+        let began = Instant::now();
+        let mut last = Instant::now();
+        let result =
+            fdt_analysis::heap::analyze(&analyze_input(&file), &AtomicBool::new(false), &mut |s| {
+                if last.elapsed() >= LIVE_EVERY {
+                    last = Instant::now();
+                    w.set_heap_stage(id, s);
+                    publish(w.publish());
+                }
+            });
+        probe
+            .micros
+            .store(began.elapsed().as_micros() as u64, Ordering::Release);
+        match result {
+            Ok(a) => {
+                w.set_heap_analysed(id, Arc::new(a.summary), Arc::new(a.index));
+                w.set_heap_stage(id, HeapStage::Ready);
+                publish(w.publish());
+            }
+            Err(_) => probe.failed.store(true, Ordering::Release),
+        }
+        probe.finished.store(true, Ordering::Release);
+    });
+}
+
+/// The `heap-analyse` feed: the stress session with a received (not yet analysed) heap, and a
+/// thread that analyses it once the script starts measuring.
+fn analysis_feed(objects: u32, probe: Arc<AnalysisProbe>) -> LiveFeed {
+    let (mut w, run) = fdt_store::synth::stress_writer(SEED);
+    let file = write_heap(objects);
+    let id = receive_heap(&mut w, run, &file);
+    let (status_tx, status) = tokio::sync::watch::channel(stress_status());
+    let (snaps_tx, snaps) = tokio::sync::watch::channel(w.publish());
+    spawn_analysis(w, id, file, probe, move |snap| {
+        let _keep = &status_tx;
+        snaps_tx.send(snap).is_ok()
+    });
+    LiveFeed { status, snaps }
+}
+
 // ---- the real run ----
 
 struct Driver {
@@ -1338,6 +1680,7 @@ impl Driver {
             refresh_ms,
             refresh_source,
             frames: o.steps,
+            analysis_ms: self.script.analysis_ms(),
         }
     }
 }
@@ -1369,6 +1712,7 @@ fn tick(driver: Rc<RefCell<Driver>>, window: &mut Window, cx: &mut App) {
             println!("{}", report.to_json());
             use std::io::Write as _;
             let _ = std::io::stdout().flush();
+            remove_heap_dir();
             // `cx.quit()` ends in `exit(0)` on macOS, so the verdict has to exit directly.
             std::process::exit(if report.pass { 0 } else { 1 });
         }
@@ -1385,7 +1729,10 @@ fn tick(driver: Rc<RefCell<Driver>>, window: &mut Window, cx: &mut App) {
     match scenario {
         // These work in views that notify themselves; the shell's notify below draws the frame.
         _ if scenario == Scenario::ToolSwitch
-            || matches!(scenario.home(), Tool::Performance | Tool::Timeline) => {}
+            || matches!(
+                scenario.home(),
+                Tool::Performance | Tool::Timeline | Tool::Memory
+            ) => {}
         _ if scenario.home() == Tool::Network => {
             cx.notify(shell.read(cx).network_view().entity_id())
         }
@@ -1399,6 +1746,7 @@ fn tick(driver: Rc<RefCell<Driver>>, window: &mut Window, cx: &mut App) {
 }
 
 fn fail(scenario: Scenario, error: &str) -> ! {
+    remove_heap_dir();
     println!(
         "{{\"scenario\":\"{}\",\"error\":\"{}\",\"pass\":false}}",
         scenario.name(),
@@ -1452,10 +1800,12 @@ enum Source {
 /// verdict. Never returns normally.
 pub fn run(scenario: Scenario, frames: Option<usize>) -> ExitCode {
     // Building the session is not timed (and not covered by the timeout).
-    let source = if matches!(scenario, Scenario::LiveLogs | Scenario::LivePerf) {
-        Source::Live(live_feed(scenario))
-    } else {
-        Source::Fixed(fdt_store::synth::stress_session(SEED))
+    let probe = Arc::new(AnalysisProbe::default());
+    let source = match scenario {
+        Scenario::LiveLogs | Scenario::LivePerf => Source::Live(live_feed(scenario)),
+        Scenario::HeapAnalyse => Source::Live(analysis_feed(HEAP_ANALYSE_OBJECTS, probe.clone())),
+        Scenario::HeapTree => Source::Fixed(session_with_heap(HEAP_TREE_OBJECTS)),
+        _ => Source::Fixed(fdt_store::synth::stress_session(SEED)),
     };
     std::thread::spawn(move || {
         std::thread::sleep(TIMEOUT);
@@ -1477,7 +1827,7 @@ pub fn run(scenario: Scenario, frames: Option<usize>) -> ExitCode {
                 fail(scenario, "the main window is missing");
             };
             let driver = Rc::new(RefCell::new(Driver {
-                script: Script::new(scenario, frames),
+                script: Script::new(scenario, frames).with_analysis(probe),
                 shell,
                 scenario,
                 collector: FrameTimingCollector::new(),
@@ -1569,6 +1919,9 @@ mod tests {
             "flame-zoom",
             "cpu-tree",
             "live-perf",
+            "memory-chart",
+            "heap-tree",
+            "heap-analyse",
         ] {
             assert!(names.contains(&want), "{want} is a scenario");
             assert!(USAGE.contains(want), "{want} is in the usage");
@@ -1577,6 +1930,16 @@ mod tests {
         assert_eq!(Scenario::ToolSwitch.latency_budget_ms(), Some(50.0));
         assert_eq!(Scenario::TimelineZoom.home(), Tool::Timeline);
         assert_eq!(Scenario::FlameZoom.home(), Tool::Performance);
+        assert_eq!(Scenario::ALL.len(), 17);
+        for s in [
+            Scenario::MemoryChart,
+            Scenario::HeapTree,
+            Scenario::HeapAnalyse,
+        ] {
+            assert_eq!(s.home(), Tool::Memory);
+        }
+        assert_eq!(Scenario::HeapTree.latency_budget_ms(), Some(16.0));
+        assert_eq!(Scenario::MemoryChart.latency_budget_ms(), None);
     }
 
     fn base() -> Measured {
@@ -1592,6 +1955,7 @@ mod tests {
             refresh_ms: 8.333,
             refresh_source: "display",
             frames: 100,
+            analysis_ms: None,
         }
     }
 
@@ -1764,6 +2128,7 @@ mod tests {
         w.set_refresh_rate(run, 120.0);
         let span = TimeRange::new(SessionTime(0), SessionTime(5_000_000_000));
         fdt_store::synth::cpu(&mut w, run, 3_000, 3, span);
+        fdt_store::synth::memory(&mut w, run, span, 3);
         w.publish()
     }
 
@@ -1853,6 +2218,7 @@ mod tests {
             (Scenario::TraceZoom, 200),
             (Scenario::FlameZoom, 200),
             (Scenario::CpuTree, 60),
+            (Scenario::MemoryChart, 200),
         ] {
             let (shell, vcx) = open_shell_with(cx, |_| {
                 SessionModel::fixed(perf_snapshot(), connected("stress", true))
@@ -1875,7 +2241,124 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn tool_switch_cycles_through_the_four_tools(cx: &mut TestAppContext) {
+    fn ready_knows_memory(cx: &mut TestAppContext) {
+        let (shell, vcx) = open_shell_with(cx, |_| {
+            SessionModel::fixed(perf_snapshot(), connected("stress", true))
+        });
+        assert!(
+            !vcx.update(|_, cx| ready(&shell, Tool::Memory, cx)),
+            "the chart has not been laid out before the page is shown"
+        );
+        vcx.update(|window, cx| {
+            shell.update(cx, |s, cx| {
+                s.navigate(Location::at(Page::Tool(Tool::Memory)), window, cx)
+            });
+            window.render_frame(cx);
+        });
+        vcx.run_until_parked();
+        assert!(vcx.update(|_, cx| ready(&shell, Tool::Memory, cx)));
+        // A session without memory samples has nothing to wait for.
+        let (empty, vcx) = open_shell_with(cx, |_| {
+            SessionModel::fixed(fdt_store::synth::session(1, 0, 0, 0), connected("x", true))
+        });
+        assert!(vcx.update(|_, cx| ready(&empty, Tool::Memory, cx)));
+    }
+
+    /// A small session with memory samples and a `Ready` heap.
+    fn heap_snapshot(objects: u32) -> std::sync::Arc<fdt_store::Snapshot> {
+        let (mut w, run) = fdt_store::synth::writer(3, 100, 100, 0);
+        fdt_store::synth::perf(&mut w, run, 600, 3, 120);
+        let span = TimeRange::new(SessionTime(0), SessionTime(5_000_000_000));
+        fdt_store::synth::memory(&mut w, run, span, 3);
+        add_ready_heap(&mut w, run, objects);
+        w.publish()
+    }
+
+    #[gpui_kit::test]
+    fn heap_tree_opens_levels_scrolls_and_searches(cx: &mut TestAppContext) {
+        let (shell, vcx) = open_shell_with(cx, |_| {
+            SessionModel::fixed(heap_snapshot(50_000), connected("stress", true))
+        });
+        let mut script = Script::new(Scenario::HeapTree, Some(30));
+        for _ in 0..3_000 {
+            vcx.update(|window, cx| {
+                window.render_frame(cx);
+                script.step(&shell, window, cx);
+            });
+            vcx.run_until_parked();
+            if script.is_done() {
+                break;
+            }
+        }
+        assert!(script.is_done());
+        assert_eq!(script.outcome().error, None);
+        assert_eq!(script.outcome().keystrokes, HEAP_QUERY.len());
+        assert_eq!(script.outcome().samples.len(), HEAP_QUERY.len());
+    }
+
+    #[gpui_kit::test]
+    fn heap_analyse_measures_frames_during_the_analysis(cx: &mut TestAppContext) {
+        use crate::test_support::open_shell_fake;
+        let (shell, vcx, handle) = open_shell_fake(cx);
+        let (mut w, run) = fdt_store::synth::writer(3, 100, 100, 0);
+        fdt_store::synth::perf(&mut w, run, 600, 3, 120);
+        let span = TimeRange::new(SessionTime(0), SessionTime(5_000_000_000));
+        fdt_store::synth::memory(&mut w, run, span, 3);
+        let file = write_heap(50_000);
+        let id = receive_heap(&mut w, run, &file);
+        handle.snaps.send(w.publish()).unwrap();
+        vcx.run_until_parked();
+        let probe = Arc::new(AnalysisProbe::default());
+        // The test executor's wakers must not be woken off its thread, so the snapshots cross
+        // by channel and the loop publishes them.
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_analysis(w, id, file, probe.clone(), move |snap| {
+            tx.send(snap).is_ok()
+        });
+        let mut script = Script::new(Scenario::HeapAnalyse, None).with_analysis(probe);
+        for _ in 0..3_000 {
+            while let Ok(snap) = rx.try_recv() {
+                handle.snaps.send(snap).unwrap();
+            }
+            vcx.update(|window, cx| {
+                window.render_frame(cx);
+                script.step(&shell, window, cx);
+            });
+            vcx.run_until_parked();
+            if script.is_done() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2)); // token-check: allow: let the thread run
+        }
+        assert!(script.is_done());
+        assert_eq!(script.outcome().error, None);
+        assert!(script.outcome().steps >= 1, "frames ran while it analysed");
+        assert!(script.measuring_since().is_some());
+        assert!(script.analysis_ms().is_some_and(|ms| ms > 0.0));
+        // The record the thread published is Ready.
+        let mut ready = false;
+        for _ in 0..100 {
+            while let Ok(snap) = rx.try_recv() {
+                handle.snaps.send(snap).unwrap();
+            }
+            vcx.run_until_parked();
+            ready = vcx.update(|_, cx| {
+                let snap = shell.read(cx).session().read(cx).snapshot().clone();
+                snap.memory
+                    .heaps()
+                    .iter()
+                    .any(|h| h.stage == fdt_store::heap::HeapStage::Ready)
+            });
+            if ready {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5)); // token-check: allow: let it publish
+        }
+        assert!(ready, "the analysed heap was published");
+    }
+
+    #[gpui_kit::test]
+    fn tool_switch_cycles_through_the_five_tools(cx: &mut TestAppContext) {
         let (shell, vcx) = open_shell_with(cx, |_| {
             SessionModel::fixed(perf_snapshot(), connected("stress", true))
         });
@@ -1894,7 +2377,13 @@ mod tests {
         }
         assert_eq!(script.outcome().error, None);
         assert_eq!(script.outcome().samples.len(), 8);
-        for tool in [Tool::Network, Tool::Performance, Tool::Timeline, Tool::Logs] {
+        for tool in [
+            Tool::Network,
+            Tool::Performance,
+            Tool::Timeline,
+            Tool::Memory,
+            Tool::Logs,
+        ] {
             assert!(shown.contains(&Page::Tool(tool)), "{tool:?} was visited");
         }
     }

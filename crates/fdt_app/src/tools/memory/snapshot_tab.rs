@@ -1035,6 +1035,57 @@ impl SnapshotTab {
         }
     }
 
+    // ---- bench-ui hooks ----
+
+    /// Opens the largest child that has children, `depth` levels down from the root, and
+    /// rebuilds the tree once. Levels opened by an earlier call stay open.
+    pub(crate) fn expand_largest_to(&mut self, depth: usize, cx: &mut Context<Self>) {
+        let Some(ready) = self.ready(cx) else { return };
+        let Some(ctx) = self.tree.as_mut() else {
+            return;
+        };
+        let mut node = 0u32;
+        let mut changed = false;
+        for _ in 0..depth {
+            let kids = ready.index.children(node);
+            let end = kids.end.min(kids.start + MAX_CHILDREN as u32);
+            let largest = (kids.start..end)
+                .filter(|&n| !ready.index.children(n).is_empty())
+                .max_by_key(|&n| ready.index.retained(n));
+            let Some(best) = largest else { break };
+            changed |= ctx.open.insert(best);
+            node = best;
+        }
+        if changed {
+            self.rebuild_items(cx);
+        }
+    }
+
+    /// How many rows the tree shows.
+    pub(crate) fn tree_len(&self, cx: &App) -> usize {
+        let state = self.tree_state.read(cx);
+        (0..).map_while(|ix| state.entry(ix)).count()
+    }
+
+    pub(crate) fn scroll_tree_to(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.tree_state.update(cx, |s, cx| {
+            s.scroll_to_item(ix, ScrollStrategy::Top);
+            cx.notify();
+        });
+    }
+
+    /// How far the tree's list is scrolled, in pixels (it applies a scroll when drawn).
+    pub(crate) fn tree_scroll_px(&self, cx: &App) -> f32 {
+        let handle = self.tree_state.read(cx).scroll_handle().clone();
+        let offset = handle.0.borrow().base_handle.offset();
+        -f32::from(offset.y)
+    }
+
+    /// How many classes match the search.
+    pub(crate) fn match_count(&self) -> usize {
+        self.matches.len()
+    }
+
     // ---- test hooks ----
 
     #[cfg(test)]
