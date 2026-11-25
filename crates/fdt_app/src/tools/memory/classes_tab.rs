@@ -912,7 +912,8 @@ impl ClassesTab {
             .border_b(layout::BORDER)
             .border_color(Hsla::from(t.border))
             .child(refresh)
-            .child(live);
+            .child(live)
+            .child(note("classes-live-only-note", LIVE_ONLY_NOTE.to_string()));
         if let Some(at) = self.as_of {
             bar = bar.child(note(
                 "classes-as-of",
@@ -1510,6 +1511,19 @@ mod ui_tests {
         cx.dispatch_action(crate::actions::RefreshAllocationProfile);
         cx.run_until_parked();
         assert_eq!(alloc_commands(&fake).last().unwrap(), "alloc_profile false");
+    }
+
+    #[gpui_kit::test]
+    fn the_live_only_note_is_visible_beside_the_switch(cx: &mut TestAppContext) {
+        let (_shell, cx, _fake) = connect(cx, with_profile(9_000, 10_000));
+        show_classes(cx);
+        let label = cx.update(|window, cx| {
+            window.render_frame(cx);
+            window
+                .try_find("classes-live-only-note".to_string())
+                .and_then(|e| e.label().map(str::to_string))
+        });
+        assert_eq!(label.as_deref(), Some(LIVE_ONLY_NOTE));
     }
 
     #[gpui_kit::test]
