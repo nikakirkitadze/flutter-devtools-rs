@@ -53,7 +53,11 @@ pub const MAX_INSTANCES: usize = 1_000;
 pub const MAX_FIELDS: usize = 100;
 /// A reveal that would open more levels than this only selects the object: the tree widget
 /// flattens and drops its items recursively. Measured in a debug test (a 2 MB thread): 1,000
-/// levels work and 3,000 overflow the stack, so this keeps a margin of two.
+/// levels work and 3,000 overflow the stack. A Windows main thread has 1 MB (8 MB on macOS and
+/// Linux), so the limit there is half as deep, to stay clear of a crash.
+#[cfg(windows)]
+const MAX_REVEAL_DEPTH: usize = 250;
+#[cfg(not(windows))]
 const MAX_REVEAL_DEPTH: usize = 500;
 /// The most characters of a class name a row shows.
 const MAX_NAME_CHARS: usize = 80;
@@ -2764,12 +2768,12 @@ mod tests {
     #[gpui_kit::test]
     fn a_deep_chain_reveals_in_the_real_tree(cx: &mut TestAppContext) {
         let snap = snapshot(|w, run| {
-            heap_record(w, run, chain(450));
+            heap_record(w, run, chain(MAX_REVEAL_DEPTH - 50));
         });
         let (index, summary, heap) = held(&snap);
         let node = chain_end(&index, &summary);
         let levels = ancestry(&index, node).expect("within the limit").len();
-        assert!(levels >= 450, "{levels}");
+        assert!(levels >= MAX_REVEAL_DEPTH - 50, "{levels}");
         let (shell, cx, _fake) = connect(cx, snap);
         let t = tab(&shell, cx);
         go(&shell, cx, Some(Selection::HeapNode { heap, node }));
@@ -2790,7 +2794,7 @@ mod tests {
     #[gpui_kit::test]
     fn a_reveal_past_the_limit_still_selects_and_says_so(cx: &mut TestAppContext) {
         let snap = snapshot(|w, run| {
-            heap_record(w, run, chain(MAX_REVEAL_DEPTH + 60));
+            heap_record(w, run, chain(MAX_REVEAL_DEPTH + 10));
         });
         let (index, summary, heap) = held(&snap);
         let node = chain_end(&index, &summary);
