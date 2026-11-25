@@ -544,6 +544,9 @@ pub struct SnapshotTab {
     path_scroll: UniformListScrollHandle,
     fields_scroll: UniformListScrollHandle,
     failed_open: bool,
+    /// An open was just asked for: the heap and the snapshot it was asked on. It reads as
+    /// opening until the next snapshot, which shows the stages if the capture took it.
+    opening: Option<(HeapId, usize)>,
     _subs: Vec<Subscription>,
 }
 
@@ -613,6 +616,7 @@ impl SnapshotTab {
             path_scroll: UniformListScrollHandle::new(),
             fields_scroll: UniformListScrollHandle::new(),
             failed_open: false,
+            opening: None,
             _subs: subs,
         }
     }
@@ -692,6 +696,7 @@ impl SnapshotTab {
         });
         if needs && let Some(control) = self.session.read(cx).control() {
             control.open_heap_snapshot(heap);
+            self.opening = Some((heap, Arc::as_ptr(&snap) as usize));
         }
     }
 
@@ -1913,7 +1918,14 @@ impl SnapshotTab {
             stage => {
                 let text = stage_text(stage).unwrap_or_else(|| match stage {
                     HeapStage::Cancelled => "This snapshot was cancelled.".to_string(),
-                    _ => "Opening this snapshot\u{2026}".to_string(),
+                    // Busy stages have their own text. A ready snapshot with no index is opening
+                    // only right after an open was asked for.
+                    _ if self.opening
+                        == Some((record.id, Arc::as_ptr(&self.snap(cx)) as usize)) =>
+                    {
+                        "Opening this snapshot\u{2026}".to_string()
+                    }
+                    _ => "This snapshot isn\u{2019}t open.".to_string(),
                 });
                 col = col.child(
                     div()
@@ -2621,6 +2633,38 @@ mod tests {
         assert_eq!(
             label(cx, "heap-stage").as_deref(),
             Some("Reading \u{b7} 50 %")
+        );
+    }
+
+    #[gpui_kit::test]
+    fn a_ready_snapshot_without_an_index_says_it_is_not_open_unless_an_open_is_pending(
+        cx: &mut TestAppContext,
+    ) {
+        let first = snapshot(|w, run| {
+            heap_record(w, run, fixture);
+            heap_record(w, run, fixture);
+        });
+        let (shell, cx, fake) = connect(cx, first.clone());
+        go(&shell, cx, Some(Selection::Heap(HeapId(0))));
+        for _ in 0..2 {
+            cx.update(|window, cx| window.render_frame(cx));
+        }
+        assert!(fake.commands().iter().any(|c| c == "heap_open 0"));
+        assert_eq!(
+            label(cx, "heap-stage").as_deref(),
+            Some("Opening this snapshot\u{2026}")
+        );
+        // The next snapshot shows no stage for it: the open was not taken.
+        fake.snaps.send(Arc::new((*first).clone())).unwrap();
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+        assert_eq!(
+            label(cx, "heap-stage").as_deref(),
+            Some("This snapshot isn\u{2019}t open.")
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("heap-open".to_string()).is_some()),
+            "an Open snapshot action"
         );
     }
 

@@ -1364,22 +1364,12 @@ fn a_failed_open_keeps_the_record_ready() {
         std::fs::remove_file(s.memory.heaps()[0].file.as_ref().unwrap().path()).unwrap();
         drop(s);
         cap.open_heap_snapshot(ids[0]);
-        // An open is ignored while another job runs, so the second one is held only after the
-        // first one ended.
-        let mut snaps = cap.snapshots();
-        let deadline = tokio::time::Instant::now() + LIMIT;
-        let s = loop {
-            cap.open_heap_snapshot(ids[1]);
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            let s = snaps.borrow_and_update().clone();
-            if s.memory.held() == Some(ids[1]) && s.memory.busy().is_none() {
-                break s;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the second never held"
-            );
-        };
+        // The second open is asked for while the first may still run, and waits its turn.
+        cap.open_heap_snapshot(ids[1]);
+        let s = common::wait_for(&cap, LIMIT, "the second held", |s| {
+            s.memory.held() == Some(ids[1]) && s.memory.busy().is_none()
+        })
+        .await;
         let a = &s.memory.heaps()[0];
         assert_eq!(
             a.stage,

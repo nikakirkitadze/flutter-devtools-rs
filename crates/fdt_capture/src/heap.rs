@@ -197,14 +197,13 @@ impl Session {
         }
     }
 
-    /// Analyses a `Ready` snapshot again from its file; it becomes the held one.
+    /// Analyses a `Ready` snapshot again from its file; it becomes the held one. Waits its turn
+    /// when another analysis is running.
     pub(crate) fn open_heap(&mut self, id: HeapId) {
         let Some(w) = self.writer.as_ref() else {
             return;
         };
-        if w.busy_heap().is_some() {
-            return;
-        }
+        // While another snapshot is busy the open is queued by `start_analysis`.
         let Some(rec) = w.heap_record(id) else {
             return;
         };
