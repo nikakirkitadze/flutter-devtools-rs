@@ -440,7 +440,8 @@ fn hot_restart_moves_polling_to_the_new_group() {
         })
         .await;
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let s = connected(&cap).await;
+        // Not `connected`: the growing sim keeps publishing samples, so it never settles.
+        let s = cap.snapshots().borrow().clone();
         assert_eq!(s.memory.gcs().len(), 1);
         assert_eq!(
             s.memory.gcs().get(0).unwrap().dur_us,
