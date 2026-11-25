@@ -275,7 +275,7 @@ All on an awake, unlocked R1, with `uptime` before each batch:
 
 ## Appendix: deferred minors from the ledger, by area
 
-Summarised from the SDD ledger (the full list is in `.superpowers/sdd/2026-11-21-m4-memory/progress.md`). None blocks the milestone; each is a small fix or a comment.
+Summarised from the execution ledger, which was a local working file and is not kept in the repository. Items the final review fixed are listed under "Final-review fixes". None blocks the milestone; each is a small fix or a comment.
 
 - **Heap format and parser** (Tasks 3, 4): a hostile header with length 0 skips a count bound and could abort on a large allocation; `refs.len()` is never checked against the declared reference count; `Graph.classes` has a `[0]` sentinel and `FullSnapshot.classes` does not; the object count is not bounded in `read_object`; the fixture's UTF-16 masker leaves one odd trailing byte unmasked at a buffer end; the recorder writes the fixture with default permissions.
 - **Analysis and index** (Tasks 5 to 9): `HeapIndex::path` keeps the 200 hops nearest the node, so a leading ellipsis is needed when `path[0] != 0`; `HeapFile::new` is public and unchecked (one owner per path); the tracked-hash vector (12 B per tracked object) is alive through the dominator peak and unbounded for hash-heavy apps; `object_details` is a linear pass (0.1 to 0.2 s at 5M) with no cancel; the leak scan opens the snapshot file once per finding; `labelled_path` opens it per sample; `HeapIndex::idom` returns `n-1` silently for an out-of-range node; hash-0 objects never count as new in the diff (dormant, H12); the replicated peak has 3 B of headroom.
@@ -286,7 +286,7 @@ Summarised from the SDD ledger (the full list is in `.superpowers/sdd/2026-11-21
 
 ## Appendices: raw runs
 
-The raw files are under `.superpowers/sdd/2026-11-21-m4-memory/task19-raw/`. Excerpts follow.
+The raw files lived in the run's local working folder and are not kept in the repository. The excerpts below are the record.
 
 
 ### A. Release budget tests (Step 1)
