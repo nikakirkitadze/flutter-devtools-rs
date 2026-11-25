@@ -21,7 +21,9 @@ use fdt_analysis::rebuilds::frame_rebuilds;
 use fdt_capture::{Capture, CaptureConfig, CaptureRuntime, ConnStatus, Target};
 use fdt_store::Snapshot;
 use fdt_store::frames::{FrameStatus, frame_status};
+use fdt_store::heap::{Edge, HeapStage, LeakKind};
 use fdt_store::logs::{LogLevel, LogSource};
+use fdt_store::memory::{GcKind, GcReason};
 use fdt_store::net::{BodyState, StatusClass};
 use fdt_vm::discovery::{DiscoveredApp, Discovery, DiscoveryConfig};
 use fdt_vm::events::{StreamEvent, decode_notification};
@@ -433,9 +435,14 @@ async fn run(rt: &CaptureRuntime, vm_uri: &str) {
     let mut iso = main_isolate(&vm).await;
     vm.stream_listen("Service").await.ok();
 
-    let cap = Capture::start(rt.handle(), CaptureConfig::default(), None);
+    let heap_dir = tempfile::tempdir().expect("heap dir");
+    let cfg = CaptureConfig {
+        heap_dir: Some(heap_dir.path().to_path_buf()),
+        ..CaptureConfig::default()
+    };
+    let cap = Capture::start(rt.handle(), cfg, None);
     let t0 = Instant::now();
-    cap.connect(Target::Discovered(app));
+    cap.connect(Target::Discovered(app.clone()));
     let mut status = cap.status();
     tokio::time::timeout(
         Duration::from_secs(20),
@@ -450,6 +457,11 @@ async fn run(rt: &CaptureRuntime, vm_uri: &str) {
         _ => unreachable!(),
     };
     println!("attach_ms={attach_ms} debug={is_debug}");
+
+    // Memory first: it needs no drawn frames (`pump_frames`), and the later steps leave the
+    // app on screens that hold their own state.
+    memory_checks(&cap, &vm, &iso, is_debug, heap_dir.path(), &app).await;
+    // The cleanup disconnected; the rest of the test runs on a new connection.
 
     // Logs. `emit_levels` is called as soon as the status is Connected, so the first live
     // record also gives `attach_to_data_ms`.
@@ -679,4 +691,240 @@ fn dump_tree(snap: &Snapshot, seq: usize) {
         head.dedup();
         println!("TREE d{d} n={} {head:?}", names.len());
     }
+}
+
+/// Waits until the snapshot after the first `before` records is `Ready`; returns its index.
+async fn next_heap(cap: &Capture, before: usize) -> (usize, std::sync::Arc<Snapshot>) {
+    let t = Instant::now();
+    cap.take_heap_snapshot();
+    let snap = common::wait_for(cap, Duration::from_secs(120), "heap snapshot", |s| {
+        let h = s.memory.heaps();
+        if let Some(HeapStage::Failed { message, details }) = h.get(before).map(|r| &r.stage) {
+            panic!("snapshot failed: {message}: {details}");
+        }
+        h.get(before).is_some_and(|r| r.stage == HeapStage::Ready)
+    })
+    .await;
+    let r = &snap.memory.heaps()[before];
+    println!(
+        "heap[{before}]: wait_ms={} bytes={} received_ms={:?} objects={} reachable={}",
+        t.elapsed().as_millis(),
+        r.bytes,
+        r.time
+            .map(|t| t.0.saturating_sub(r.requested.0) / 1_000_000),
+        r.summary.as_ref().map_or(0, |s| s.objects),
+        r.summary.as_ref().map_or(0, |s| s.reachable),
+    );
+    (before, snap)
+}
+
+async fn memory_checks(
+    cap: &Capture,
+    vm: &VmService,
+    iso: &str,
+    is_debug: bool,
+    heap_dir: &std::path::Path,
+    app: &DiscoveredApp,
+) {
+    // 1. Samples: at least 3 within 2 s, with the process's RSS.
+    let from = cap.snapshots().borrow().memory.samples().len();
+    let s = common::wait_for(cap, Duration::from_secs(2), "3 memory samples", |s| {
+        s.memory.samples().len() >= from + 3
+    })
+    .await;
+    let last = s
+        .memory
+        .samples()
+        .get(s.memory.samples().len() - 1)
+        .unwrap();
+    assert!(last.rss.is_some(), "samples carry rss");
+    assert!(last.heap_used > 0);
+    println!(
+        "memory: samples ok heap_used={} rss={:?}",
+        last.heap_used, last.rss
+    );
+
+    // 2. A GC from a live-only allocation profile.
+    let gcs = cap.snapshots().borrow().memory.gcs().len();
+    let profiles = cap.snapshots().borrow().memory.profiles().len();
+    cap.fetch_allocation_profile(true);
+    let s = common::wait_for(cap, WAIT, "gc and profile", |s| {
+        s.memory.profiles().len() > profiles
+            && (gcs..s.memory.gcs().len()).any(|i| {
+                let g = s.memory.gcs().get(i).unwrap();
+                g.kind == GcKind::MarkSweep && g.reason == GcReason::Debugging
+            })
+    })
+    .await;
+    assert!(s.memory.profiles()[profiles].gc, "profile fetched with gc");
+    println!("memory: gc ok");
+
+    // 3. Baseline on home.
+    let (b0, s0) = next_heap(cap, 0).await;
+    let rec = &s0.memory.heaps()[b0];
+    let sum = rec.summary.as_ref().expect("summary");
+    assert!(sum.findings.is_empty(), "home has no leaks");
+    drop(s0);
+
+    // 4. Go to /leaks and back.
+    act(vm, iso, "goto_leaks").await;
+    act(vm, iso, "pump_frames").await;
+    sleep(Duration::from_secs(1)).await;
+    act(vm, iso, "home").await;
+    act(vm, iso, "pump_frames").await;
+    sleep(Duration::from_secs(1)).await;
+
+    // 5. Second snapshot.
+    let (b1, ready) = next_heap(cap, 1).await;
+    let sum = ready.memory.heaps()[b1].summary.clone().expect("summary");
+    drop(ready);
+    println!(
+        "heap[{b1}]: analysis checks={:?} findings={} http={:?}",
+        sum.checks,
+        sum.findings.len(),
+        sum.http
+    );
+    let name = |c: u32| &*sum.classes[c as usize].name;
+
+    // 6. Level 1.
+    let states: Vec<_> = sum
+        .findings
+        .iter()
+        .filter(|f| f.kind == LeakKind::UnmountedState && name(f.class) == "_LeakyScreenState")
+        .collect();
+    assert_eq!(states.len(), 1, "one unmounted _LeakyScreenState");
+    let f = states[0];
+    let text = fdt_analysis::heap::leaks::path_text(&sum, &f.path);
+    println!("path (state): {text}");
+    assert!(
+        matches!(f.path[0].edge, Edge::RootSlice(ref n) if &**n == "isolate"),
+        "{text}"
+    );
+    assert_eq!(f.path[1].edge, Edge::Static("instance".into()), "{text}");
+    let classes: Vec<&str> = f.path.iter().map(|h| name(h.class)).collect();
+    assert!(
+        classes.ends_with(&[
+            "AppEvents",
+            "_List",
+            "_Closure",
+            "Context",
+            "_LeakyScreenState"
+        ]),
+        "{text}"
+    );
+    let culprit = &f.path[usize::from(f.culprit.expect("culprit"))];
+    assert_eq!(name(culprit.class), "AppEvents", "{text}");
+    assert_eq!(culprit.edge, Edge::Field("_listeners".into()), "{text}");
+    assert!(
+        f.keeps
+            .iter()
+            .any(|(c, _)| name(*c) == "TextEditingController"),
+        "keeps a TextEditingController: {:?}",
+        f.keeps.iter().map(|(c, _)| name(*c)).collect::<Vec<_>>()
+    );
+    if is_debug {
+        let d = sum
+            .findings
+            .iter()
+            .find(|f| f.kind == LeakKind::DisposedNotifier && name(f.class) == "ScrollController")
+            .expect("a disposed ScrollController in debug");
+        let text = fdt_analysis::heap::leaks::path_text(&sum, &d.path);
+        println!("path (notifier): {text}");
+        let i = d
+            .path
+            .iter()
+            .position(|h| h.edge == Edge::Static("controllers".into()));
+        let i = i.unwrap_or_else(|| panic!("through static controllers: {text}"));
+        assert_eq!(name(d.path[i + 1].class), "_GrowableList", "{text}");
+    }
+
+    // 7. Level 2: the diff against snapshot 1.
+    // The diff is computed after the snapshot is Ready.
+    let t = Instant::now();
+    let s1 = common::wait_for(cap, WAIT, "diff", |s| s.memory.heaps()[b1].diff.is_some()).await;
+    println!("diff_ms={}", t.elapsed().as_millis());
+    let rec = &s1.memory.heaps()[b1];
+    let diff = rec.diff.as_ref().expect("diff");
+    assert_eq!(diff.baseline, s1.memory.heaps()[0].id);
+    assert!(diff.comparable.is_ok(), "{:?}", diff.comparable);
+    let grown = |list: &[fdt_store::heap::Growth], n: &str| {
+        list.iter().find(|g| name(g.class) == n).cloned()
+    };
+    let user = grown(&diff.user, "_LeakyScreenState").expect("user growth _LeakyScreenState");
+    assert_eq!(user.new_objects, 1);
+    let sc = grown(&diff.lifecycle, "ScrollController").expect("lifecycle ScrollController");
+    assert_eq!(sc.new_objects, 1);
+    let p = &sc.samples[0].2;
+    let text = fdt_analysis::heap::leaks::path_text(&sum, p);
+    println!("path (diff ScrollController): {text}");
+    assert!(
+        p.iter()
+            .any(|h| h.edge == Edge::Static("controllers".into())),
+        "{text}"
+    );
+    let tc =
+        grown(&diff.lifecycle, "TextEditingController").expect("lifecycle TextEditingController");
+    assert_eq!(tc.new_objects, 1);
+    let p = &tc.samples[0].2;
+    let text = fdt_analysis::heap::leaks::path_text(&sum, p);
+    println!("path (diff TextEditingController): {text}");
+    let n = p.len();
+    assert_eq!(name(p[n - 2].class), "_LeakyScreenState", "{text}");
+    assert_eq!(p[n - 2].edge, Edge::Field("_text".into()), "{text}");
+    drop((s1, s));
+
+    // 8. HTTP held by the recording.
+    act(vm, iso, "goto_network").await;
+    act(vm, iso, "pump_frames").await;
+    let reqs = cap.snapshots().borrow().net.len();
+    act(vm, iso, "load_products").await;
+    common::wait_for(cap, WAIT, "products request", |s| s.net.len() > reqs).await;
+    let (b2, s2) = next_heap(cap, 2).await;
+    let http = s2.memory.heaps()[b2]
+        .summary
+        .as_ref()
+        .and_then(|s| s.http)
+        .expect("http held reported");
+    println!("http held: {http:?}");
+    assert!(http.requests >= 1 && http.bytes > 0, "{http:?}");
+    drop(s2);
+
+    // Leave the app where the later checks expect it.
+    act(vm, iso, "pop").await;
+    act(vm, iso, "pump_frames").await;
+    sleep(Duration::from_millis(500)).await;
+
+    // 9. Cleanup: disconnecting as the user would empties the heap directory.
+    cap.disconnect();
+    let mut status = cap.status();
+    tokio::time::timeout(
+        WAIT,
+        status.wait_for(|s| !matches!(s, ConnStatus::Connected { .. })),
+    )
+    .await
+    .expect("disconnect")
+    .unwrap();
+    // Snapshots stay in the session until the user clears it (Session > New), which deletes
+    // their files.
+    assert!(
+        std::fs::read_dir(heap_dir).is_ok_and(|d| d.count() >= 1),
+        "snapshot files exist while the session holds them"
+    );
+    cap.new_session();
+    common::eventually(WAIT, "heap directory empty", || {
+        std::fs::read_dir(heap_dir).is_ok_and(|mut d| d.next().is_none())
+    })
+    .await;
+    println!("memory: cleanup ok");
+
+    // The rest of the test needs a connection.
+    cap.connect(Target::Discovered(app.clone()));
+    let mut status = cap.status();
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        status.wait_for(|s| matches!(s, ConnStatus::Connected { .. })),
+    )
+    .await
+    .expect("reconnect")
+    .unwrap();
 }
