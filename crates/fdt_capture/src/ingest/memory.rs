@@ -348,6 +348,9 @@ async fn cancel_stream(svc: &VmService) {
     let _ = tokio::time::timeout(CANCEL_WAIT, svc.stream_cancel(STREAM)).await;
 }
 
+/// Makes names unique across every `Capture` in the process (each window has its own).
+static FILE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 async fn create(dir: &Path, session: u32, id: HeapId) -> std::io::Result<Dest> {
     let mut dirs = tokio::fs::DirBuilder::new();
     dirs.recursive(true);
@@ -355,12 +358,13 @@ async fn create(dir: &Path, session: u32, id: HeapId) -> std::io::Result<Dest> {
     dirs.mode(0o700);
     dirs.create(dir).await?;
     let path = dir.join(format!(
-        "{}-{session}-{}.dartheap",
+        "{}-{}-{session}-{}.dartheap",
         std::process::id(),
+        FILE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         id.0
     ));
     let mut open = tokio::fs::OpenOptions::new();
-    open.write(true).create(true).truncate(true);
+    open.write(true).create_new(true);
     #[cfg(unix)]
     open.mode(0o600);
     let file = open.open(&path).await?;

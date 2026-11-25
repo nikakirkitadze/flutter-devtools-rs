@@ -47,7 +47,7 @@ pub struct CaptureConfig {
     pub heap_request_timeout: Duration,
     /// A heap snapshot gives up when no chunk arrives for this long.
     pub heap_chunk_timeout: Duration,
-    /// Where heap snapshots are written; `None` is a folder in the system's temp directory.
+    /// Where heap snapshots are written; `None` is `fdt/heap` in the user's cache directory, else the system's temp directory.
     pub heap_dir: Option<std::path::PathBuf>,
 }
 

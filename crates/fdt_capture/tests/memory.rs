@@ -616,10 +616,13 @@ fn chunks_become_a_ready_record_with_findings() {
         assert_eq!(path.parent(), Some(dir.path()));
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        assert_eq!(
-            name,
-            format!("{}-{}-{}.dartheap", std::process::id(), 0, h.id.0)
-        );
+        // `<pid>-<seq>-<session>-<id>`; the sequence is process-wide, so only its shape is fixed.
+        let parts: Vec<&str> = name.strip_suffix(".dartheap").unwrap().split('-').collect();
+        assert_eq!(parts.len(), 4, "{name}");
+        assert_eq!(parts[0], std::process::id().to_string());
+        assert!(parts[1].parse::<u64>().is_ok(), "{name}");
+        assert_eq!(parts[2], "0");
+        assert_eq!(parts[3], h.id.0.to_string());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1073,6 +1076,43 @@ fn remove_held_clears_it() {
         drop(s);
         common::eventually(LIMIT, "the file to go", || files(dir.path()).is_empty()).await;
         drop(cap);
+    });
+}
+
+#[test]
+fn two_captures_write_distinct_files_and_removing_one_keeps_the_other() {
+    let rt = CaptureRuntime::new().unwrap();
+    rt.handle().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let (server_a, server_b) = (
+            Sim::new(false, false).server(),
+            Sim::new(false, false).server(),
+        );
+        script(&server_a, &heap_bytes(1));
+        script(&server_b, &heap_bytes(1));
+        let a = start(&server_a, heap_config(dir.path()), &rt);
+        let b = start(&server_b, heap_config(dir.path()), &rt);
+        connected(&a).await;
+        connected(&b).await;
+        a.take_heap_snapshot();
+        b.take_heap_snapshot();
+        let sa = heap_is(&a, "a's snapshot", |h| ready(h) && h.index.is_some()).await;
+        let sb = heap_is(&b, "b's snapshot", |h| ready(h) && h.index.is_some()).await;
+        let (ha, hb) = (&sa.memory.heaps()[0], &sb.memory.heaps()[0]);
+        let (pa, pb) = (
+            ha.file.as_ref().unwrap().path().to_path_buf(),
+            hb.file.as_ref().unwrap().path().to_path_buf(),
+        );
+        assert_ne!(pa, pb, "each capture has its own file");
+        let id = ha.id;
+        drop(sa);
+        a.remove_heap_snapshot(id);
+        common::eventually(LIMIT, "a's file to go", || !pa.exists()).await;
+        assert!(pb.exists(), "the other capture's file stays");
+        assert_eq!(std::fs::read(&pb).unwrap(), heap_bytes(1));
+        drop(sb);
+        drop(a);
+        drop(b);
     });
 }
 

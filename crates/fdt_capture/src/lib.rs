@@ -15,5 +15,6 @@ mod status;
 
 pub use capture::{Capture, Target};
 pub use config::CaptureConfig;
+pub use heap::remove_own_heap_files;
 pub use runtime::CaptureRuntime;
 pub use status::ConnStatus;

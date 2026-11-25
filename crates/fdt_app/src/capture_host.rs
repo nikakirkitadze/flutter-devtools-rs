@@ -194,6 +194,7 @@ impl CaptureHost {
             if let Some(host) = cx.try_global::<CaptureHost>() {
                 host.shutdown_devices();
             }
+            fdt_capture::remove_own_heap_files(&CaptureConfig::default());
             std::future::ready(())
         })
         .detach();
@@ -289,6 +290,7 @@ impl CaptureHost {
                 if let Some(w) = slot.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
                     w.shutdown();
                 }
+                fdt_capture::remove_own_heap_files(&CaptureConfig::default());
                 std::process::exit(code);
             })
             .await;

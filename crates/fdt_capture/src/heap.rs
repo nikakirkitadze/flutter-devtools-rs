@@ -101,7 +101,7 @@ pub(crate) fn heap_dir(cfg: &CaptureConfig) -> PathBuf {
 }
 
 /// Deletes snapshot files that a process which is no longer running left behind. Files are named
-/// `<pid>-<session>-<id>.dartheap`; anything else in the folder is left alone.
+/// `<pid>-<seq>-<session>-<id>.dartheap`; anything else in the folder is left alone.
 pub(crate) fn remove_stale_files(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -119,6 +119,30 @@ pub(crate) fn remove_stale_files(dir: &Path) {
         }
         if let Err(e) = std::fs::remove_file(entry.path()) {
             log::debug!("could not delete a stale heap file: {:?}", e.kind());
+        }
+    }
+}
+
+/// Deletes this process's own snapshot files (`<own pid>-…dartheap`) from the heap folder, now.
+/// Quitting does not run any drops, so the app calls this on quit and before a signal exit.
+pub fn remove_own_heap_files(cfg: &CaptureConfig) {
+    remove_files_of(&heap_dir(cfg), std::process::id());
+}
+
+pub(crate) fn remove_files_of(dir: &Path, pid: u32) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".dartheap")) else {
+            continue;
+        };
+        if stem.split('-').next().and_then(|p| p.parse::<u32>().ok()) != Some(pid) {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(entry.path()) {
+            log::debug!("could not delete a heap file: {:?}", e.kind());
         }
     }
 }
@@ -556,5 +580,42 @@ fn run_job(
             id,
             details: e.to_string(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn own_files_are_deleted_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        let other = pid.wrapping_add(1);
+        let names = [
+            format!("{pid}-0-0-1.dartheap"),
+            format!("{pid}-3-2-7.dartheap"),
+            format!("{other}-0-0-1.dartheap"),
+            format!("{pid}-0-0-1.txt"),
+            "notes.dartheap".to_string(),
+        ];
+        for n in &names {
+            std::fs::write(dir.path().join(n), b"x").unwrap();
+        }
+        remove_files_of(dir.path(), pid);
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        let mut want = vec![names[2].clone(), names[3].clone(), names[4].clone()];
+        want.sort();
+        assert_eq!(left, want);
+    }
+
+    #[test]
+    fn missing_folder_is_fine() {
+        remove_files_of(Path::new("/nonexistent/fdt-test-dir"), 1);
     }
 }
