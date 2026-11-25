@@ -52,8 +52,9 @@ pub const MAX_INSTANCES: usize = 1_000;
 /// The most fields the details list.
 pub const MAX_FIELDS: usize = 100;
 /// A reveal that would open more levels than this only selects the object: the tree widget
-/// flattens and drops its items recursively.
-const MAX_REVEAL_DEPTH: usize = 400;
+/// flattens and drops its items recursively. Measured in a debug test (a 2 MB thread): 1,000
+/// levels work and 3,000 overflow the stack, so this keeps a margin of two.
+const MAX_REVEAL_DEPTH: usize = 500;
 /// The most characters of a class name a row shows.
 const MAX_NAME_CHARS: usize = 80;
 /// The rows of the search results shown without scrolling.
@@ -69,6 +70,7 @@ pub fn empty_body() -> String {
         crate::keymap::platform("\u{2318}\u{21e7}S", "Ctrl+Shift+S")
     )
 }
+pub const TOO_DEEP: &str = "This object is too deep in the tree to show here. Its details and retaining path are on the right.";
 pub const NO_MATCH: &str = "No classes match your search.";
 pub const DISCONNECTED_TIP: &str = "Connect to an app to open an older snapshot.";
 
@@ -174,9 +176,101 @@ fn item_node(id: &str) -> Option<u32> {
     id.parse().ok()
 }
 
-/// The items for the children of `parent`: the first [`MAX_CHILDREN`], the pinned ones past them,
-/// and a "{n} more" row for the rest. Children of the nodes in `open` are built too; the others
-/// get one placeholder, so they can be opened.
+/// One built level of the tree: the children of a node as plain data.
+#[derive(Debug)]
+pub struct Level {
+    /// Node, label and whether it has children, for the first [`MAX_CHILDREN`] and the pinned
+    /// ones past them.
+    nodes: Vec<(u32, String, bool)>,
+    /// How many children are not listed.
+    more: usize,
+}
+
+/// The built levels of the nodes opened so far, under one view key.
+pub type Levels = std::collections::HashMap<u32, Arc<Level>>;
+
+/// Builds the level of `parent`'s children. Reads at most [`MAX_CHILDREN`] plus the pinned ones.
+pub fn build_level(
+    index: &HeapIndex,
+    summary: &HeapSummary,
+    parent: u32,
+    pinned: &HashSet<u32>,
+) -> Level {
+    let kids = index.children(parent);
+    let len = (kids.end - kids.start) as usize;
+    let first_end = kids.start + len.min(MAX_CHILDREN) as u32;
+    let mut ids: Vec<u32> = (kids.start..first_end).collect();
+    let mut extra: Vec<u32> = pinned
+        .iter()
+        .copied()
+        .filter(|n| (first_end..kids.end).contains(n))
+        .collect();
+    extra.sort_unstable();
+    ids.extend(extra);
+    let nodes: Vec<(u32, String, bool)> = ids
+        .iter()
+        .map(|&n| {
+            (
+                n,
+                elide(&node_name(index, summary, n)),
+                !index.children(n).is_empty(),
+            )
+        })
+        .collect();
+    Level {
+        more: len - nodes.len(),
+        nodes,
+    }
+}
+
+/// The items for the children of `parent`. Levels come from `levels`, and are built into it when
+/// missing (`built` counts the nodes built). Children of the nodes in `open` are included; the
+/// others get one placeholder, so they can be opened.
+pub fn assemble_items(
+    index: &HeapIndex,
+    summary: &HeapSummary,
+    parent: u32,
+    open: &HashSet<u32>,
+    pinned: &HashSet<u32>,
+    levels: &mut Levels,
+    built: &mut usize,
+) -> Vec<TreeItem> {
+    let level = match levels.get(&parent) {
+        Some(l) => l.clone(),
+        None => {
+            let l = Arc::new(build_level(index, summary, parent, pinned));
+            *built += l.nodes.len();
+            levels.insert(parent, l.clone());
+            l
+        }
+    };
+    let mut items = Vec::with_capacity(level.nodes.len() + 1);
+    for (n, label, has_children) in &level.nodes {
+        let mut item = TreeItem::new(node_id(*n), label.clone());
+        if *has_children {
+            if open.contains(n) {
+                item = item.expanded(true).children(assemble_items(
+                    index, summary, *n, open, pinned, levels, built,
+                ));
+            } else {
+                item = item.child(TreeItem::new(format!("\u{2026}{n}"), "").disabled(true));
+            }
+        }
+        items.push(item);
+    }
+    if level.more > 0 {
+        items.push(
+            TreeItem::new(
+                format!("more{parent}"),
+                format!("{} more", group_digits(level.more as u64)),
+            )
+            .disabled(true),
+        );
+    }
+    items
+}
+
+/// The items for the children of `parent`, built from scratch.
 pub fn level_items(
     index: &HeapIndex,
     summary: &HeapSummary,
@@ -184,42 +278,15 @@ pub fn level_items(
     open: &HashSet<u32>,
     pinned: &HashSet<u32>,
 ) -> Vec<TreeItem> {
-    let kids = index.children(parent);
-    let len = (kids.end - kids.start) as usize;
-    let first_end = kids.start + len.min(MAX_CHILDREN) as u32;
-    let mut nodes: Vec<u32> = (kids.start..first_end).collect();
-    let mut extra: Vec<u32> = pinned
-        .iter()
-        .copied()
-        .filter(|n| (first_end..kids.end).contains(n))
-        .collect();
-    extra.sort_unstable();
-    nodes.extend(extra);
-    let mut items = Vec::with_capacity(nodes.len() + 1);
-    for &n in &nodes {
-        let mut item = TreeItem::new(node_id(n), elide(&node_name(index, summary, n)));
-        if !index.children(n).is_empty() {
-            if open.contains(&n) {
-                item = item
-                    .expanded(true)
-                    .children(level_items(index, summary, n, open, pinned));
-            } else {
-                item = item.child(TreeItem::new(format!("\u{2026}{n}"), "").disabled(true));
-            }
-        }
-        items.push(item);
-    }
-    let more = len - nodes.len();
-    if more > 0 {
-        items.push(
-            TreeItem::new(
-                format!("more{parent}"),
-                format!("{} more", group_digits(more as u64)),
-            )
-            .disabled(true),
-        );
-    }
-    items
+    assemble_items(
+        index,
+        summary,
+        parent,
+        open,
+        pinned,
+        &mut Levels::new(),
+        &mut 0,
+    )
 }
 
 /// The classes whose name or library contains `query` (lowercase), the biggest first, at most
@@ -419,6 +486,10 @@ struct TreeCtx {
     key: ViewKey,
     open: HashSet<u32>,
     pinned: HashSet<u32>,
+    /// The levels built for this view, kept so an expand builds only the new one.
+    levels: Levels,
+    /// How many nodes were built into `levels`.
+    built: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -446,6 +517,8 @@ pub struct SnapshotTab {
     tree: Option<TreeCtx>,
     /// The selection whose reveal in the tree is done.
     revealed: Option<(ViewKey, u32)>,
+    /// The revealed object is deeper than the tree can show.
+    too_deep: bool,
     input: Entity<InputState>,
     /// The search, lowercase and trimmed.
     query: String,
@@ -516,6 +589,7 @@ impl SnapshotTab {
             tree_state,
             tree: None,
             revealed: None,
+            too_deep: false,
             input,
             query: String::new(),
             fill_input: None,
@@ -552,6 +626,7 @@ impl SnapshotTab {
         self.selection = None;
         self.range = None;
         self.tree = None;
+        self.too_deep = false;
         self.revealed = None;
         self.clear_search_results();
         self.query.clear();
@@ -671,16 +746,21 @@ impl SnapshotTab {
                     key: r.key,
                     open: HashSet::new(),
                     pinned: HashSet::new(),
+                    levels: Levels::new(),
+                    built: 0,
                 });
                 self.revealed = None;
+                self.too_deep = false;
                 self.keys = None;
                 self.clear_details();
+                self.clear_search_results();
                 self.rebuild_items(cx);
                 let q = self.query.clone();
                 self.set_query(q, cx);
             }
             (None, Some(_)) => {
                 self.tree = None;
+                self.too_deep = false;
                 self.revealed = None;
                 self.keys = None;
                 self.matches.clear();
@@ -702,10 +782,18 @@ impl SnapshotTab {
     }
 
     fn rebuild_items(&mut self, cx: &mut Context<Self>) {
-        let (Some(ready), Some(ctx)) = (self.ready(cx), self.tree.as_ref()) else {
+        let (Some(ready), Some(ctx)) = (self.ready(cx), self.tree.as_mut()) else {
             return;
         };
-        let items = level_items(&ready.index, &ready.summary, 0, &ctx.open, &ctx.pinned);
+        let items = assemble_items(
+            &ready.index,
+            &ready.summary,
+            0,
+            &ctx.open,
+            &ctx.pinned,
+            &mut ctx.levels,
+            &mut ctx.built,
+        );
         self.tree_state.update(cx, |state, cx| {
             let selected = state.selected_item().map(|i| i.id.clone());
             state.set_items(items, cx);
@@ -723,8 +811,12 @@ impl SnapshotTab {
             return;
         }
         let Some(chain) = ancestry(&ready.index, node) else {
+            // Too deep for the tree widget: the details and the path still show.
+            self.too_deep = true;
+            cx.notify();
             return;
         };
+        self.too_deep = false;
         let Some(ctx) = self.tree.as_mut() else {
             return;
         };
@@ -732,6 +824,11 @@ impl SnapshotTab {
             ctx.pinned.insert(n);
             if i + 1 < chain.len() {
                 ctx.open.insert(n);
+            }
+            // A child past its parent's first level changes that level's pinned rows.
+            let parent = ready.index.idom(n);
+            if n >= ready.index.children(parent).start + MAX_CHILDREN as u32 {
+                ctx.levels.remove(&parent);
             }
         }
         self.rebuild_items(cx);
@@ -756,6 +853,7 @@ impl SnapshotTab {
         }
         self.selection = Some(sel);
         self.revealed = Some((ready.key, node));
+        self.too_deep = false;
         self.sync_details(cx);
         self.emit(Some(sel), true, cx);
         cx.notify();
@@ -1194,7 +1292,8 @@ impl SnapshotTab {
                         .text_size(font::BODY)
                         .child(title),
                 );
-            let Some((_, nodes)) = &self.instances else {
+            let Some((_, nodes)) = self.instances.as_ref().filter(|(k, _)| k.view == ready.key)
+            else {
                 let mut body = shell("heap-instances", RESULT_ROWS).child(header);
                 if self.scan_started.is_some() {
                     body = body.child(
@@ -1219,8 +1318,8 @@ impl SnapshotTab {
                         return Vec::new();
                     };
                     let nodes = match &this.instances {
-                        Some((_, n)) => n.clone(),
-                        None => return Vec::new(),
+                        Some((k, n)) if k.view == ready.key => n.clone(),
+                        _ => return Vec::new(),
                     };
                     let t = *cx.tokens();
                     let end = range.end.min(nodes.len());
@@ -1442,6 +1541,18 @@ impl SnapshotTab {
                     .child(header("Retained %", table::COL_PERCENT))
                     .child(header("Shallow", table::COL_BYTES)),
             )
+            .children(self.too_deep.then(|| {
+                div()
+                    .id("heap-too-deep")
+                    .test_support()
+                    .aria_label(TOO_DEEP)
+                    .flex_none()
+                    .px(space::S16)
+                    .py(space::S8)
+                    .text_size(font::BODY)
+                    .text_color(Hsla::from(t.text_muted))
+                    .child(TOO_DEEP)
+            }))
             .child(
                 div()
                     .id("heap-tree")
@@ -2593,5 +2704,166 @@ mod tests {
         assert_eq!(t.read_with(cx, |t, _| t.selection()), None);
         assert!(rows(&t, cx).is_empty());
         assert!(exists(cx, "memory-snapshot-empty"));
+    }
+
+    #[gpui_kit::test]
+    fn search_follows_the_shown_snapshot(cx: &mut TestAppContext) {
+        let (mut w, run) = crate::test_support::writer();
+        heap_record(&mut w, run, fixture);
+        let s1 = w.publish();
+        heap_record(&mut w, run, fixture);
+        let s2 = w.publish();
+        heap_record(&mut w, run, fixture);
+        let s3 = w.publish();
+        let (_, summary, _) = held(&s1);
+        let item = class_ix(&summary, "Item");
+        let (shell, cx, fake) = connect(cx, s1);
+        let t = tab(&shell, cx);
+        t.update(cx, |t, cx| t.set_search_text("item", cx));
+        click(cx, "heap-class-0");
+        assert!(t.read_with(cx, |t, _| t.instances()).is_some());
+        assert!(exists(cx, "heap-instance-0"));
+        // Another snapshot is held: the old list goes, and the query stays.
+        fake.snaps.send(s2).unwrap();
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+        assert_eq!(t.read_with(cx, |t, _| t.chosen_class), None);
+        assert!(t.read_with(cx, |t, _| t.instances()).is_none());
+        assert!(!exists(cx, "heap-instance-0"));
+        assert!(exists(cx, "heap-class-0"));
+        assert_eq!(t.read_with(cx, |t, _| t.query().to_string()), "item");
+        // A scan still running when the snapshot changes is dropped.
+        t.update(cx, |t, cx| t.choose_class(item, cx));
+        fake.snaps.send(s3).unwrap();
+        cx.run_until_parked();
+        assert!(t.read_with(cx, |t, _| t.instances()).is_none());
+        assert_eq!(t.read_with(cx, |t, _| t.chosen_class), None);
+    }
+
+    /// A chain of `depth` links, each holding the next, under one static.
+    fn chain(depth: usize) -> impl FnOnce(&mut SnapshotBuilder) {
+        move |b| {
+            let link = b.class("Link", "package:app/link.dart", &["next"]);
+            let mut next = b.object(link, 16, Value::None, &[]);
+            for _ in 0..depth {
+                next = b.object(link, 16, Value::None, &[next]);
+            }
+            b.static_field("chain", next);
+        }
+    }
+
+    /// The node of the chain's last link: the one with the longest ancestry.
+    fn chain_end(index: &HeapIndex, summary: &HeapSummary) -> u32 {
+        let link = class_ix(summary, "Link");
+        nodes_of(index, link)
+            .into_iter()
+            .find(|&n| index.children(n).is_empty())
+            .expect("the last link")
+    }
+
+    #[gpui_kit::test]
+    fn a_deep_chain_reveals_in_the_real_tree(cx: &mut TestAppContext) {
+        let snap = snapshot(|w, run| {
+            heap_record(w, run, chain(450));
+        });
+        let (index, summary, heap) = held(&snap);
+        let node = chain_end(&index, &summary);
+        let levels = ancestry(&index, node).expect("within the limit").len();
+        assert!(levels >= 450, "{levels}");
+        let (shell, cx, _fake) = connect(cx, snap);
+        let t = tab(&shell, cx);
+        go(&shell, cx, Some(Selection::HeapNode { heap, node }));
+        assert_eq!(
+            t.read_with(cx, |t, cx| t.tree_selected(cx)),
+            Some(node.to_string())
+        );
+        assert_eq!(t.read_with(cx, |t, _| t.open_nodes().len()), levels - 1);
+        let rows = rows(&t, cx);
+        let at = rows.iter().position(|r| r.0 == node.to_string()).unwrap();
+        assert_eq!(rows[at].1, levels - 1);
+        let d = t.read_with(cx, |t, _| t.details()).expect("details");
+        assert_eq!(d.node, node);
+        assert!(d.path.len() >= 200, "{}", d.path.len());
+        assert!(!exists(cx, "heap-too-deep"));
+    }
+
+    #[gpui_kit::test]
+    fn a_reveal_past_the_limit_still_selects_and_says_so(cx: &mut TestAppContext) {
+        let snap = snapshot(|w, run| {
+            heap_record(w, run, chain(MAX_REVEAL_DEPTH + 60));
+        });
+        let (index, summary, heap) = held(&snap);
+        let node = chain_end(&index, &summary);
+        assert!(ancestry(&index, node).is_none());
+        let (shell, cx, _fake) = connect(cx, snap);
+        let t = tab(&shell, cx);
+        go(&shell, cx, Some(Selection::HeapNode { heap, node }));
+        assert_eq!(label(cx, "heap-too-deep").as_deref(), Some(TOO_DEEP));
+        assert_eq!(
+            t.read_with(cx, |t, _| t.selection()),
+            Some(Selection::HeapNode { heap, node })
+        );
+        let d = t.read_with(cx, |t, _| t.details()).expect("details");
+        assert_eq!(d.node, node);
+        assert!(!d.path.is_empty());
+        assert!(exists(cx, "heap-copy-path"));
+        // Choosing a visible row clears the note.
+        let top = index.children(0).next().unwrap();
+        click(cx, &format!("heap-row-{top}"));
+        assert!(!exists(cx, "heap-too-deep"));
+    }
+
+    #[test]
+    fn an_expand_builds_only_the_new_level() {
+        // Levels of 600 children; the first child of each level has the next level as children.
+        let levels = 12usize;
+        let per = 600usize;
+        let n = 1 + levels * per;
+        let start_of = |k: usize| (1 + k * per) as u32;
+        // Node `chain(k)` = start_of(k) has children start_of(k+1)..start_of(k+2).
+        let mut starts: Vec<Option<u32>> = vec![None; n];
+        starts[0] = Some(start_of(0));
+        for k in 0..levels - 1 {
+            starts[start_of(k) as usize] = Some(start_of(k + 1));
+        }
+        let mut first_child = vec![n as u32; n + 1];
+        let mut next = n as u32;
+        for i in (0..n).rev() {
+            if let Some(s) = starts[i] {
+                next = s;
+            }
+            first_child[i] = next;
+        }
+        let index = HeapIndex::from_parts(HeapIndexParts {
+            orig: (0..n as u32).collect(),
+            class: vec![0; n],
+            shallow: vec![1; n],
+            retained: vec![1; n],
+            first_child,
+            retainer: vec![0; n],
+            offsets: Vec::new(),
+            mint_class: None,
+            names: Vec::new(),
+            file: Arc::new(HeapFile::new(std::env::temp_dir().join("fdt-app-levels"))),
+        });
+        assert_eq!(index.children(0).len(), per);
+        assert_eq!(index.children(start_of(3)).len(), per);
+        let summary = bare_summary();
+        let pinned = HashSet::new();
+        let mut open: HashSet<u32> = (0..10).map(start_of).collect();
+        let mut cache = Levels::new();
+        let mut built = 0usize;
+        let items = assemble_items(&index, &summary, 0, &open, &pinned, &mut cache, &mut built);
+        assert_eq!(items.len(), MAX_CHILDREN + 1);
+        assert_eq!(built, 11 * MAX_CHILDREN, "root plus ten open levels");
+        // Open one more node: only its level is built.
+        open.insert(start_of(10));
+        built = 0;
+        assemble_items(&index, &summary, 0, &open, &pinned, &mut cache, &mut built);
+        assert!(built > 0 && built <= MAX_CHILDREN + 1, "built {built}");
+        // Nothing to build when nothing changed.
+        built = 0;
+        assemble_items(&index, &summary, 0, &open, &pinned, &mut cache, &mut built);
+        assert_eq!(built, 0);
     }
 }
