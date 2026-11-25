@@ -596,7 +596,7 @@ impl MainWindow {
         }
     }
 
-    /// Focuses the current tool's search field. Logs and Network have one.
+    /// Focuses the current tool's search field. Logs, Network and the Memory snapshot tab have one.
     fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.current().page == Page::Tool(Tool::Logs) && self.logs_routed(cx) {
             self.logs
@@ -604,6 +604,9 @@ impl MainWindow {
         } else if self.current().page == Page::Tool(Tool::Network) && self.network_routed(cx) {
             self.network
                 .update(cx, |net, cx| net.focus_search(window, cx));
+        } else if self.current().page == Page::Tool(Tool::Memory) && self.memory_routed(cx) {
+            self.memory
+                .update(cx, |memory, cx| memory.focus_search(window, cx));
         }
     }
 

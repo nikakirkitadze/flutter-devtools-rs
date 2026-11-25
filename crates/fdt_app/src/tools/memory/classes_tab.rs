@@ -1793,12 +1793,13 @@ mod ui_tests {
         cx.run_until_parked();
         let view = shell.read_with(cx, |s, _| s.memory_view().clone());
         assert_eq!(view.read_with(cx, |v, _| v.tab()), MemoryTab::Snapshot);
+        // The Snapshot tab took the request: its search starts filled with the class.
         assert_eq!(
-            view.read_with(cx, |v, _| v
-                .pending_snapshot_search()
-                .map(|s| s.to_string())),
-            Some("Thing".to_string())
+            view.read_with(cx, |v, _| v.pending_snapshot_search().cloned()),
+            None
         );
+        let tab = view.read_with(cx, |v, _| v.snapshot().clone());
+        assert_eq!(tab.read_with(cx, |t, _| t.query().to_string()), "thing");
     }
 }
 

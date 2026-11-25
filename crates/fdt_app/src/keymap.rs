@@ -38,6 +38,8 @@ pub const LANES_CONTEXT: &str = "Lanes";
 /// The Memory page's Leaks list.
 pub const LEAKS_CONTEXT: &str = "LeaksList";
 
+/// Key context of the Memory page's dominator tree, where Enter opens the object's details.
+pub const HEAP_TREE_CONTEXT: &str = "HeapTree";
 /// Key context of the frame chart, where the arrow keys step between frames.
 pub const FRAME_CHART_CONTEXT: &str = "FrameChart";
 
@@ -131,6 +133,11 @@ pub fn bindings() -> Vec<KeyBinding> {
         // Enter opens the selected request's details, as it does a log line's.
         KeyBinding::new("enter", OpenDetails, table),
     ]);
+    out.push(KeyBinding::new(
+        "enter",
+        OpenDetails,
+        Some(HEAP_TREE_CONTEXT),
+    ));
     let lanes = Some(LANES_CONTEXT);
     out.extend([
         KeyBinding::new(platform("cmd-=", "ctrl-="), ZoomIn, lanes),

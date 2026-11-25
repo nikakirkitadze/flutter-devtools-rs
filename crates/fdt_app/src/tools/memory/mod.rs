@@ -4,9 +4,11 @@ pub mod chart;
 pub mod classes_tab;
 pub mod details;
 pub mod leaks_tab;
+pub mod snapshot_tab;
 pub mod view;
 
 pub use leaks_tab::LeaksTab;
+pub use snapshot_tab::SnapshotTab;
 pub use view::{MemoryTab, MemoryView, TAKE_SNAPSHOT_TIP};
 
 use fdt_store::heap::HeapId;

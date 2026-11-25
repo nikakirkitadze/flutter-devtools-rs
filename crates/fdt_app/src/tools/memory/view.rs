@@ -2,22 +2,19 @@
 //! tab's body.
 //!
 //! The page keeps the shared range and the selection the shell hands it, and the chart's tooltip.
-//! The three tabs are placeholders that show their empty states until they are built.
 
 use super::chart::{ChartTip, EMPTY_TEXT, MemoryChart};
 use super::classes_tab::{ClassesTab, ShowInSnapshot};
-use super::group_digits;
 use super::leaks_tab::{LeaksTab, PAUSE_TIP};
+use super::snapshot_tab::SnapshotTab;
 use crate::actions::TakeHeapSnapshot;
 use crate::actions::{ZoomIn, ZoomOut, ZoomToFit};
 use crate::focus::PendingFocus;
 use crate::keymap::LANES_CONTEXT;
 use crate::nav::{Location, Page, Selection, TimeRange, Tool};
 use crate::session_model::SessionModel;
-use crate::shell::sidebar::tool_icon;
 use crate::tools::{KeyZoom, OpenLocation, ReplaceLocation};
 use fdt_capture::ConnStatus;
-use fdt_ui::empty_state::EmptyState;
 use fdt_ui::theme::TokensExt as _;
 use fdt_ui::tokens::{font, layout, radius, space};
 use gpui_kit::component::button::Button;
@@ -48,14 +45,6 @@ impl MemoryTab {
             MemoryTab::Classes => "Classes",
             MemoryTab::Leaks => "Leaks",
             MemoryTab::Snapshot => "Snapshot",
-        }
-    }
-
-    fn slug(self) -> &'static str {
-        match self {
-            MemoryTab::Classes => "classes",
-            MemoryTab::Leaks => "leaks",
-            MemoryTab::Snapshot => "snapshot",
         }
     }
 
@@ -93,6 +82,7 @@ pub struct MemoryView {
     chart: Entity<MemoryChart>,
     classes: Entity<ClassesTab>,
     leaks: Entity<LeaksTab>,
+    snapshot: Entity<SnapshotTab>,
     /// The heap snapshots the store held when the page last looked, to tell which were removed.
     known_heaps: Vec<fdt_store::heap::HeapId>,
     /// A class name the Snapshot tab should search for, set by "Show in snapshot".
@@ -103,6 +93,7 @@ pub struct MemoryView {
     _chart: [Subscription; 2],
     _classes: [Subscription; 3],
     _leaks: [Subscription; 2],
+    _snapshot: [Subscription; 2],
 }
 
 impl EventEmitter<OpenLocation> for MemoryView {}
@@ -141,6 +132,13 @@ impl MemoryView {
             cx.subscribe(&leaks, |_, _, e: &OpenLocation, cx| cx.emit(e.clone())),
             cx.subscribe(&leaks, |_, _, e: &ReplaceLocation, cx| cx.emit(e.clone())),
         ];
+        let snapshot = cx.new(|cx| SnapshotTab::new(session.clone(), _window, cx));
+        let snapshot_subs = [
+            cx.subscribe(&snapshot, |_, _, e: &OpenLocation, cx| cx.emit(e.clone())),
+            cx.subscribe(&snapshot, |_, _, e: &ReplaceLocation, cx| {
+                cx.emit(e.clone())
+            }),
+        ];
         Self {
             session,
             tab: MemoryTab::Leaks,
@@ -152,6 +150,7 @@ impl MemoryView {
             chart,
             classes,
             leaks,
+            snapshot,
             known_heaps: Vec::new(),
             pending_snapshot_search: None,
             tip: None,
@@ -159,6 +158,7 @@ impl MemoryView {
             _chart: chart_subs,
             _classes: classes_subs,
             _leaks: leaks_subs,
+            _snapshot: snapshot_subs,
         }
     }
 
@@ -220,6 +220,17 @@ impl MemoryView {
         &self.leaks
     }
 
+    pub fn snapshot(&self) -> &Entity<SnapshotTab> {
+        &self.snapshot
+    }
+
+    /// ⌘F: the Snapshot tab's class search, when it is the tab on screen.
+    pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page_active && self.tab == MemoryTab::Snapshot {
+            self.snapshot.update(cx, |s, cx| s.focus_search(window, cx));
+        }
+    }
+
     /// Clears a selection that points at a heap snapshot that was removed.
     fn heaps_changed(&mut self, cx: &mut Context<Self>) {
         let now: Vec<_> = self
@@ -239,6 +250,7 @@ impl MemoryView {
         if gone {
             self.selection = None;
             self.leaks.update(cx, |l, cx| l.set_selection(None, cx));
+            self.snapshot.update(cx, |s, cx| s.set_selection(None, cx));
             cx.emit(ReplaceLocation(Location {
                 page: Page::Tool(Tool::Memory),
                 selection: None,
@@ -252,6 +264,12 @@ impl MemoryView {
         self.classes.update(cx, |c, cx| c.set_active(on, cx));
         let on = self.page_active && self.tab == MemoryTab::Leaks;
         self.leaks.update(cx, |l, cx| l.set_active(on, cx));
+        let on = self.page_active && self.tab == MemoryTab::Snapshot;
+        if on && let Some(class) = self.pending_snapshot_search.take() {
+            self.snapshot
+                .update(cx, |s, cx| s.set_search_text(&class, cx));
+        }
+        self.snapshot.update(cx, |s, cx| s.set_active(on, cx));
     }
 
     pub fn selection(&self) -> Option<Selection> {
@@ -269,6 +287,7 @@ impl MemoryView {
             .update(cx, |c, cx| c.set_location(None, None, cx));
         self.classes.update(cx, |c, cx| c.reset(cx));
         self.leaks.update(cx, |l, cx| l.reset(cx));
+        self.snapshot.update(cx, |s, cx| s.reset(cx));
         self.known_heaps.clear();
         self.sync_classes(cx);
         cx.notify();
@@ -306,6 +325,10 @@ impl MemoryView {
         self.leaks.update(cx, |l, cx| {
             l.set_range(range, cx);
             l.set_selection(selection, cx);
+        });
+        self.snapshot.update(cx, |s, cx| {
+            s.set_range(range, cx);
+            s.set_selection(selection, cx);
         });
         if selected && let Some(tab) = selection.and_then(MemoryTab::showing) {
             self.tab = tab;
@@ -449,83 +472,25 @@ impl MemoryView {
         )
     }
 
-    fn empty(
-        &self,
-        id: &'static str,
-        heading: &'static str,
-        body: &'static str,
-    ) -> gpui_kit::AnyElement {
-        EmptyState::new(id, tool_icon(Tool::Memory), heading, body).into_any_element()
-    }
-
-    /// A line for a tab that has data its real body will show.
-    fn note(&self, id: &'static str, text: String, cx: &Context<Self>) -> AnyElement {
-        let t = cx.tokens();
-        div()
-            .id(id)
-            .test_support()
-            .text_size(font::BODY)
-            .text_color(Hsla::from(t.text_muted))
-            .child(text)
-            .into_any_element()
-    }
-
-    fn render_body(&self, cx: &mut Context<Self>) -> AnyElement {
-        let snap = self.session.read(cx).snapshot().clone();
-        let memory = &snap.memory;
-        let content = match self.tab {
-            MemoryTab::Classes => {
-                return div()
-                    .id("memory-tab-classes")
-                    .test_support()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .child(self.classes.clone())
-                    .into_any_element();
-            }
-            MemoryTab::Leaks => {
-                return div()
-                    .id("memory-tab-leaks")
-                    .test_support()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .child(self.leaks.clone())
-                    .into_any_element();
-            }
-            MemoryTab::Snapshot => {
-                if memory.heaps().is_empty() {
-                    self.empty(
-                        "memory-snapshot-empty",
-                        "No heap snapshot yet",
-                        "Take a heap snapshot to browse the objects in memory.",
-                    )
-                } else {
-                    self.note(
-                        "memory-snapshot-placeholder",
-                        format!(
-                            "{} heap snapshots taken.",
-                            group_digits(memory.heaps().len() as u64)
-                        ),
-                        cx,
-                    )
-                }
-            }
+    fn render_body(&self) -> AnyElement {
+        let (id, child): (&'static str, AnyElement) = match self.tab {
+            MemoryTab::Classes => (
+                "memory-tab-classes",
+                self.classes.clone().into_any_element(),
+            ),
+            MemoryTab::Leaks => ("memory-tab-leaks", self.leaks.clone().into_any_element()),
+            MemoryTab::Snapshot => (
+                "memory-tab-snapshot",
+                self.snapshot.clone().into_any_element(),
+            ),
         };
         div()
-            .id(SharedString::from(format!(
-                "memory-tab-{}",
-                self.tab.slug()
-            )))
+            .id(id)
             .test_support()
             .flex_1()
             .min_h_0()
             .w_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(content)
+            .child(child)
             .into_any_element()
     }
 }
@@ -535,6 +500,11 @@ impl Render for MemoryView {
         crate::perf::bump(crate::perf::Counter::MemoryView, 1);
         if self.page_active {
             self.focus_pending.take(window, cx, &self.focus, true);
+        }
+        if self.tab != MemoryTab::Snapshot {
+            let to = self.focus.clone();
+            self.snapshot
+                .update(cx, |s, cx| s.release_focus(&to, window, cx));
         }
         div()
             .id("memory-view")
@@ -549,7 +519,7 @@ impl Render for MemoryView {
             .on_action(cx.listener(|this, _: &ZoomToFit, _, cx| this.key_zoom(KeyZoom::Fit, cx)))
             .child(self.render_chart_slot(cx))
             .child(self.render_tabs(cx))
-            .child(self.render_body(cx))
+            .child(self.render_body())
             .children(self.render_tooltip(cx))
     }
 }
