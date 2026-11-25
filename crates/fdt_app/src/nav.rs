@@ -76,6 +76,8 @@ pub enum Selection {
     Frame(EntryId),
     /// A heap snapshot in the Memory tool.
     Heap(HeapId),
+    /// A heap snapshot chosen in the Leaks tab (the Snapshot tab's is [`Selection::Heap`]).
+    LeakSnapshot(HeapId),
     /// An object of a heap snapshot, by its node in the dominator tree.
     HeapNode {
         heap: HeapId,
@@ -101,6 +103,7 @@ impl Selection {
     pub fn heap(self) -> Option<HeapId> {
         match self {
             Selection::Heap(heap)
+            | Selection::LeakSnapshot(heap)
             | Selection::HeapNode { heap, .. }
             | Selection::Leak { heap, .. }
             | Selection::Growth { heap, .. } => Some(heap),
@@ -273,6 +276,7 @@ mod tests {
         let heap = HeapId(3);
         for (sel, owner) in [
             (Selection::Heap(heap), Some(heap)),
+            (Selection::LeakSnapshot(heap), Some(heap)),
             (Selection::HeapNode { heap, node: 9 }, Some(heap)),
             (Selection::Leak { heap, finding: 1 }, Some(heap)),
             (Selection::Growth { heap, index: 2 }, Some(heap)),

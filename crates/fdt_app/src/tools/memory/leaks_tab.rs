@@ -7,7 +7,8 @@
 //! job. The tab renders its lines through a `uniform_list`.
 
 use super::{group_digits, heap_number};
-use crate::actions::TakeHeapSnapshot;
+use crate::actions::{SelectNext, SelectPrevious, TakeHeapSnapshot};
+use crate::keymap::LEAKS_CONTEXT;
 use crate::nav::{Location, Page, Selection, Tool};
 use crate::session_model::SessionModel;
 use crate::shell::strip::format_offset;
@@ -43,7 +44,13 @@ pub const PAUSE_TIP: &str = "Your app pauses while it writes the snapshot: a fra
 pub const RECEIVING_NOTE: &str =
     "Your app is paused until it finishes writing. Cancelling stops fdt from reading the rest.";
 pub const EMPTY_HEADING: &str = "No heap snapshot yet";
-pub const EMPTY_BODY: &str = "Take one (\u{2318}\u{21e7}S) to look for objects that are still in memory after their screen closed. To check a screen, take a snapshot, open the screen and leave it, then take another.";
+/// The empty state's body, with the platform's keys for taking a snapshot.
+pub fn empty_body() -> String {
+    format!(
+        "Take one ({}) to look for objects that are still in memory after their screen closed. To check a screen, take a snapshot, open the screen and leave it, then take another.",
+        crate::keymap::platform("\u{2318}\u{21e7}S", "Ctrl+Shift+S")
+    )
+}
 pub const ONE_SNAPSHOT_NOTE: &str =
     "Take another snapshot after visiting a screen to see what it left behind.";
 pub const PROFILE_NOTE: &str = "Profile mode can't tell a disposed controller or notifier from an unused one. Compare two snapshots, or run in debug mode to check them directly.";
@@ -134,10 +141,7 @@ pub fn growth_at(diff: &fdt_store::heap::HeapDiff, index: u32) -> Option<&Growth
 }
 
 fn grew_by(g: &Growth) -> u64 {
-    match g.after.saturating_sub(g.before) {
-        0 => g.new_objects,
-        n => n,
-    }
+    g.after.saturating_sub(g.before)
 }
 
 pub fn growth_sentence(summary: &HeapSummary, g: &Growth, baseline: HeapId) -> String {
@@ -211,7 +215,7 @@ pub fn lines(record: &HeapRecord) -> Vec<Line> {
 pub fn shown_record(mem: &MemorySnapshot, selection: Option<Selection>) -> Option<&HeapRecord> {
     let chosen = match selection {
         Some(
-            Selection::Heap(h)
+            Selection::LeakSnapshot(h)
             | Selection::Leak { heap: h, .. }
             | Selection::Growth { heap: h, .. },
         ) => mem.heap(h),
@@ -372,40 +376,50 @@ fn screen_changes(
     at: SessionTime,
 ) -> Vec<ScreenChange> {
     let nav = snap.logs.navigation();
-    let mut out = Vec::new();
-    for i in (0..nav.len()).rev() {
-        let Some(&seq) = nav.get(i) else { continue };
-        let Some(row) = snap.logs.get_row(seq as usize) else {
-            continue;
-        };
-        if row.time > at {
-            continue;
+    let time_of = |i: usize| {
+        nav.get(i)
+            .and_then(|&s| snap.logs.get_row(s as usize))
+            .map(|r| r.time)
+    };
+    // The first index whose record fails `before` (records are in time order).
+    let first = |before: &dyn Fn(SessionTime) -> bool| {
+        let (mut lo, mut hi) = (0, nav.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if time_of(mid).is_some_and(before) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
         }
-        if from.is_some_and(|f| row.time < f) {
-            break;
-        }
-        let line = row.text.lines().next().unwrap_or("").trim();
-        out.push(ScreenChange {
-            id: row.id,
-            text: format!("{} \u{b7} {line}", format_offset(row.time)),
-        });
-        let cap = if from.is_some() {
-            MAX_SCREENS
-        } else {
-            RECENT_SCREENS
-        };
-        if out.len() >= cap {
-            break;
-        }
-    }
-    out.reverse();
-    out
+        lo
+    };
+    let hi = first(&|t| t <= at);
+    let lo = from.map_or(0, |f| first(&|t| t < f));
+    let cap = if from.is_some() {
+        MAX_SCREENS
+    } else {
+        RECENT_SCREENS
+    };
+    // The records nearest `at`.
+    let lo = lo.max(hi.saturating_sub(cap));
+    (lo..hi)
+        .filter_map(|i| {
+            let row = snap.logs.get_row(*nav.get(i)? as usize)?;
+            let line = row.text.lines().next().unwrap_or("").trim();
+            Some(ScreenChange {
+                id: row.id,
+                text: format!("{} \u{b7} {line}", format_offset(row.time)),
+            })
+        })
+        .collect()
 }
 
 /// The details of a finding or growth selection, or `None` for anything else or a record that
 /// is gone.
 pub fn build_details(snap: &fdt_store::Snapshot, selection: Selection) -> Option<Details> {
     let mem = &snap.memory;
+    let growth = matches!(selection, Selection::Growth { .. });
     let (heap, sentence, retained, path, culprit, keeps, node, baseline) = match selection {
         Selection::Leak { heap, finding } => {
             let record = mem.heap(heap)?;
@@ -465,7 +479,11 @@ pub fn build_details(snap: &fdt_store::Snapshot, selection: Selection) -> Option
     Some(Details {
         heap,
         sentence,
-        retains: format!("Retains {}", format_bytes(retained)),
+        retains: if growth {
+            format!("New objects use {}", format_bytes(retained))
+        } else {
+            format!("Retains {}", format_bytes(retained))
+        },
         held_by: held_by(summary, &path, culprit),
         hops: hop_rows(mem, summary, &path, culprit),
         keeps: keeps
@@ -490,7 +508,7 @@ struct DetailsKey {
     summary: usize,
     diff: usize,
     classes: usize,
-    logs: usize,
+    navigation: usize,
 }
 
 pub struct LeaksTab {
@@ -577,7 +595,7 @@ impl LeaksTab {
         let mine = selection.filter(|s| {
             matches!(
                 s,
-                Selection::Heap(_) | Selection::Leak { .. } | Selection::Growth { .. }
+                Selection::LeakSnapshot(_) | Selection::Leak { .. } | Selection::Growth { .. }
             )
         });
         if selection.is_some() && mine.is_none() {
@@ -640,7 +658,7 @@ impl LeaksTab {
                 .and_then(|h| h.diff.as_ref())
                 .map(|d| Arc::as_ptr(d) as usize)),
             classes: snap.memory.alloc_class_count(),
-            logs: snap.logs.len(),
+            navigation: snap.logs.navigation().len(),
         };
         if self.details_started.as_ref() == Some(&key) {
             return;
@@ -667,11 +685,11 @@ impl LeaksTab {
             control.set_heap_baseline(id);
         }
         if let Some(Selection::Growth { heap, .. }) = self.selection {
-            self.selection = Some(Selection::Heap(heap));
+            self.selection = Some(Selection::LeakSnapshot(heap));
             self.details = None;
             self.details_started = None;
             self.details_job = None;
-            self.emit_location(Some(Selection::Heap(heap)), true, cx);
+            self.emit_location(Some(Selection::LeakSnapshot(heap)), true, cx);
         }
         cx.notify();
     }
@@ -722,7 +740,7 @@ impl LeaksTab {
     }
 
     /// Up and Down move through the findings and growths.
-    fn step(&mut self, down: bool, cx: &mut Context<Self>) {
+    pub fn step(&mut self, down: bool, cx: &mut Context<Self>) {
         let snap = self.session.read(cx).snapshot().clone();
         let Some(record) = shown_record(&snap.memory, self.selection) else {
             return;
@@ -861,7 +879,7 @@ impl LeaksTab {
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, window, cx| {
                     window.focus(&this.focus, cx);
-                    this.select(Selection::Heap(id), false, cx);
+                    this.select(Selection::LeakSnapshot(id), false, cx);
                 }));
             if on {
                 line = line.bg(Hsla::from(t.accent).opacity(f32::from(alpha::ACTIVE_ROW) / 255.0));
@@ -1131,7 +1149,7 @@ impl LeaksTab {
                         "memory-leaks-empty",
                         crate::shell::sidebar::tool_icon(Tool::Memory),
                         EMPTY_HEADING,
-                        EMPTY_BODY,
+                        empty_body(),
                     ),
                 ))
                 .into_any_element();
@@ -1413,13 +1431,9 @@ impl Render for LeaksTab {
             .track_focus(&self.focus)
             .size_full()
             .flex()
-            .on_key_down(cx.listener(|this, e: &gpui_kit::KeyDownEvent, _, cx| {
-                match e.keystroke.key.as_str() {
-                    "down" => this.step(true, cx),
-                    "up" => this.step(false, cx),
-                    _ => {}
-                }
-            }))
+            .key_context(LEAKS_CONTEXT)
+            .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.step(true, cx)))
+            .on_action(cx.listener(|this, _: &SelectPrevious, _, cx| this.step(false, cx)))
             .child(main)
             .children(self.render_details(cx))
     }
@@ -1613,9 +1627,16 @@ mod tests {
         assert!(exists(cx, "memory-leaks-empty"));
         assert!(!exists(cx, "leaks-snapshots"));
         assert_eq!(EMPTY_HEADING, "No heap snapshot yet");
+        let keys = if cfg!(target_os = "macos") {
+            "\u{2318}\u{21e7}S"
+        } else {
+            "Ctrl+Shift+S"
+        };
         assert_eq!(
-            EMPTY_BODY,
-            "Take one (\u{2318}\u{21e7}S) to look for objects that are still in memory after their screen closed. To check a screen, take a snapshot, open the screen and leave it, then take another."
+            empty_body(),
+            format!(
+                "Take one ({keys}) to look for objects that are still in memory after their screen closed. To check a screen, take a snapshot, open the screen and leave it, then take another."
+            )
         );
         // One snapshot and no diff.
         let snap = snapshot(|w, run| {
@@ -2037,7 +2058,7 @@ mod tests {
         cx.run_until_parked();
         assert!(fake.commands().contains(&"heap_baseline 0".to_string()));
         let sel = shell.read_with(cx, |s, _| s.current().selection);
-        assert_eq!(sel, Some(Selection::Heap(HeapId(1))));
+        assert_eq!(sel, Some(Selection::LeakSnapshot(HeapId(1))));
         tab.update(cx, |t, cx| t.set_baseline(None, cx));
         assert!(fake.commands().contains(&"heap_baseline none".to_string()));
     }
@@ -2123,14 +2144,101 @@ mod tests {
         cx.run_until_parked();
         let loc = shell.read_with(cx, |s, _| s.current().clone());
         assert_eq!(loc.page, Page::Tool(Tool::Memory));
-        assert_eq!(loc.selection, Some(Selection::Heap(HeapId(1))));
+        assert_eq!(loc.selection, Some(Selection::LeakSnapshot(HeapId(1))));
         assert_eq!(view.read_with(cx, |v, _| v.tab()), MemoryTab::Leaks);
         // Choosing a snapshot in the list does not leave the Leaks tab.
         click(cx, "leaks-snapshot-1");
         assert_eq!(
             shell.read_with(cx, |s, _| s.current().selection),
-            Some(Selection::Heap(HeapId(0)))
+            Some(Selection::LeakSnapshot(HeapId(0)))
         );
         assert_eq!(view.read_with(cx, |v, _| v.tab()), MemoryTab::Leaks);
+    }
+
+    #[gpui_kit::test]
+    fn back_from_a_finding_lands_on_the_leaks_tab(cx: &mut TestAppContext) {
+        use crate::tools::memory::MemoryTab;
+        use crate::tools::timeline::lanes::LaneHit;
+        let (shell, cx, _fake) = connect(cx, two_snapshots(true));
+        let view = shell.read_with(cx, |s, _| s.memory_view().clone());
+        press(cx, "cmd-1", "ctrl-1");
+        let timeline = shell.read_with(cx, |s, _| s.timeline_view().clone());
+        timeline.update(cx, |t, cx| t.activate(LaneHit::Leak(HeapId(1)), cx));
+        cx.run_until_parked();
+        click(cx, "leaks-finding-0");
+        let finding = leak0(1);
+        assert_eq!(
+            shell.read_with(cx, |s, _| s.current().selection),
+            Some(finding)
+        );
+        press(cx, "cmd-[", "ctrl-[");
+        assert_eq!(
+            shell.read_with(cx, |s, _| s.current().selection),
+            Some(Selection::LeakSnapshot(HeapId(1)))
+        );
+        assert_eq!(view.read_with(cx, |v, _| v.tab()), MemoryTab::Leaks);
+        press(cx, "cmd-]", "ctrl-]");
+        assert_eq!(
+            shell.read_with(cx, |s, _| s.current().selection),
+            Some(finding)
+        );
+        assert_eq!(view.read_with(cx, |v, _| v.tab()), MemoryTab::Leaks);
+    }
+
+    #[gpui_kit::test]
+    fn arrow_keys_move_through_the_rows(cx: &mut TestAppContext) {
+        let (shell, cx, _fake) = connect(cx, two_snapshots(true));
+        click(cx, "leaks-finding-0");
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        assert_eq!(
+            shell.read_with(cx, |s, _| s.current().selection),
+            Some(Selection::Growth {
+                heap: HeapId(1),
+                index: 0
+            })
+        );
+        cx.simulate_keystrokes("up");
+        cx.run_until_parked();
+        assert_eq!(
+            shell.read_with(cx, |s, _| s.current().selection),
+            Some(leak0(1))
+        );
+    }
+
+    #[test]
+    fn screen_changes_are_a_range_lookup() {
+        let snap = snapshot(|w, run| {
+            let ms: Vec<u64> = (1..=100).map(|i| i * 10).collect();
+            with_navigation(w, run, &ms);
+        });
+        let t = |ms: u64| SessionTime(ms * 1_000_000);
+        let texts = |v: Vec<ScreenChange>| v.into_iter().map(|s| s.text).collect::<Vec<_>>();
+        // Between 300 and 330 ms, inclusive.
+        let got = texts(screen_changes(&snap, Some(t(300)), t(330)));
+        assert_eq!(got.len(), 4);
+        assert!(got[0].ends_with("/screen-300") && got[3].ends_with("/screen-330"));
+        // No baseline: the last three at or before 335 ms.
+        let got = texts(screen_changes(&snap, None, t(335)));
+        assert!(got[0].ends_with("/screen-310") && got[2].ends_with("/screen-330"));
+        assert!(screen_changes(&snap, Some(t(5_000)), t(6_000)).is_empty());
+    }
+
+    #[gpui_kit::test]
+    fn growth_details_say_new_objects_use(cx: &mut TestAppContext) {
+        let snap = two_snapshots(true);
+        let d = build_details(
+            &snap,
+            Selection::Growth {
+                heap: HeapId(1),
+                index: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            d.retains,
+            format!("New objects use {}", format_bytes(4_096))
+        );
+        let _ = cx;
     }
 }

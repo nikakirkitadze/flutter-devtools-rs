@@ -743,7 +743,7 @@ pub fn location_for(snap: &Snapshot, hit: &LaneHit, range: Option<TimeRange>) ->
         }
         LaneHit::Leak(id) => {
             snap.memory.heap(id)?;
-            Some(at(Tool::Memory, Some(Selection::Heap(id))))
+            Some(at(Tool::Memory, Some(Selection::LeakSnapshot(id))))
         }
         LaneHit::Gc(_) => Some(at(Tool::Performance, None)),
         LaneHit::LogCell(_)
@@ -1414,7 +1414,7 @@ mod tests {
         );
         let loc = location_for(&snap, &LaneHit::Leak(HeapId(1)), None).unwrap();
         assert_eq!(loc.page, Page::Tool(Tool::Memory));
-        assert_eq!(loc.selection, Some(Selection::Heap(HeapId(1))));
+        assert_eq!(loc.selection, Some(Selection::LeakSnapshot(HeapId(1))));
         // A record that is gone opens nothing.
         assert!(location_for(&snap, &LaneHit::Leak(HeapId(7)), None).is_none());
         // Out of view: no marker.

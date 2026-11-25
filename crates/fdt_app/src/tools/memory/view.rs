@@ -67,7 +67,9 @@ impl MemoryTab {
     fn showing(selection: Selection) -> Option<MemoryTab> {
         match selection {
             Selection::AllocClass(_) => Some(MemoryTab::Classes),
-            Selection::Leak { .. } | Selection::Growth { .. } => Some(MemoryTab::Leaks),
+            Selection::LeakSnapshot(_) | Selection::Leak { .. } | Selection::Growth { .. } => {
+                Some(MemoryTab::Leaks)
+            }
             Selection::Heap(_) | Selection::HeapNode { .. } => Some(MemoryTab::Snapshot),
             Selection::Log(_)
             | Selection::Request(_)
@@ -93,9 +95,6 @@ pub struct MemoryView {
     leaks: Entity<LeaksTab>,
     /// The heap snapshots the store held when the page last looked, to tell which were removed.
     known_heaps: Vec<fdt_store::heap::HeapId>,
-    /// The selection the Leaks tab just asked for: it stays on the Leaks tab even when it is a
-    /// heap snapshot (which the chart opens in the Snapshot tab).
-    stay_on_leaks: Option<Selection>,
     /// A class name the Snapshot tab should search for, set by "Show in snapshot".
     pending_snapshot_search: Option<SharedString>,
     /// What the pointer is over on the chart, and where.
@@ -139,14 +138,8 @@ impl MemoryView {
         ];
         let leaks = cx.new(|cx| LeaksTab::new(session.clone(), _window, cx));
         let leaks_subs = [
-            cx.subscribe(&leaks, |this, _, e: &OpenLocation, cx| {
-                this.stay_on_leaks = e.0.selection.filter(|s| matches!(s, Selection::Heap(_)));
-                cx.emit(e.clone());
-            }),
-            cx.subscribe(&leaks, |this, _, e: &ReplaceLocation, cx| {
-                this.stay_on_leaks = e.0.selection.filter(|s| matches!(s, Selection::Heap(_)));
-                cx.emit(e.clone());
-            }),
+            cx.subscribe(&leaks, |_, _, e: &OpenLocation, cx| cx.emit(e.clone())),
+            cx.subscribe(&leaks, |_, _, e: &ReplaceLocation, cx| cx.emit(e.clone())),
         ];
         Self {
             session,
@@ -160,7 +153,6 @@ impl MemoryView {
             classes,
             leaks,
             known_heaps: Vec::new(),
-            stay_on_leaks: None,
             pending_snapshot_search: None,
             tip: None,
             _observe: observe,
@@ -215,6 +207,13 @@ impl MemoryView {
 
     pub fn classes(&self) -> &Entity<ClassesTab> {
         &self.classes
+    }
+
+    /// Up or Down through the Leaks list, when it is the tab on screen.
+    pub fn step_leaks(&mut self, down: bool, cx: &mut Context<Self>) {
+        if self.page_active && self.tab == MemoryTab::Leaks {
+            self.leaks.update(cx, |l, cx| l.step(down, cx));
+        }
     }
 
     pub fn leaks(&self) -> &Entity<LeaksTab> {
@@ -308,12 +307,7 @@ impl MemoryView {
             l.set_range(range, cx);
             l.set_selection(selection, cx);
         });
-        let stay = selection.is_some() && self.stay_on_leaks == selection;
-        self.stay_on_leaks = None;
-        if selected
-            && !stay
-            && let Some(tab) = selection.and_then(MemoryTab::showing)
-        {
+        if selected && let Some(tab) = selection.and_then(MemoryTab::showing) {
             self.tab = tab;
         }
         self.sync_classes(cx);

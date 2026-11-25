@@ -229,15 +229,7 @@ impl MainWindow {
             cx.subscribe_in(
                 &timeline,
                 window,
-                move |this, _, e: &OpenLocation, w, cx| {
-                    open(this, e, w, cx);
-                    // The findings lane's leak marker opens the Leaks tab, where the snapshot's
-                    // findings are.
-                    if matches!(e.0.selection, Some(Selection::Heap(_))) {
-                        this.memory
-                            .update(cx, |m, cx| m.set_tab(MemoryTab::Leaks, cx));
-                    }
-                },
+                move |this, _, e: &OpenLocation, w, cx| open(this, e, w, cx),
             ),
             cx.subscribe_in(&memory, window, move |this, _, e: &OpenLocation, w, cx| {
                 open(this, e, w, cx)
@@ -1069,10 +1061,12 @@ impl Render for MainWindow {
             .on_action(cx.listener(|this, _: &SelectNext, _, cx| {
                 this.with_logs(cx, |v, cx| v.select_next(cx));
                 this.with_network(cx, |v, cx| v.select_next(cx));
+                this.memory.update(cx, |m, cx| m.step_leaks(true, cx));
             }))
             .on_action(cx.listener(|this, _: &SelectPrevious, _, cx| {
                 this.with_logs(cx, |v, cx| v.select_previous(cx));
                 this.with_network(cx, |v, cx| v.select_previous(cx));
+                this.memory.update(cx, |m, cx| m.step_leaks(false, cx));
             }))
             .on_action(cx.listener(|this, _: &ToggleExpand, _, cx| {
                 this.with_logs(cx, |v, cx| v.toggle_expand(cx));
@@ -2441,6 +2435,7 @@ mod tests {
         let heap = HeapId(0);
         let picks = [
             (Selection::Heap(heap), MemoryTab::Snapshot),
+            (Selection::LeakSnapshot(heap), MemoryTab::Leaks),
             (Selection::HeapNode { heap, node: 4 }, MemoryTab::Snapshot),
             (Selection::Leak { heap, finding: 2 }, MemoryTab::Leaks),
             (Selection::Growth { heap, index: 1 }, MemoryTab::Leaks),

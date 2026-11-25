@@ -35,6 +35,8 @@ pub const TABLE_CONTEXT: &str = "DataTable";
 /// Key context of time-axis views (the Timeline lanes, the raw trace and the flame chart), where
 /// the zoom keys apply. A view sets it on its focusable element.
 pub const LANES_CONTEXT: &str = "Lanes";
+/// The Memory page's Leaks list.
+pub const LEAKS_CONTEXT: &str = "LeaksList";
 
 /// Key context of the frame chart, where the arrow keys step between frames.
 pub const FRAME_CHART_CONTEXT: &str = "FrameChart";
@@ -100,6 +102,13 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("down", AppListNext, list),
         KeyBinding::new("j", AppListNext, list),
         KeyBinding::new("enter", AppListConnect, list),
+    ]);
+    let leaks = Some(LEAKS_CONTEXT);
+    out.extend([
+        KeyBinding::new("j", SelectNext, leaks),
+        KeyBinding::new("down", SelectNext, leaks),
+        KeyBinding::new("k", SelectPrevious, leaks),
+        KeyBinding::new("up", SelectPrevious, leaks),
     ]);
     let logs = Some(LOGS_LIST_CONTEXT);
     out.extend([
